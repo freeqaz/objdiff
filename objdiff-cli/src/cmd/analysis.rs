@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::LazyLock};
 use regex::Regex;
 use serde::Serialize;
 
-use super::diff::{InstructionDiffOutput, InstructionSummary};
+use super::diff::{InstructionDiffOutput, InstructionInfo, InstructionSummary};
 
 // =============================================================================
 // Constants
@@ -292,10 +292,74 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
     })
 }
 
+/// Check clrlwi for bool mask pattern using typed args or string fallback.
+/// clrlwi rD, rS, N - clears left N bits. N=24 masks to u8, N=31 masks to bool.
+fn check_clrlwi_bool_mask(side: &InstructionInfo) -> Option<u8> {
+    // Prefer typed args if available
+    if let Some(typed_args) = &side.typed_args {
+        // clrlwi has 3 args: dest reg, src reg, bit count
+        // The bit count is the 3rd arg (index 2)
+        if typed_args.len() >= 3 {
+            if let Some(bit_count) = typed_args[2].as_i64() {
+                if bit_count == 24 {
+                    return Some(24);
+                } else if bit_count == 31 {
+                    return Some(31);
+                }
+            }
+        }
+    }
+
+    // Fall back to string matching
+    if let Some(args) = &side.args {
+        if args.contains(", 24") || args.ends_with(", 0x18") {
+            return Some(24);
+        } else if args.contains(", 31") || args.ends_with(", 0x1f") {
+            return Some(31);
+        }
+    }
+    None
+}
+
+/// Check rlwinm for bool mask pattern using typed args or string fallback.
+/// rlwinm rD, rS, SH, MB, ME - bit rotate/mask
+/// For byte mask: SH=0, MB=24, ME=31
+/// For bool mask: SH=0, MB=31, ME=31
+fn check_rlwinm_bool_mask(side: &InstructionInfo) -> Option<u8> {
+    // Prefer typed args if available
+    if let Some(typed_args) = &side.typed_args {
+        // rlwinm has 5 args: dest, src, shift, mask_begin, mask_end
+        if typed_args.len() >= 5 {
+            let sh = typed_args[2].as_i64();
+            let mb = typed_args[3].as_i64();
+            let me = typed_args[4].as_i64();
+
+            if let (Some(0), Some(24), Some(31)) = (sh, mb, me) {
+                return Some(24); // byte mask
+            } else if let (Some(0), Some(31), Some(31)) = (sh, mb, me) {
+                return Some(31); // bool mask
+            }
+        }
+    }
+
+    // Fall back to string matching
+    if let Some(args) = &side.args {
+        if args.contains("0, 24, 31") || args.contains("0x0, 0x18, 0x1f") {
+            return Some(24);
+        } else if args.contains("0, 31, 31") || args.contains("0x0, 0x1f, 0x1f") {
+            return Some(31);
+        }
+    }
+    None
+}
+
 /// Detect bool return masking patterns.
 ///
 /// Looks for `delete`/`insert` instructions with `clrlwi` or `rlwinm`
 /// opcodes that mask values to bool (bit 31) or byte (bits 24-31).
+///
+/// Uses typed args when available for more reliable detection,
+/// falling back to string parsing for backward compatibility.
 pub fn detect_bool_mask(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut mask_count = 0;
     let mut bit_positions: Vec<u8> = Vec::new();
@@ -307,42 +371,17 @@ pub fn detect_bool_mask(instructions: &[InstructionDiffOutput]) -> Option<Patter
 
         // Check both target and base sides for bool masking
         for side in [&instr.target, &instr.base].into_iter().flatten() {
-            match side.opcode.as_str() {
-                "clrlwi" => {
-                    // clrlwi rD, rS, N - clears left N bits
-                    // N=24 masks to u8, N=31 masks to bool (1 bit)
-                    if let Some(args) = &side.args {
-                        if args.contains(", 24") {
-                            mask_count += 1;
-                            if !bit_positions.contains(&24) {
-                                bit_positions.push(24);
-                            }
-                        } else if args.contains(", 31") {
-                            mask_count += 1;
-                            if !bit_positions.contains(&31) {
-                                bit_positions.push(31);
-                            }
-                        }
-                    }
+            let detected_bit = match side.opcode.as_str() {
+                "clrlwi" => check_clrlwi_bool_mask(side),
+                "rlwinm" => check_rlwinm_bool_mask(side),
+                _ => None,
+            };
+
+            if let Some(bit) = detected_bit {
+                mask_count += 1;
+                if !bit_positions.contains(&bit) {
+                    bit_positions.push(bit);
                 }
-                "rlwinm" => {
-                    // rlwinm rD, rS, 0, 24, 31 - equivalent to clrlwi for byte
-                    // rlwinm rD, rS, 0, 31, 31 - equivalent to clrlwi for bool
-                    if let Some(args) = &side.args {
-                        if args.contains("0, 24, 31") {
-                            mask_count += 1;
-                            if !bit_positions.contains(&24) {
-                                bit_positions.push(24);
-                            }
-                        } else if args.contains("0, 31, 31") {
-                            mask_count += 1;
-                            if !bit_positions.contains(&31) {
-                                bit_positions.push(31);
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -528,6 +567,7 @@ fn parse_comparison_immediate(args: &str) -> Option<i64> {
 }
 
 /// Branch opcodes for PowerPC (without hint suffixes).
+/// Used as fallback when branch_dest is not available.
 const BRANCH_OPCODES: &[&str] = &[
     "b", "bl", "blr", "bctr", "bctrl", "blrl",
     "beq", "bne", "blt", "ble", "bgt", "bge",
@@ -547,11 +587,24 @@ fn is_branch_opcode(opcode: &str) -> bool {
     BRANCH_OPCODES.contains(&base)
 }
 
+/// Check if an instruction is a branch using branch_dest (preferred) or opcode fallback.
+fn is_branch_instruction(info: &InstructionInfo) -> bool {
+    // Prefer branch_dest if available (more accurate, architecture-agnostic)
+    if info.branch_dest.is_some() {
+        return true;
+    }
+    // Fall back to opcode-based detection
+    is_branch_opcode(&info.opcode)
+}
+
 /// Detect control flow differences on branch instructions.
 ///
 /// Looks for `diff_op` or `replace` match types where either the target
 /// or base instruction is a branch. This indicates structural control
 /// flow differences that are often fixable.
+///
+/// Uses branch_dest when available for more accurate detection,
+/// falling back to opcode-based detection for backward compatibility.
 pub fn detect_control_flow(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut branch_diffs: Vec<BranchDiffInfo> = Vec::new();
 
@@ -561,18 +614,15 @@ pub fn detect_control_flow(instructions: &[InstructionDiffOutput]) -> Option<Pat
             continue;
         }
 
-        let target_op = instr.target.as_ref().map(|t| t.opcode.as_str());
-        let base_op = instr.base.as_ref().map(|b| b.opcode.as_str());
-
-        // Check if either side is a branch instruction
-        let target_is_branch = target_op.is_some_and(is_branch_opcode);
-        let base_is_branch = base_op.is_some_and(is_branch_opcode);
+        // Check if either side is a branch instruction using the new method
+        let target_is_branch = instr.target.as_ref().is_some_and(is_branch_instruction);
+        let base_is_branch = instr.base.as_ref().is_some_and(is_branch_instruction);
 
         if target_is_branch || base_is_branch {
             branch_diffs.push(BranchDiffInfo {
                 index: instr.index,
-                target_opcode: target_op.map(|s| s.to_string()),
-                base_opcode: base_op.map(|s| s.to_string()),
+                target_opcode: instr.target.as_ref().map(|t| t.opcode.clone()),
+                base_opcode: instr.base.as_ref().map(|b| b.opcode.clone()),
                 match_type: instr.match_type.clone(),
             });
         }
@@ -772,9 +822,30 @@ pub fn compute_verdict(
     });
 
     if has_control_flow && merged_ratio < MERGED_RATIO_LIKELY_FIXABLE {
-        let mut suggestions = vec![Suggestion {
+        let mut suggestions = Vec::new();
+
+        // Add specific branch suggestions with indices
+        if let Some(cf_pattern) = analysis.patterns.iter().find(|p| p.pattern == PatternType::ControlFlow) {
+            if let PatternDetails::ControlFlow { branch_diffs } = &cf_pattern.details {
+                // List specific branch indices
+                let indices: Vec<String> = branch_diffs.iter().take(3).map(|bd| bd.index.to_string()).collect();
+                if !indices.is_empty() {
+                    let indices_str = indices.join(", ");
+                    let more = if branch_diffs.len() > 3 {
+                        format!(" (+{} more)", branch_diffs.len() - 3)
+                    } else {
+                        String::new()
+                    };
+                    suggestions.push(Suggestion {
+                        action: format!("Check branch at index {}{}", indices_str, more),
+                    });
+                }
+            }
+        }
+
+        suggestions.push(Suggestion {
             action: "Check branch conditions and if/else structure".to_string(),
-        }];
+        });
 
         if summary.diff_op > 0 {
             suggestions.push(Suggestion {
@@ -808,6 +879,29 @@ pub fn compute_verdict(
     });
 
     if has_register_swap && merged_ratio < 0.3 {
+        let mut suggestions = Vec::new();
+
+        // Add specific register swap details
+        if let Some(rs_pattern) = analysis.patterns.iter().find(|p| p.pattern == PatternType::RegisterSwap) {
+            if let PatternDetails::RegisterSwap { swaps } = &rs_pattern.details {
+                for swap in swaps.iter().take(3) {
+                    suggestions.push(Suggestion {
+                        action: format!(
+                            "Register swap {}↔{} at {} location(s)",
+                            swap.target_reg, swap.base_reg, swap.count
+                        ),
+                    });
+                }
+            }
+        }
+
+        suggestions.push(Suggestion {
+            action: "Reorder local variable declarations".to_string(),
+        });
+        suggestions.push(Suggestion {
+            action: "Move variable initialization closer to first use".to_string(),
+        });
+
         return Verdict {
             classification: VerdictClassification::MaybeFixable,
             confidence: Confidence::Medium,
@@ -818,14 +912,7 @@ pub fn compute_verdict(
             factors,
             recommendation: "Try reordering variable declarations or delaying assignments."
                 .to_string(),
-            suggestions: vec![
-                Suggestion {
-                    action: "Reorder local variable declarations".to_string(),
-                },
-                Suggestion {
-                    action: "Move variable initialization closer to first use".to_string(),
-                },
-            ],
+            suggestions,
         };
     }
 
@@ -846,7 +933,7 @@ pub fn compute_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::diff::InstructionInfo;
+    use crate::cmd::diff::{InstructionInfo, TypedArg};
 
     fn make_instr(
         index: usize,
@@ -862,11 +949,46 @@ mod tests {
                 address: format!("{:#x}", index * 4),
                 opcode: op.to_string(),
                 args: target_args.map(|s| s.to_string()),
+                typed_args: None,
+                branch_dest: None,
             }),
             base: base_op.map(|op| InstructionInfo {
                 address: format!("{:#x}", index * 4),
                 opcode: op.to_string(),
                 args: base_args.map(|s| s.to_string()),
+                typed_args: None,
+                branch_dest: None,
+            }),
+            match_type: match_type.to_string(),
+        }
+    }
+
+    /// Helper function to create instruction with typed args for testing
+    fn make_instr_typed(
+        index: usize,
+        match_type: &str,
+        target_op: Option<&str>,
+        target_typed_args: Option<Vec<TypedArg>>,
+        base_op: Option<&str>,
+        base_typed_args: Option<Vec<TypedArg>>,
+        target_branch_dest: Option<u64>,
+        base_branch_dest: Option<u64>,
+    ) -> InstructionDiffOutput {
+        InstructionDiffOutput {
+            index,
+            target: target_op.map(|op| InstructionInfo {
+                address: format!("{:#x}", index * 4),
+                opcode: op.to_string(),
+                args: None, // typed_args takes precedence
+                typed_args: target_typed_args,
+                branch_dest: target_branch_dest,
+            }),
+            base: base_op.map(|op| InstructionInfo {
+                address: format!("{:#x}", index * 4),
+                opcode: op.to_string(),
+                args: None,
+                typed_args: base_typed_args,
+                branch_dest: base_branch_dest,
             }),
             match_type: match_type.to_string(),
         }
@@ -1185,5 +1307,104 @@ mod tests {
         let analysis = analyze_instructions(&instructions);
         assert!(analysis.patterns_checked.contains(&"COMPARISON_STYLE"));
         assert!(analysis.patterns_checked.contains(&"CONTROL_FLOW"));
+    }
+
+    #[test]
+    fn test_detect_bool_mask_with_typed_args() {
+        // Test bool mask detection using typed args (more reliable than string matching)
+        let instructions = vec![
+            make_instr_typed(
+                0,
+                "delete",
+                Some("clrlwi"),
+                Some(vec![
+                    TypedArg::Register("r3".to_string()),
+                    TypedArg::Register("r11".to_string()),
+                    TypedArg::Unsigned(24), // bit position
+                ]),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        let pattern = detect_bool_mask(&instructions).expect("Should detect bool mask with typed args");
+        assert_eq!(pattern.pattern, PatternType::BoolMask);
+        assert_eq!(pattern.instruction_count, 1);
+
+        if let PatternDetails::BoolMask { bit_positions } = &pattern.details {
+            assert!(bit_positions.contains(&24));
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_bool_mask_rlwinm_typed_args() {
+        // Test rlwinm bool mask detection using typed args
+        let instructions = vec![
+            make_instr_typed(
+                0,
+                "insert",
+                None,
+                None,
+                Some("rlwinm"),
+                Some(vec![
+                    TypedArg::Register("r3".to_string()),
+                    TypedArg::Register("r5".to_string()),
+                    TypedArg::Unsigned(0),  // shift
+                    TypedArg::Unsigned(31), // mask begin
+                    TypedArg::Unsigned(31), // mask end
+                ]),
+                None,
+                None,
+            ),
+        ];
+
+        let pattern = detect_bool_mask(&instructions).expect("Should detect rlwinm bool mask");
+        assert_eq!(pattern.pattern, PatternType::BoolMask);
+
+        if let PatternDetails::BoolMask { bit_positions } = &pattern.details {
+            assert!(bit_positions.contains(&31));
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_control_flow_with_branch_dest() {
+        // Test control flow detection using branch_dest (more accurate than opcode matching)
+        let instructions = vec![
+            make_instr_typed(
+                0,
+                "diff_op",
+                Some("beq"), // custom opcode, but has branch_dest
+                None,
+                Some("bne"),
+                None,
+                Some(0x100), // target branch dest
+                Some(0x100), // base branch dest
+            ),
+        ];
+
+        let pattern = detect_control_flow(&instructions).expect("Should detect control flow with branch_dest");
+        assert_eq!(pattern.pattern, PatternType::ControlFlow);
+        assert_eq!(pattern.instruction_count, 1);
+    }
+
+    #[test]
+    fn test_typed_arg_methods() {
+        // Test TypedArg helper methods
+        assert!(TypedArg::Register("r3".to_string()).is_register());
+        assert!(!TypedArg::Signed(5).is_register());
+
+        assert!(TypedArg::Signed(-10).is_numeric());
+        assert!(TypedArg::Unsigned(100).is_numeric());
+        assert!(!TypedArg::Symbol("func".to_string()).is_numeric());
+
+        assert_eq!(TypedArg::Signed(-5).as_i64(), Some(-5));
+        assert_eq!(TypedArg::Unsigned(100).as_i64(), Some(100));
+        assert_eq!(TypedArg::Register("r3".to_string()).as_i64(), None);
     }
 }

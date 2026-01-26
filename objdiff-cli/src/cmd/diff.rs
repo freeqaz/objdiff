@@ -79,6 +79,52 @@ impl DiffOutputFormat {
 }
 
 // JSON output structures
+
+/// Typed argument representation for JSON output.
+/// Preserves type information from objdiff-core's InstructionArg.
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "type", content = "value")]
+pub enum TypedArg {
+    /// Signed integer value
+    Signed(i64),
+    /// Unsigned integer value
+    Unsigned(u64),
+    /// Register name (opaque values that look like registers)
+    Register(String),
+    /// Symbol reference from relocation
+    Symbol(String),
+    /// Branch destination address
+    BranchDest(u64),
+    /// Other opaque values (labels, etc.)
+    Other(String),
+}
+
+impl TypedArg {
+    /// Check if this is a register argument.
+    /// Used by analysis pattern detection and external consumers.
+    #[allow(dead_code)]
+    pub fn is_register(&self) -> bool {
+        matches!(self, TypedArg::Register(_))
+    }
+
+    /// Check if this is a numeric value (signed or unsigned).
+    /// Used by analysis pattern detection and external consumers.
+    #[allow(dead_code)]
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, TypedArg::Signed(_) | TypedArg::Unsigned(_))
+    }
+
+    /// Get the numeric value if this is a signed or unsigned arg.
+    /// Used by analysis pattern detection for value comparisons.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            TypedArg::Signed(v) => Some(*v),
+            TypedArg::Unsigned(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct DiffOutput {
     pub symbol: String,
@@ -129,12 +175,20 @@ pub struct InstructionDiffOutput {
     pub match_type: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct InstructionInfo {
     pub address: String,
     pub opcode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
+    /// Typed arguments preserving type information from objdiff-core.
+    /// New in v3.6+: provides structured access to instruction arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typed_args: Option<Vec<TypedArg>>,
+    /// Branch destination address if this instruction is a branch.
+    /// Populated from InstructionArg::BranchDest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_dest: Option<u64>,
 }
 
 /// Result of analyzing a single symbol for the batch analyze command.
@@ -759,6 +813,42 @@ fn build_instruction_diffs(
     Ok(instructions)
 }
 
+/// Regex to detect register names (r0-r31, f0-f31, cr0-cr7, etc.)
+static REGISTER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^([rf]\d+|cr\d+|sp|lr|ctr|xer)$").unwrap()
+});
+
+/// Convert an InstructionArg to a TypedArg for JSON serialization.
+fn convert_to_typed_arg(
+    arg: &objdiff_core::obj::InstructionArg,
+    relocation: Option<&objdiff_core::obj::ResolvedRelocation>,
+) -> TypedArg {
+    use objdiff_core::obj::{InstructionArg, InstructionArgValue};
+
+    match arg {
+        InstructionArg::Value(v) => match v {
+            InstructionArgValue::Signed(n) => TypedArg::Signed(*n),
+            InstructionArgValue::Unsigned(n) => TypedArg::Unsigned(*n),
+            InstructionArgValue::Opaque(s) => {
+                // Classify opaque values as registers or other
+                if REGISTER_RE.is_match(s.as_ref()) {
+                    TypedArg::Register(s.to_string())
+                } else {
+                    TypedArg::Other(s.to_string())
+                }
+            }
+        },
+        InstructionArg::Reloc => {
+            // Get symbol name from relocation if available
+            let symbol_name = relocation
+                .map(|r| r.symbol.name.clone())
+                .unwrap_or_else(|| "<reloc>".to_string());
+            TypedArg::Symbol(symbol_name)
+        }
+        InstructionArg::BranchDest(addr) => TypedArg::BranchDest(*addr),
+    }
+}
+
 fn build_instruction_info(
     obj: &Object,
     symbol_idx: usize,
@@ -770,6 +860,7 @@ fn build_instruction_info(
         .context("Failed to resolve instruction")?;
     let processed = obj.arch.process_instruction(resolved, diff_config)?;
 
+    // Build string args for backward compatibility
     let args_str = if processed.args.is_empty() {
         None
     } else {
@@ -787,10 +878,34 @@ fn build_instruction_info(
         Some(args.join(diff_config.separator()))
     };
 
+    // Build typed args preserving type information
+    let typed_args = if processed.args.is_empty() {
+        None
+    } else {
+        Some(
+            processed
+                .args
+                .iter()
+                .map(|arg| convert_to_typed_arg(arg, resolved.relocation.as_ref()))
+                .collect(),
+        )
+    };
+
+    // Extract branch destination if present
+    let branch_dest = processed.args.iter().find_map(|arg| {
+        if let objdiff_core::obj::InstructionArg::BranchDest(addr) = arg {
+            Some(*addr)
+        } else {
+            None
+        }
+    });
+
     Ok(InstructionInfo {
         address: format!("{:#x}", ins_ref.address),
         opcode: processed.mnemonic.to_string(),
         args: args_str,
+        typed_args,
+        branch_dest,
     })
 }
 
