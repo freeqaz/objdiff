@@ -1122,6 +1122,70 @@ pub fn has_function(obj_path: &std::path::Path, symbol_name: &str) -> Result<boo
         .is_some())
 }
 
+/// A symbol match result from `match_symbol_by_query`
+#[derive(Debug, Clone)]
+pub struct SymbolMatch {
+    /// The mangled symbol name
+    pub name: String,
+    /// The demangled symbol name (if available)
+    pub demangled: Option<String>,
+    /// Whether this was an exact match (vs partial/contains match)
+    pub exact: bool,
+}
+
+/// Match symbols by exact name or demangled name.
+///
+/// Returns all matching symbols in the object file. Use the `exact` field to
+/// distinguish between exact matches and partial (contains) matches.
+#[cfg(feature = "std")]
+pub fn match_symbol_by_query(
+    obj_path: &std::path::Path,
+    query: &str,
+    config: &DiffObjConfig,
+) -> Result<Vec<SymbolMatch>> {
+    let data = {
+        let file = std::fs::File::open(obj_path)?;
+        unsafe { memmap2::Mmap::map(&file) }?
+    };
+    let file = object::File::parse(&*data)?;
+    let mut matches = Vec::new();
+
+    for symbol in file.symbols() {
+        if symbol.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = symbol.name() else { continue };
+
+        // Exact match on mangled name
+        if name == query {
+            let demangled = config.demangler.demangle(name);
+            matches.push(SymbolMatch { name: name.to_string(), demangled, exact: true });
+            continue;
+        }
+
+        // Try demangling and matching
+        if let Some(demangled) = config.demangler.demangle(name) {
+            if demangled == query {
+                // Exact match on demangled name
+                matches.push(SymbolMatch {
+                    name: name.to_string(),
+                    demangled: Some(demangled),
+                    exact: true,
+                });
+            } else if demangled.contains(query) {
+                // Partial match (demangled name contains query)
+                matches.push(SymbolMatch {
+                    name: name.to_string(),
+                    demangled: Some(demangled),
+                    exact: false,
+                });
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
 fn parse_split_meta(obj_file: &object::File) -> Result<Option<SplitMeta>> {
     Ok(if let Some(section) = obj_file.section_by_name(SPLITMETA_SECTION) {
         Some(SplitMeta::from_section(section, obj_file.endianness(), obj_file.is_64())?)

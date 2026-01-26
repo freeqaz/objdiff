@@ -345,6 +345,28 @@ impl Object {
         self.symbols.iter().position(|symbol| symbol.section.is_some() && symbol.name == name)
     }
 
+    /// Look up a symbol by mangled name first, then fall back to demangled name matching.
+    /// Supports exact matches and contains matches (for partial demangled names).
+    /// Returns the symbol index if found.
+    pub fn symbol_by_name_or_demangled(&self, name: &str) -> Option<usize> {
+        // First try exact match on mangled name
+        if let Some(idx) = self.symbol_by_name(name) {
+            return Some(idx);
+        }
+        // Try exact match on demangled name
+        if let Some(idx) = self.symbols.iter().position(|symbol| {
+            symbol.section.is_some()
+                && symbol.demangled_name.as_ref().is_some_and(|d| d == name)
+        }) {
+            return Some(idx);
+        }
+        // Fall back to contains match on demangled name (for partial queries like "Box::Volume")
+        self.symbols.iter().position(|symbol| {
+            symbol.section.is_some()
+                && symbol.demangled_name.as_ref().is_some_and(|d| d.contains(name))
+        })
+    }
+
     pub fn get_flow_analysis_result(&self, symbol: &Symbol) -> Option<&dyn FlowAnalysisResult> {
         let key = symbol.section.unwrap_or_default() as u64 * 1024 * 1024 * 1024 + symbol.address;
         self.flow_analysis_results.get(&key).map(|result| result.as_ref())
