@@ -39,7 +39,7 @@ fn cross_endian_diff() {
     let right_symbol_idx =
         obj_le.symbols.iter().position(|s| s.name == "func_00000000__FPcPc").unwrap();
     let (left_diff, right_diff) =
-        diff::code::diff_code(&obj_be, &obj_le, left_symbol_idx, right_symbol_idx, &diff_config)
+        diff::code::diff_code(&obj_be, &obj_le, left_symbol_idx, right_symbol_idx, &diff_config, &Default::default())
             .unwrap();
     // Although the objects differ in endianness, the instructions should match.
     assert_eq!(left_diff.instruction_rows[0].kind, diff::InstructionDiffKind::None);

@@ -1,5 +1,7 @@
 #[cfg(feature = "dwarf")]
 mod dwarf2;
+#[cfg(feature = "std")]
+pub mod map_file;
 mod mdebug;
 pub mod read;
 pub mod split_meta;

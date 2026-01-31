@@ -61,6 +61,10 @@ pub fn diff_code(
     left_symbol_idx: usize,
     right_symbol_idx: usize,
     diff_config: &DiffObjConfig,
+    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
+        alloc::string::String,
+        std::collections::HashSet<alloc::string::String>,
+    >,
 ) -> Result<(SymbolDiff, SymbolDiff)> {
     let left_symbol = &left_obj.symbols[left_symbol_idx];
     let right_symbol = &right_obj.symbols[right_symbol_idx];
@@ -132,6 +136,8 @@ pub fn diff_code(
             right_row,
             diff_config,
             &mut diff_state,
+            #[cfg(feature = "std")]
+            symbol_equivalences,
         )?;
         left_row.kind = result.kind;
         right_row.kind = result.kind;
@@ -302,6 +308,10 @@ fn reloc_eq(
     left_ins: ResolvedInstructionRef,
     right_ins: ResolvedInstructionRef,
     diff_config: &DiffObjConfig,
+    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
+        alloc::string::String,
+        std::collections::HashSet<alloc::string::String>,
+    >,
 ) -> bool {
     let relax_reloc_diffs = diff_config.function_reloc_diffs == FunctionRelocDiffs::None;
     let (left_reloc, right_reloc) = match (left_ins.relocation, right_ins.relocation) {
@@ -318,8 +328,21 @@ fn reloc_eq(
         return true;
     }
 
-    let symbol_name_addend_matches = left_reloc.symbol.name == right_reloc.symbol.name
-        && left_reloc.relocation.addend == right_reloc.relocation.addend;
+    let names_match = left_reloc.symbol.name == right_reloc.symbol.name || {
+        #[cfg(feature = "std")]
+        {
+            symbol_equivalences
+                .get(&left_reloc.symbol.name)
+                .is_some_and(|group| group.contains(&right_reloc.symbol.name))
+                || symbol_equivalences
+                    .get(&right_reloc.symbol.name)
+                    .is_some_and(|group| group.contains(&left_reloc.symbol.name))
+        }
+        #[cfg(not(feature = "std"))]
+        false
+    };
+    let symbol_name_addend_matches =
+        names_match && left_reloc.relocation.addend == right_reloc.relocation.addend;
     match (&left_reloc.symbol.section, &right_reloc.symbol.section) {
         (Some(sl), Some(sr)) => {
             // Match if section and name or address match
@@ -347,6 +370,10 @@ fn arg_eq(
     left_ins: ResolvedInstructionRef,
     right_ins: ResolvedInstructionRef,
     diff_config: &DiffObjConfig,
+    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
+        alloc::string::String,
+        std::collections::HashSet<alloc::string::String>,
+    >,
 ) -> bool {
     match left_arg {
         InstructionArg::Value(l) => match right_arg {
@@ -358,7 +385,15 @@ fn arg_eq(
         },
         InstructionArg::Reloc => {
             matches!(right_arg, InstructionArg::Reloc)
-                && reloc_eq(left_obj, right_obj, left_ins, right_ins, diff_config)
+                && reloc_eq(
+                    left_obj,
+                    right_obj,
+                    left_ins,
+                    right_ins,
+                    diff_config,
+                    #[cfg(feature = "std")]
+                    symbol_equivalences,
+                )
         }
         InstructionArg::BranchDest(_) => match right_arg {
             // Compare dest instruction idx after diffing
@@ -408,6 +443,10 @@ fn diff_instruction(
     right_row: &InstructionDiffRow,
     diff_config: &DiffObjConfig,
     state: &mut InstructionDiffState,
+    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
+        alloc::string::String,
+        std::collections::HashSet<alloc::string::String>,
+    >,
 ) -> Result<InstructionDiffResult> {
     let (l, r) = match (l, r) {
         (Some(l), Some(r)) => (l, r),
@@ -436,7 +475,15 @@ fn diff_instruction(
         .context("Failed to resolve right instruction")?;
 
     if left_resolved.code != right_resolved.code
-        || !reloc_eq(left_obj, right_obj, left_resolved, right_resolved, diff_config)
+        || !reloc_eq(
+            left_obj,
+            right_obj,
+            left_resolved,
+            right_resolved,
+            diff_config,
+            #[cfg(feature = "std")]
+            symbol_equivalences,
+        )
     {
         // If either the raw code bytes or relocations don't match, process instructions and compare args
         let left_ins = left_obj.arch.process_instruction(left_resolved, diff_config)?;
@@ -461,6 +508,8 @@ fn diff_instruction(
                 left_resolved,
                 right_resolved,
                 diff_config,
+                #[cfg(feature = "std")]
+                symbol_equivalences,
             ) {
                 result.left_args_diff.push(InstructionArgDiffIndex::NONE);
                 result.right_args_diff.push(InstructionArgDiffIndex::NONE);

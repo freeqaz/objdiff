@@ -48,6 +48,12 @@ pub struct ProjectConfig {
     pub progress_categories: Option<Vec<ProjectProgressCategory>>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub options: Option<ProjectOptions>,
+    /// Path to an MSVC linker map file for ICF symbol equivalence resolution.
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "unix_path_serde_option", skip_serializing_if = "Option::is_none")
+    )]
+    pub map_file: Option<Utf8UnixPathBuf>,
 }
 
 impl ProjectConfig {

@@ -309,6 +309,21 @@ fn generate(args: GenerateArgs) -> Result<()> {
         if args.deduplicate { 1 } else { rayon::current_num_threads() }
     );
 
+    // Load map file for ICF symbol equivalences
+    let mapping_config = if let Some(map_file) = &project.map_file {
+        let map_path = project_dir.join(map_file.with_platform_encoding());
+        let file = std::fs::File::open(map_path.as_str())
+            .with_context(|| format!("Failed to open map file: {}", map_path))?;
+        let reader = std::io::BufReader::new(file);
+        let equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
+        info!("Loaded {} ICF equivalence entries from {}", equivalences.len(), map_path);
+        let mut mc = diff::MappingConfig::default();
+        mc.symbol_equivalences = equivalences;
+        mc
+    } else {
+        diff::MappingConfig::default()
+    };
+
     let start = Instant::now();
     let mut units = vec![];
     let mut existing_functions: HashSet<String> = HashSet::new();
@@ -321,7 +336,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
                 project_units.get(*unit_idx).and_then(ProjectObject::options),
                 &args.config,
             )?;
-            if let Some(unit) = report_object(object, &diff_config, Some(&mut existing_functions))?
+            if let Some(unit) = report_object(object, &diff_config, Some(&mut existing_functions), Some(&mapping_config))?
             {
                 units.push(unit);
             }
@@ -336,7 +351,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
                     project_units.get(*unit_idx).and_then(ProjectObject::options),
                     &args.config,
                 )?;
-                report_object(object, &diff_config, None)
+                report_object(object, &diff_config, None, Some(&mapping_config))
             })
             .collect::<Result<Vec<Option<ReportUnit>>>>()?;
         units = vec.into_iter().flatten().collect();
@@ -381,6 +396,7 @@ fn report_object(
     object: &ObjectConfig,
     diff_config: &diff::DiffObjConfig,
     mut existing_functions: Option<&mut HashSet<String>>,
+    mapping_config: Option<&diff::MappingConfig>,
 ) -> Result<Option<ReportUnit>> {
     match (&object.target_path, &object.base_path) {
         (None, Some(_)) if !object.complete.unwrap_or(false) => {
@@ -393,7 +409,8 @@ fn report_object(
         }
         _ => {}
     }
-    let mapping_config = diff::MappingConfig::default();
+    let default_mapping = diff::MappingConfig::default();
+    let mapping_config = mapping_config.unwrap_or(&default_mapping);
     let target = object
         .target_path
         .as_ref()
@@ -411,7 +428,7 @@ fn report_object(
         })
         .transpose()?;
     let result =
-        diff::diff_objs(target.as_ref(), base.as_ref(), None, diff_config, &mapping_config)?;
+        diff::diff_objs(target.as_ref(), base.as_ref(), None, diff_config, mapping_config)?;
 
     let metadata = ReportUnitMetadata {
         complete: object.metadata.complete,
@@ -1435,6 +1452,21 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
         by_unit.entry(unit.name.as_str()).or_default().push((*unit, *func));
     }
 
+    // Load map file for ICF symbol equivalences
+    let mapping_config = if let Some(map_file) = &project_config.map_file {
+        let map_path = project_dir.join(map_file.with_platform_encoding());
+        let file = std::fs::File::open(map_path.as_str())
+            .with_context(|| format!("Failed to open map file: {}", map_path))?;
+        let reader = std::io::BufReader::new(file);
+        let equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
+        info!("Loaded {} ICF equivalence entries from {}", equivalences.len(), map_path);
+        let mut mc = diff::MappingConfig::default();
+        mc.symbol_equivalences = equivalences;
+        mc
+    } else {
+        diff::MappingConfig::default()
+    };
+
     // Process each unit
     let mut results = AnalyzeResults {
         likely_fixable: Vec::new(),
@@ -1459,7 +1491,6 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
             unit_options,
             &args.config,
         )?;
-        let mapping_config = diff::MappingConfig::default();
 
         // Load objects
         let target_obj = object_config

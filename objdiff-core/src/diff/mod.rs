@@ -4,6 +4,9 @@ use alloc::{
     vec,
     vec::Vec,
 };
+
+#[cfg(feature = "std")]
+use std::collections::{HashMap, HashSet};
 use core::{num::NonZeroU32, ops::Range};
 
 use anyhow::Result;
@@ -225,6 +228,8 @@ pub fn diff_objs(
                             left_symbol_ref,
                             right_symbol_ref,
                             diff_config,
+                            #[cfg(feature = "std")]
+                            &mapping_config.symbol_equivalences,
                         )?;
                         left_out.symbols[left_symbol_ref] = left_diff;
                         right_out.symbols[right_symbol_ref] = right_diff;
@@ -237,6 +242,8 @@ pub fn diff_objs(
                                 right_symbol_ref,
                                 prev_symbol_ref,
                                 diff_config,
+                                #[cfg(feature = "std")]
+                                &mapping_config.symbol_equivalences,
                             )?;
                             prev_out.symbols[prev_symbol_ref] = prev_diff;
                         }
@@ -457,7 +464,17 @@ fn generate_mapping_symbols(
         };
         let (left_diff, right_diff) = match base_section_kind {
             SectionKind::Code => {
-                diff_code(left_obj, right_obj, left_symbol_idx, right_symbol_idx, config)
+                #[cfg(feature = "std")]
+                let empty_equivalences = HashMap::new();
+                diff_code(
+                    left_obj,
+                    right_obj,
+                    left_symbol_idx,
+                    right_symbol_idx,
+                    config,
+                    #[cfg(feature = "std")]
+                    &empty_equivalences,
+                )
             }
             SectionKind::Data => {
                 diff_data_symbol(left_obj, right_obj, left_symbol_idx, right_symbol_idx)
@@ -504,6 +521,11 @@ pub struct MappingConfig {
     pub selecting_left: Option<String>,
     /// The left object symbol name that we're selecting a right symbol for
     pub selecting_right: Option<String>,
+    /// ICF merged symbol equivalence groups.
+    /// Maps each symbol name to the set of names it's equivalent to.
+    #[cfg(feature = "std")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub symbol_equivalences: HashMap<String, HashSet<String>>,
 }
 
 fn apply_symbol_mappings(

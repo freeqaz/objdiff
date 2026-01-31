@@ -333,14 +333,17 @@ pub struct Args {
     #[argp(switch)]
     /// Use incremental build targeting specific .obj file (default when using --build)
     incremental: bool,
+    #[argp(option, from_str_fn(platform_path))]
+    /// Path to MSVC linker map file for ICF symbol equivalence
+    map_file: Option<Utf8PlatformPathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let (target_path, base_path, project_config, unit_options) =
+    let (target_path, base_path, project_config, unit_options, project_dir) =
         match (&args.target, &args.base, &args.project, &args.unit) {
             (Some(_), Some(_), None, None)
             | (Some(_), None, None, None)
-            | (None, Some(_), None, None) => (args.target.clone(), args.base.clone(), None, None),
+            | (None, Some(_), None, None) => (args.target.clone(), args.base.clone(), None, None, None),
             (None, None, p, u) => {
                 let project = match p {
                     Some(project) => project.clone(),
@@ -484,7 +487,7 @@ pub fn run(args: Args) -> Result<()> {
                 let unit_options = units.get(unit_idx).and_then(|u| u.options().cloned());
                 let target_path = object.target_path.clone();
                 let base_path = object.base_path.clone();
-                (target_path, base_path, Some(project_config), unit_options)
+                (target_path, base_path, Some(project_config), unit_options, Some(project))
             }
             _ => bail!("Either target and base or project and unit must be specified"),
         };
@@ -542,16 +545,16 @@ pub fn run(args: Args) -> Result<()> {
 
     match output_format {
         DiffOutputFormat::Tui => {
-            run_interactive(args, target_path, base_path, project_config, unit_options)
+            run_interactive(args, target_path, base_path, project_config, unit_options, project_dir)
         }
         DiffOutputFormat::Proto => {
             // Use upstream oneshot mode for proto output (binding format)
             let output = args.output.as_deref().unwrap_or(Utf8PlatformPath::new("-"));
-            run_oneshot(&args, output, target_path.as_deref(), base_path.as_deref(), unit_options)
+            run_oneshot(&args, output, target_path.as_deref(), base_path.as_deref(), unit_options, project_dir.as_deref())
         }
         _ => {
             // Use enhanced JSON/markdown output with analysis support
-            run_json(args, target_path, base_path, project_config, unit_options, output_format)
+            run_json(args, target_path, base_path, project_config, unit_options, output_format, project_dir)
         }
     }
 }
@@ -562,10 +565,11 @@ fn run_oneshot(
     target_path: Option<&Utf8PlatformPath>,
     base_path: Option<&Utf8PlatformPath>,
     unit_options: Option<ProjectOptions>,
+    project_dir: Option<&Utf8PlatformPath>,
 ) -> Result<()> {
     use crate::util::output::{OutputFormat, write_output};
     let output_format = OutputFormat::Proto; // Proto is the only format that uses oneshot
-    let (diff_config, mapping_config) = build_config_from_args(args, None, unit_options.as_ref())?;
+    let (diff_config, mapping_config) = build_config_from_args(args, None, unit_options.as_ref(), project_dir)?;
     let target = target_path
         .map(|p| {
             obj::read::read(p.as_ref(), &diff_config, DiffSide::Target)
@@ -591,6 +595,7 @@ fn build_config_from_args(
     args: &Args,
     project_config: Option<&ProjectConfig>,
     unit_options: Option<&ProjectOptions>,
+    project_dir: Option<&Utf8PlatformPath>,
 ) -> Result<(DiffObjConfig, MappingConfig)> {
     let mut diff_config = DiffObjConfig::default();
     if let Some(options) = project_config.and_then(|config| config.options.as_ref()) {
@@ -600,7 +605,35 @@ fn build_config_from_args(
         apply_project_options(&mut diff_config, options)?;
     }
     apply_config_args(&mut diff_config, &args.config)?;
-    Ok((diff_config, MappingConfig::default()))
+
+    let mut mapping_config = MappingConfig::default();
+
+    // Load map file: CLI arg takes precedence over project config
+    let map_file_path = args.map_file.clone().or_else(|| {
+        project_config.and_then(|c| {
+            c.map_file.as_ref().map(|p| {
+                if let Some(dir) = project_dir {
+                    dir.join(p.with_platform_encoding())
+                } else {
+                    Utf8PlatformPathBuf::from(p.as_str())
+                }
+            })
+        })
+    });
+    if let Some(map_path) = &map_file_path {
+        let file = std::fs::File::open(map_path.as_str())
+            .with_context(|| format!("Failed to open map file: {}", map_path))?;
+        let reader = std::io::BufReader::new(file);
+        mapping_config.symbol_equivalences =
+            objdiff_core::obj::map_file::parse_msvc_map(reader);
+        eprintln!(
+            "Loaded {} ICF equivalence entries from {}",
+            mapping_config.symbol_equivalences.len(),
+            map_path
+        );
+    }
+
+    Ok((diff_config, mapping_config))
 }
 
 fn run_json(
@@ -610,6 +643,7 @@ fn run_json(
     project_config: Option<ProjectConfig>,
     unit_options: Option<ProjectOptions>,
     output_format: DiffOutputFormat,
+    project_dir: Option<Utf8PlatformPathBuf>,
 ) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
@@ -618,7 +652,7 @@ fn run_json(
     };
 
     let (diff_config, mapping_config) =
-        build_config_from_args(&args, project_config.as_ref(), unit_options.as_ref())?;
+        build_config_from_args(&args, project_config.as_ref(), unit_options.as_ref(), project_dir.as_deref())?;
 
     // Read target object
     let target_obj = target_path
@@ -1506,12 +1540,13 @@ fn run_interactive(
     base_path: Option<Utf8PlatformPathBuf>,
     project_config: Option<ProjectConfig>,
     unit_options: Option<ProjectOptions>,
+    project_dir: Option<Utf8PlatformPathBuf>,
 ) -> Result<()> {
     let Some(symbol_name) = &args.symbol else { bail!("Interactive mode requires a symbol name") };
     let time_format = time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]")
         .context("Failed to parse time format")?;
     let (diff_obj_config, mapping_config) =
-        build_config_from_args(&args, project_config.as_ref(), unit_options.as_ref())?;
+        build_config_from_args(&args, project_config.as_ref(), unit_options.as_ref(), project_dir.as_deref())?;
     let mut state = AppState {
         jobs: Default::default(),
         waker: Default::default(),
