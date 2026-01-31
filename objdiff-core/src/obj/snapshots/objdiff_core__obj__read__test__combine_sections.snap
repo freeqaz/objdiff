@@ -1,5 +1,6 @@
 ---
 source: objdiff-core/src/obj/read.rs
+assertion_line: 1294
 expression: "(sections, symbols)"
 ---
 (
@@ -74,8 +75,14 @@ expression: "(sections, symbols)"
                 },
             ],
             line_info: {
-                0: 1,
-                8: 2,
+                0: (
+                    1,
+                    "",
+                ),
+                8: (
+                    2,
+                    "",
+                ),
             },
             virtual_address: None,
         },

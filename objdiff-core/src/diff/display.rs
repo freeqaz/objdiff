@@ -177,7 +177,8 @@ pub fn display_row(
         InstructionDiffKind::Insert => DiffTextColor::Insert,
         _ => DiffTextColor::Normal,
     };
-    if let Some(line) = resolved.section.line_info.range(..=ins_ref.address).last().map(|(_, &b)| b)
+    if let Some(line) =
+        resolved.section.line_info.range(..=ins_ref.address).last().map(|(_, (line, _))| *line)
     {
         cb(DiffTextSegment { text: DiffText::Line(line), color: DiffTextColor::Dim, pad_to: 5 })?;
     }

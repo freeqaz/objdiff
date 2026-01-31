@@ -165,6 +165,26 @@ pub struct BuildStatusOutput {
     pub stderr: Option<String>,
 }
 
+/// Detailed breakdown of a single argument difference.
+#[derive(Serialize, Clone)]
+pub struct ArgumentDiff {
+    /// Index of the argument in the instruction (0-based).
+    pub index: usize,
+    /// Type of argument: "register", "immediate", "symbol", "branch_dest", or "other".
+    pub arg_type: String,
+    /// The target (reference) value.
+    pub target: TypedArg,
+    /// The base (decompiled) value.
+    pub base: TypedArg,
+}
+
+/// Breakdown of all differing arguments in an instruction.
+#[derive(Serialize, Clone)]
+pub struct InstructionDiffBreakdown {
+    /// List of arguments that differ between target and base.
+    pub arguments: Vec<ArgumentDiff>,
+}
+
 #[derive(Serialize)]
 pub struct InstructionDiffOutput {
     pub index: usize,
@@ -173,6 +193,9 @@ pub struct InstructionDiffOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<InstructionInfo>,
     pub match_type: String,
+    /// Detailed breakdown of which arguments differ (only for diff_arg type).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_breakdown: Option<InstructionDiffBreakdown>,
 }
 
 #[derive(Serialize, Clone)]
@@ -189,6 +212,12 @@ pub struct InstructionInfo {
     /// Populated from InstructionArg::BranchDest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_dest: Option<u64>,
+    /// Source line number from DWARF debug info.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_number: Option<u32>,
+    /// Source file path from DWARF debug info.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
 }
 
 /// Result of analyzing a single symbol for the batch analyze command.
@@ -802,15 +831,104 @@ fn build_instruction_diffs(
             .or_else(|| right_row.map(|r| r.kind))
             .unwrap_or(InstructionDiffKind::None);
 
+        // Compute diff breakdown if this is an argument mismatch
+        let diff_breakdown = if kind == InstructionDiffKind::ArgMismatch {
+            compute_arg_diff_breakdown(target_info.as_ref(), base_info.as_ref())
+        } else {
+            None
+        };
+
         instructions.push(InstructionDiffOutput {
             index: idx,
             target: target_info,
             base: base_info,
             match_type: match_type_str(kind).to_string(),
+            diff_breakdown,
         });
     }
 
     Ok(instructions)
+}
+
+/// Compute which arguments differ between target and base instructions.
+fn compute_arg_diff_breakdown(
+    target: Option<&InstructionInfo>,
+    base: Option<&InstructionInfo>,
+) -> Option<InstructionDiffBreakdown> {
+    let target_args = target.and_then(|t| t.typed_args.as_ref())?;
+    let base_args = base.and_then(|b| b.typed_args.as_ref())?;
+
+    let mut arguments = Vec::new();
+
+    // Compare arguments at each position
+    let max_len = target_args.len().max(base_args.len());
+    for i in 0..max_len {
+        let target_arg = target_args.get(i);
+        let base_arg = base_args.get(i);
+
+        match (target_arg, base_arg) {
+            (Some(t), Some(b)) if !typed_args_equal(t, b) => {
+                arguments.push(ArgumentDiff {
+                    index: i,
+                    arg_type: typed_arg_type(t),
+                    target: t.clone(),
+                    base: b.clone(),
+                });
+            }
+            (Some(t), None) => {
+                // Target has arg, base doesn't
+                arguments.push(ArgumentDiff {
+                    index: i,
+                    arg_type: typed_arg_type(t),
+                    target: t.clone(),
+                    base: TypedArg::Other("<missing>".to_string()),
+                });
+            }
+            (None, Some(b)) => {
+                // Base has arg, target doesn't
+                arguments.push(ArgumentDiff {
+                    index: i,
+                    arg_type: typed_arg_type(b),
+                    target: TypedArg::Other("<missing>".to_string()),
+                    base: b.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if arguments.is_empty() {
+        None
+    } else {
+        Some(InstructionDiffBreakdown { arguments })
+    }
+}
+
+/// Check if two TypedArgs are equal for diff purposes.
+fn typed_args_equal(a: &TypedArg, b: &TypedArg) -> bool {
+    match (a, b) {
+        (TypedArg::Signed(x), TypedArg::Signed(y)) => x == y,
+        (TypedArg::Unsigned(x), TypedArg::Unsigned(y)) => x == y,
+        (TypedArg::Register(x), TypedArg::Register(y)) => x == y,
+        (TypedArg::Symbol(x), TypedArg::Symbol(y)) => x == y,
+        (TypedArg::BranchDest(x), TypedArg::BranchDest(y)) => x == y,
+        (TypedArg::Other(x), TypedArg::Other(y)) => x == y,
+        // Allow signed/unsigned comparison
+        (TypedArg::Signed(x), TypedArg::Unsigned(y)) => *x as u64 == *y,
+        (TypedArg::Unsigned(x), TypedArg::Signed(y)) => *x == *y as u64,
+        _ => false,
+    }
+}
+
+/// Get a string type name for a TypedArg.
+fn typed_arg_type(arg: &TypedArg) -> String {
+    match arg {
+        TypedArg::Signed(_) | TypedArg::Unsigned(_) => "immediate".to_string(),
+        TypedArg::Register(_) => "register".to_string(),
+        TypedArg::Symbol(_) => "symbol".to_string(),
+        TypedArg::BranchDest(_) => "branch_dest".to_string(),
+        TypedArg::Other(_) => "other".to_string(),
+    }
 }
 
 /// Regex to detect register names (r0-r31, f0-f31, cr0-cr7, etc.)
@@ -900,12 +1018,27 @@ fn build_instruction_info(
         }
     });
 
+    // Extract line number and source file from section line_info
+    let line_info = resolved
+        .section
+        .line_info
+        .range(..=ins_ref.address)
+        .last()
+        .map(|(_, info)| info);
+
+    let line_number = line_info.map(|(line, _)| *line);
+    let source_file = line_info
+        .map(|(_, file)| file.clone())
+        .filter(|f| !f.is_empty());
+
     Ok(InstructionInfo {
         address: format!("{:#x}", ins_ref.address),
         opcode: processed.mnemonic.to_string(),
         args: args_str,
         typed_args,
         branch_dest,
+        line_number,
+        source_file,
     })
 }
 
@@ -1088,6 +1221,29 @@ fn render_diff_markdown(output: &DiffOutput) -> String {
                                 md,
                                 "  - Index {}: {} vs {} ({})",
                                 bd.index, target, base, bd.match_type
+                            )
+                            .unwrap();
+                        }
+                    }
+                    PatternDetails::CommutativeOpOrder { swaps } => {
+                        for swap in swaps {
+                            writeln!(
+                                md,
+                                "  - Index {}: {} operands swapped ({} vs {})",
+                                swap.index,
+                                swap.opcode,
+                                swap.target_operands.join(", "),
+                                swap.base_operands.join(", ")
+                            )
+                            .unwrap();
+                        }
+                    }
+                    PatternDetails::OffsetSwap { swaps } => {
+                        for swap in swaps {
+                            writeln!(
+                                md,
+                                "  - Indices {:?}: offsets {:?} vs {:?}",
+                                swap.indices, swap.target_offsets, swap.base_offsets
                             )
                             .unwrap();
                         }

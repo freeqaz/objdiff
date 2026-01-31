@@ -162,7 +162,8 @@ fn assign_lines(sections: &mut [Section], base_address: u64, lines: &[i32]) {
         if line >= 0
             && let Some(section) = find_code_section(sections, address)
         {
-            section.line_info.insert(address, line as u32);
+            // mdebug format doesn't have per-line source file info, store empty string
+            section.line_info.insert(address, (line as u32, String::new()));
         }
         address = address.wrapping_add(4);
     }

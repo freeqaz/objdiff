@@ -755,7 +755,11 @@ fn parse_line_info_dwarf1(obj_file: &object::File, sections: &mut [Section]) -> 
                     log::warn!("Unhandled statement pos {statement_pos}");
                 }
                 let address_delta = read_u32(obj_file, &mut section_data)? as u64;
-                out_section.line_info.insert(base_address + address_delta, line_number);
+                // DWARF1 doesn't have per-instruction source file info
+                out_section.line_info.insert(
+                    base_address + address_delta,
+                    (line_number, String::new()),
+                );
             }
         }
     }
@@ -872,15 +876,18 @@ fn parse_line_info_coff(
                 cur_fun_start_linenumber = Some(bf_aux.linenumber.get(LE) as u32);
                 // Let's also synthesize a line number record from the start of
                 // the function, as the linenumber records don't always cover it.
+                // COFF doesn't have per-line source file info
                 out_section.line_info.insert(
                     sect.address() + symbol.value() as u64,
-                    bf_aux.linenumber.get(LE) as u32,
+                    (bf_aux.linenumber.get(LE) as u32, String::new()),
                 );
             } else if let Some(cur_linenumber) = cur_fun_start_linenumber {
                 let vaddr = linenum.symbol_table_index_or_virtual_address.get(LE);
-                out_section
-                    .line_info
-                    .insert(sect.address() + vaddr as u64, cur_linenumber + line_number as u32);
+                // COFF doesn't have per-line source file info
+                out_section.line_info.insert(
+                    sect.address() + vaddr as u64,
+                    (cur_linenumber + line_number as u32, String::new()),
+                );
             }
         }
     }
@@ -972,7 +979,7 @@ fn do_combine_sections(
     // Combine section data
     let mut data = Vec::<u8>::with_capacity(data_size);
     let mut relocations = Vec::<Relocation>::with_capacity(num_relocations);
-    let mut line_info = BTreeMap::<u64, u32>::new();
+    let mut line_info = BTreeMap::<u64, (u32, String)>::new();
     for (&i, &offset) in section_indices.iter().zip(&offsets) {
         let section = &mut sections[i];
         section.size = 0;
@@ -980,7 +987,13 @@ fn do_combine_sections(
         align_data_slice_to(&mut data, section.combined_alignment());
         section.relocations.iter_mut().for_each(|r| r.address += offset);
         relocations.append(&mut section.relocations);
-        line_info.append(&mut section.line_info.iter().map(|(&a, &l)| (a + offset, l)).collect());
+        line_info.append(
+            &mut section
+                .line_info
+                .iter()
+                .map(|(&a, (line, file))| (a + offset, (*line, file.clone())))
+                .collect(),
+        );
         section.line_info.clear();
         if offset > 0 {
             section.kind = SectionKind::Unknown;
@@ -1241,7 +1254,7 @@ mod test {
                     target_symbol: 2,
                     addend: 0,
                 }],
-                line_info: [(0, 1)].into_iter().collect(),
+                line_info: [(0, (1, String::new()))].into_iter().collect(),
                 ..Default::default()
             },
             Section {
@@ -1264,7 +1277,7 @@ mod test {
                 size: 4,
                 kind: SectionKind::Data,
                 data: SectionData(vec![9, 10, 11, 12]),
-                line_info: [(0, 2)].into_iter().collect(),
+                line_info: [(0, (2, String::new()))].into_iter().collect(),
                 ..Default::default()
             },
         ];

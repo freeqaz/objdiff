@@ -80,6 +80,8 @@ message DiffInstruction {
   optional uint64 branch_dest = 6;
   // Source line number (if present)
   optional uint32 line_number = 7;
+  // Source file path (if present, from DWARF debug info)
+  optional string source_file = 8;
 }
 
 // An instruction part

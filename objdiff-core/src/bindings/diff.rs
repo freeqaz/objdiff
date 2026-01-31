@@ -182,12 +182,18 @@ impl DiffInstruction {
 
         let relocation = resolved.relocation.map(|r| DiffRelocation::new(obj, r));
 
-        let line_number = resolved
+        // Extract line number and source file from line_info tuple
+        let line_info = resolved
             .section
             .line_info
             .range(..=resolved.ins_ref.address)
             .last()
-            .map(|(_, &line)| line);
+            .map(|(_, info)| info);
+
+        let line_number = line_info.map(|(line, _)| *line);
+        let source_file = line_info
+            .map(|(_, file)| file.clone())
+            .filter(|f| !f.is_empty());
 
         Ok(Self {
             address: resolved.ins_ref.address,
@@ -197,6 +203,7 @@ impl DiffInstruction {
             relocation,
             branch_dest: resolved.ins_ref.branch_dest,
             line_number,
+            source_file,
         })
     }
 }

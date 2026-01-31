@@ -75,8 +75,9 @@ fn ido_mdebug_line_numbers() {
     .unwrap();
 
     let text_section = obj.sections.iter().find(|s| s.name == ".text").unwrap();
-    assert_eq!(text_section.line_info.get(&0), Some(&6));
-    assert_eq!(text_section.line_info.get(&12), Some(&7));
-    assert_eq!(text_section.line_info.get(&56), Some(&9));
+    // line_info now stores (line_number, source_file) tuples
+    assert_eq!(text_section.line_info.get(&0).map(|(line, _)| *line), Some(6));
+    assert_eq!(text_section.line_info.get(&12).map(|(line, _)| *line), Some(7));
+    assert_eq!(text_section.line_info.get(&56).map(|(line, _)| *line), Some(9));
     assert_eq!(text_section.line_info.len(), 66);
 }

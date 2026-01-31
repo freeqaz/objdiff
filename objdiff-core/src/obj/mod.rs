@@ -80,7 +80,9 @@ pub struct Section {
     pub align: Option<NonZeroU64>,
     pub relocations: Vec<Relocation>,
     /// Line number info (.line or .debug_line section)
-    pub line_info: BTreeMap<u64, u32>,
+    /// Maps address -> (line_number, source_file_path)
+    /// Source file path may be empty if not available (e.g., mdebug format)
+    pub line_info: BTreeMap<u64, (u32, String)>,
     /// Original virtual address (from .note.split section)
     pub virtual_address: Option<u64>,
 }
@@ -448,7 +450,7 @@ static DUMMY_SECTION: Section = Section {
     flags: SectionFlagSet::empty(),
     align: None,
     relocations: Vec::new(),
-    line_info: BTreeMap::new(),
+    line_info: BTreeMap::new(), // Empty BTreeMap works for (u32, String) tuples too
     virtual_address: None,
 };
 

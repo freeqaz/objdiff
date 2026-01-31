@@ -64,6 +64,10 @@ pub enum PatternType {
     ComparisonStyle,
     /// Branch instruction differences (diff_op/replace on branches)
     ControlFlow,
+    /// Operand order swapped in commutative operations (fadd, fmul, add, etc.)
+    CommutativeOpOrder,
+    /// Two offsets swapped between target and base
+    OffsetSwap,
 }
 
 impl PatternType {
@@ -74,6 +78,8 @@ impl PatternType {
             PatternType::RegisterSwap => "REGISTER_SWAP",
             PatternType::ComparisonStyle => "COMPARISON_STYLE",
             PatternType::ControlFlow => "CONTROL_FLOW",
+            PatternType::CommutativeOpOrder => "COMMUTATIVE_OP_ORDER",
+            PatternType::OffsetSwap => "OFFSET_SWAP",
         }
     }
 }
@@ -130,6 +136,23 @@ pub struct BranchDiffInfo {
     pub match_type: String,
 }
 
+/// Information about a commutative operation with swapped operands.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommutativeOpInfo {
+    pub index: usize,
+    pub opcode: String,
+    pub target_operands: Vec<String>,
+    pub base_operands: Vec<String>,
+}
+
+/// Information about an offset swap between two instructions.
+#[derive(Debug, Clone, Serialize)]
+pub struct OffsetSwapInfo {
+    pub indices: (usize, usize),
+    pub target_offsets: (i64, i64),
+    pub base_offsets: (i64, i64),
+}
+
 /// Details specific to each pattern type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -153,6 +176,14 @@ pub enum PatternDetails {
     /// Control flow branch differences
     ControlFlow {
         branch_diffs: Vec<BranchDiffInfo>,
+    },
+    /// Commutative operation with swapped operands
+    CommutativeOpOrder {
+        swaps: Vec<CommutativeOpInfo>,
+    },
+    /// Offset swaps between instruction pairs
+    OffsetSwap {
+        swaps: Vec<OffsetSwapInfo>,
     },
 }
 
@@ -643,6 +674,230 @@ pub fn detect_control_flow(instructions: &[InstructionDiffOutput]) -> Option<Pat
     })
 }
 
+/// Commutative opcodes where operand order doesn't affect the result.
+/// Includes both integer and floating-point variants.
+const COMMUTATIVE_OPCODES: &[&str] = &[
+    // Floating-point
+    "fadd", "fadds", "fmul", "fmuls",
+    // Integer
+    "add", "addi", "addis", "and", "andi.", "andis.", "or", "ori", "oris", "xor", "xori", "xoris",
+    // Dot variants (set CR0)
+    "add.", "and.", "or.", "xor.",
+];
+
+/// Check if an opcode is a commutative operation.
+fn is_commutative_opcode(opcode: &str) -> bool {
+    COMMUTATIVE_OPCODES.contains(&opcode)
+}
+
+/// Extract operands from an instruction (excluding the destination register).
+/// For commutative operations like `fadd f0, f1, f2`, returns ["f1", "f2"].
+fn extract_source_operands(info: &InstructionInfo) -> Vec<String> {
+    // Prefer typed_args if available
+    if let Some(typed_args) = &info.typed_args {
+        // Skip the first arg (destination) and collect the rest
+        return typed_args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| match arg {
+                super::diff::TypedArg::Register(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+
+    // Fall back to string parsing
+    if let Some(args) = &info.args {
+        let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
+        // Skip the first (destination), return the rest
+        return parts.iter().skip(1).map(|s| s.to_string()).collect();
+    }
+
+    Vec::new()
+}
+
+/// Detect commutative operation order differences.
+///
+/// Looks for `diff_arg` instructions where the opcode is commutative
+/// (fadd, fmul, add, and, or, xor, etc.) and the operands are
+/// permuted between target and base.
+pub fn detect_commutative_op_order(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut swaps: Vec<CommutativeOpInfo> = Vec::new();
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else {
+            continue;
+        };
+
+        // Opcodes must match and be commutative
+        if target.opcode != base.opcode {
+            continue;
+        }
+
+        if !is_commutative_opcode(&target.opcode) {
+            continue;
+        }
+
+        let target_ops = extract_source_operands(target);
+        let base_ops = extract_source_operands(base);
+
+        // Must have exactly 2 source operands for a simple swap check
+        if target_ops.len() != 2 || base_ops.len() != 2 {
+            continue;
+        }
+
+        // Check if operands are swapped (a,b vs b,a)
+        if target_ops[0] == base_ops[1] && target_ops[1] == base_ops[0] {
+            swaps.push(CommutativeOpInfo {
+                index: instr.index,
+                opcode: target.opcode.clone(),
+                target_operands: target_ops,
+                base_operands: base_ops,
+            });
+        }
+    }
+
+    if swaps.is_empty() {
+        return None;
+    }
+
+    let count = swaps.len();
+
+    Some(Pattern {
+        pattern: PatternType::CommutativeOpOrder,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::CommutativeOpOrder { swaps },
+    })
+}
+
+/// Extract offset value from an instruction's memory operand.
+/// For instructions like `lwz r3, 0x10(r4)`, extracts 0x10.
+fn extract_offset(info: &InstructionInfo) -> Option<i64> {
+    // Prefer typed_args if available
+    if let Some(typed_args) = &info.typed_args {
+        // Look for a signed/unsigned integer that represents an offset
+        for arg in typed_args {
+            match arg {
+                super::diff::TypedArg::Signed(v) => return Some(*v),
+                super::diff::TypedArg::Unsigned(v) => return Some(*v as i64),
+                _ => continue,
+            }
+        }
+    }
+
+    // Fall back to string parsing: look for offset(reg) pattern
+    if let Some(args) = &info.args {
+        // Match patterns like "0x10(r4)" or "-0x8(r1)"
+        static OFFSET_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(-?0x[0-9a-fA-F]+|-?\d+)\(").unwrap());
+
+        if let Some(cap) = OFFSET_RE.captures(args) {
+            let offset_str = cap.get(1)?.as_str();
+            // Parse hex or decimal
+            if let Some(hex) = offset_str.strip_prefix("0x").or_else(|| offset_str.strip_prefix("-0x")) {
+                let is_neg = offset_str.starts_with('-');
+                if let Ok(val) = i64::from_str_radix(hex, 16) {
+                    return Some(if is_neg { -val } else { val });
+                }
+            } else {
+                return offset_str.parse().ok();
+            }
+        }
+    }
+
+    None
+}
+
+/// Detect offset swap patterns.
+///
+/// Looks for pairs of `diff_arg` instructions where the offsets are
+/// swapped between target and base. For example:
+/// - Instruction A: target has offset 0x4, base has offset 0x8
+/// - Instruction B: target has offset 0x8, base has offset 0x4
+///
+/// This indicates the compiler reordered struct field accesses.
+pub fn detect_offset_swap(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    // Collect all diff_arg instructions with offset differences
+    let mut offset_diffs: Vec<(usize, i64, i64)> = Vec::new(); // (index, target_offset, base_offset)
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else {
+            continue;
+        };
+
+        // Opcodes should match (same instruction type)
+        if target.opcode != base.opcode {
+            continue;
+        }
+
+        let target_offset = extract_offset(target);
+        let base_offset = extract_offset(base);
+
+        if let (Some(t_off), Some(b_off)) = (target_offset, base_offset) {
+            if t_off != b_off {
+                offset_diffs.push((instr.index, t_off, b_off));
+            }
+        }
+    }
+
+    // Look for symmetric swaps
+    let mut swaps: Vec<OffsetSwapInfo> = Vec::new();
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for i in 0..offset_diffs.len() {
+        if used.contains(&i) {
+            continue;
+        }
+
+        let (idx_a, t_off_a, b_off_a) = offset_diffs[i];
+
+        for j in (i + 1)..offset_diffs.len() {
+            if used.contains(&j) {
+                continue;
+            }
+
+            let (idx_b, t_off_b, b_off_b) = offset_diffs[j];
+
+            // Check for symmetric swap: A's target=B's base and A's base=B's target
+            if t_off_a == b_off_b && b_off_a == t_off_b {
+                swaps.push(OffsetSwapInfo {
+                    indices: (idx_a, idx_b),
+                    target_offsets: (t_off_a, t_off_b),
+                    base_offsets: (b_off_a, b_off_b),
+                });
+                used.insert(i);
+                used.insert(j);
+                break;
+            }
+        }
+    }
+
+    if swaps.is_empty() {
+        return None;
+    }
+
+    // Each swap involves 2 instructions
+    let count = swaps.len() * 2;
+
+    Some(Pattern {
+        pattern: PatternType::OffsetSwap,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::OffsetSwap { swaps },
+    })
+}
+
 // =============================================================================
 // Analysis
 // =============================================================================
@@ -667,6 +922,12 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
     if let Some(p) = detect_control_flow(instructions) {
         patterns.push(p);
     }
+    if let Some(p) = detect_commutative_op_order(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_offset_swap(instructions) {
+        patterns.push(p);
+    }
 
     // Count total mismatches
     let total_mismatches = instructions
@@ -689,6 +950,8 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
             "REGISTER_SWAP",
             "COMPARISON_STYLE",
             "CONTROL_FLOW",
+            "COMMUTATIVE_OP_ORDER",
+            "OFFSET_SWAP",
         ],
         unattributed_mismatches: unattributed,
     }
@@ -951,6 +1214,8 @@ mod tests {
                 args: target_args.map(|s| s.to_string()),
                 typed_args: None,
                 branch_dest: None,
+                line_number: None,
+                source_file: None,
             }),
             base: base_op.map(|op| InstructionInfo {
                 address: format!("{:#x}", index * 4),
@@ -958,8 +1223,11 @@ mod tests {
                 args: base_args.map(|s| s.to_string()),
                 typed_args: None,
                 branch_dest: None,
+                line_number: None,
+                source_file: None,
             }),
             match_type: match_type.to_string(),
+            diff_breakdown: None,
         }
     }
 
@@ -982,6 +1250,8 @@ mod tests {
                 args: None, // typed_args takes precedence
                 typed_args: target_typed_args,
                 branch_dest: target_branch_dest,
+                line_number: None,
+                source_file: None,
             }),
             base: base_op.map(|op| InstructionInfo {
                 address: format!("{:#x}", index * 4),
@@ -989,8 +1259,11 @@ mod tests {
                 args: None,
                 typed_args: base_typed_args,
                 branch_dest: base_branch_dest,
+                line_number: None,
+                source_file: None,
             }),
             match_type: match_type.to_string(),
+            diff_breakdown: None,
         }
     }
 
@@ -1406,5 +1679,207 @@ mod tests {
         assert_eq!(TypedArg::Signed(-5).as_i64(), Some(-5));
         assert_eq!(TypedArg::Unsigned(100).as_i64(), Some(100));
         assert_eq!(TypedArg::Register("r3".to_string()).as_i64(), None);
+    }
+
+    #[test]
+    fn test_detect_commutative_op_order() {
+        // Test case: fmuls with swapped operands (f0, f13, f0 vs f0, f0, f13)
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("fmuls"),
+                Some("f0, f13, f0"),
+                Some("fmuls"),
+                Some("f0, f0, f13"),
+            ),
+        ];
+
+        let pattern = detect_commutative_op_order(&instructions)
+            .expect("Should detect commutative op order");
+        assert_eq!(pattern.pattern, PatternType::CommutativeOpOrder);
+        assert_eq!(pattern.instruction_count, 1);
+        assert_eq!(pattern.confidence, Confidence::High);
+        assert_eq!(pattern.fixability, Fixability::LikelyFixable);
+
+        if let PatternDetails::CommutativeOpOrder { swaps } = &pattern.details {
+            assert_eq!(swaps.len(), 1);
+            assert_eq!(swaps[0].index, 0);
+            assert_eq!(swaps[0].opcode, "fmuls");
+            assert_eq!(swaps[0].target_operands, vec!["f13", "f0"]);
+            assert_eq!(swaps[0].base_operands, vec!["f0", "f13"]);
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_commutative_op_order_integer() {
+        // Test case: add with swapped operands
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("add"),
+                Some("r3, r5, r4"),
+                Some("add"),
+                Some("r3, r4, r5"),
+            ),
+        ];
+
+        let pattern = detect_commutative_op_order(&instructions)
+            .expect("Should detect integer commutative op order");
+        assert_eq!(pattern.pattern, PatternType::CommutativeOpOrder);
+
+        if let PatternDetails::CommutativeOpOrder { swaps } = &pattern.details {
+            assert_eq!(swaps[0].opcode, "add");
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_commutative_op_order_not_swapped() {
+        // Test case: same order, no swap
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("fmuls"),
+                Some("f0, f1, f2"),
+                Some("fmuls"),
+                Some("f0, f1, f3"), // Different operand, not swapped
+            ),
+        ];
+
+        let pattern = detect_commutative_op_order(&instructions);
+        assert!(pattern.is_none(), "Should not detect when operands aren't swapped");
+    }
+
+    #[test]
+    fn test_detect_commutative_op_order_non_commutative() {
+        // Test case: sub is not commutative
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("sub"),
+                Some("r3, r5, r4"),
+                Some("sub"),
+                Some("r3, r4, r5"),
+            ),
+        ];
+
+        let pattern = detect_commutative_op_order(&instructions);
+        assert!(pattern.is_none(), "Should not detect non-commutative opcode");
+    }
+
+    #[test]
+    fn test_detect_offset_swap() {
+        // Test case: two instructions with swapped offsets
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("lwz"),
+                Some("r3, 0x4(r31)"),
+                Some("lwz"),
+                Some("r3, 0x8(r31)"),
+            ),
+            make_instr(
+                1,
+                "diff_arg",
+                Some("lwz"),
+                Some("r4, 0x8(r31)"),
+                Some("lwz"),
+                Some("r4, 0x4(r31)"),
+            ),
+        ];
+
+        let pattern = detect_offset_swap(&instructions).expect("Should detect offset swap");
+        assert_eq!(pattern.pattern, PatternType::OffsetSwap);
+        assert_eq!(pattern.instruction_count, 2); // 1 swap = 2 instructions
+        assert_eq!(pattern.confidence, Confidence::High);
+        assert_eq!(pattern.fixability, Fixability::LikelyFixable);
+
+        if let PatternDetails::OffsetSwap { swaps } = &pattern.details {
+            assert_eq!(swaps.len(), 1);
+            assert_eq!(swaps[0].indices, (0, 1));
+            assert_eq!(swaps[0].target_offsets, (0x4, 0x8));
+            assert_eq!(swaps[0].base_offsets, (0x8, 0x4));
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_offset_swap_negative() {
+        // Test case: negative offsets
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("stw"),
+                Some("r3, -0x10(r1)"),
+                Some("stw"),
+                Some("r3, -0x8(r1)"),
+            ),
+            make_instr(
+                1,
+                "diff_arg",
+                Some("stw"),
+                Some("r4, -0x8(r1)"),
+                Some("stw"),
+                Some("r4, -0x10(r1)"),
+            ),
+        ];
+
+        let pattern = detect_offset_swap(&instructions).expect("Should detect negative offset swap");
+        assert_eq!(pattern.pattern, PatternType::OffsetSwap);
+
+        if let PatternDetails::OffsetSwap { swaps } = &pattern.details {
+            assert_eq!(swaps[0].target_offsets, (-0x10, -0x8));
+            assert_eq!(swaps[0].base_offsets, (-0x8, -0x10));
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_offset_swap_not_symmetric() {
+        // Test case: offsets differ but aren't swapped
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("lwz"),
+                Some("r3, 0x4(r31)"),
+                Some("lwz"),
+                Some("r3, 0x8(r31)"),
+            ),
+            make_instr(
+                1,
+                "diff_arg",
+                Some("lwz"),
+                Some("r4, 0xc(r31)"),
+                Some("lwz"),
+                Some("r4, 0x10(r31)"),
+            ),
+        ];
+
+        let pattern = detect_offset_swap(&instructions);
+        assert!(pattern.is_none(), "Should not detect non-symmetric offsets");
+    }
+
+    #[test]
+    fn test_analyze_instructions_includes_all_patterns() {
+        // Verify that analyze_instructions includes all patterns in patterns_checked
+        let instructions = vec![
+            make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")),
+        ];
+
+        let analysis = analyze_instructions(&instructions);
+        assert!(analysis.patterns_checked.contains(&"COMMUTATIVE_OP_ORDER"));
+        assert!(analysis.patterns_checked.contains(&"OFFSET_SWAP"));
     }
 }

@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use anyhow::{Context, Result};
 use object::{Object as _, ObjectSection as _};
@@ -30,11 +30,13 @@ pub(crate) fn parse_line_info_dwarf2(
             let mut lines = text_sections.next().map(|section| &mut section.line_info);
 
             let mut rows = program.rows();
-            while let Some((_header, row)) =
+            while let Some((header, row)) =
                 rows.next_row().map_err(|e| gimli_error(e, "loading program row"))?
             {
                 if let (Some(line), Some(lines)) = (row.line(), &mut lines) {
-                    lines.insert(row.address(), line.get() as u32);
+                    // Extract source file name from file index
+                    let source_file = extract_source_file(row.file_index(), header);
+                    lines.insert(row.address(), (line.get() as u32, source_file));
                 }
                 if row.end_sequence() {
                     // The next row is the start of a new sequence, which means we must
@@ -49,6 +51,18 @@ pub(crate) fn parse_line_info_dwarf2(
     }
 
     Ok(())
+}
+
+/// Extract source file path from a file index and line program header.
+fn extract_source_file<R: gimli::Reader>(
+    file_index: u64,
+    header: &gimli::LineProgramHeader<R, R::Offset>,
+) -> String {
+    let file_entry = match header.file(file_index) {
+        Some(entry) => entry,
+        None => return String::new(),
+    };
+    extract_file_path(file_entry, header).unwrap_or_default()
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +115,50 @@ fn load_file_section<'input, 'arena, Endian: gimli::Endianity>(
     let section = gimli::EndianSlice::new(data_ref, endian);
     let relocations = arena_relocations.alloc(relocations);
     Ok(Relocate::new(section, relocations))
+}
+
+/// Extract file path from DWARF file entry, combining directory and filename.
+fn extract_file_path<R: gimli::Reader>(
+    file_entry: &gimli::FileEntry<R, R::Offset>,
+    header: &gimli::LineProgramHeader<R, R::Offset>,
+) -> Result<String> {
+    let mut path = String::new();
+
+    // Get the directory if present
+    if let Some(dir) = file_entry.directory(header) {
+        if let Some(dir_str) = attr_value_to_string(dir) {
+            if !dir_str.is_empty() {
+                path.push_str(&dir_str);
+                // Add separator if needed (handle both Unix and Windows paths)
+                if !path.ends_with('/') && !path.ends_with('\\') {
+                    path.push('/');
+                }
+            }
+        }
+    }
+
+    // Get the filename
+    if let Some(file_name) = attr_value_to_string(file_entry.path_name()) {
+        path.push_str(&file_name);
+    }
+
+    Ok(path)
+}
+
+/// Convert an AttributeValue to a string if possible.
+fn attr_value_to_string<R: gimli::Reader>(value: gimli::AttributeValue<R>) -> Option<String> {
+    match value {
+        gimli::AttributeValue::String(s) => s.to_string_lossy().ok().map(|s| s.into_owned()),
+        gimli::AttributeValue::DebugStrRef(_) => {
+            // Would need dwarf context to resolve, skip for now
+            None
+        }
+        gimli::AttributeValue::DebugLineStrRef(_) => {
+            // Would need dwarf context to resolve, skip for now
+            None
+        }
+        _ => None,
+    }
 }
 
 #[inline]
