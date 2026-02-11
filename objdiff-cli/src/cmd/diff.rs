@@ -62,20 +62,27 @@ pub enum DiffOutputFormat {
 impl DiffOutputFormat {
     fn from_option(s: Option<&str>) -> Result<Self> {
         match s {
-            None | Some("tui") => Ok(Self::Tui),
+            Some("tui") => Ok(Self::Tui),
             Some("json") => Ok(Self::Json),
             Some("json-pretty") | Some("json_pretty") => Ok(Self::JsonPretty),
-            Some("markdown") | Some("md") => Ok(Self::Markdown),
+            None | Some("markdown") | Some("md") => Ok(Self::Markdown), // markdown is now default
             Some("proto") => Ok(Self::Proto),
             Some(other) => {
-                bail!("Invalid output format: {}. Supported: tui, json, json-pretty, markdown, proto", other)
+                bail!(
+                    "Invalid output format: {}. Supported: markdown (default), tui, json, json-pretty, proto",
+                    other
+                )
             }
         }
     }
 
-    fn is_json(&self) -> bool { matches!(self, Self::Json | Self::JsonPretty) }
+    fn is_json(&self) -> bool {
+        matches!(self, Self::Json | Self::JsonPretty)
+    }
 
-    fn is_non_tui(&self) -> bool { !matches!(self, Self::Tui) }
+    fn is_non_tui(&self) -> bool {
+        !matches!(self, Self::Tui)
+    }
 }
 
 // JSON output structures
@@ -146,6 +153,12 @@ pub struct DiffOutput {
     pub analysis: Option<super::analysis::Analysis>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<super::analysis::Verdict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_diff: Option<super::analysis::CallDiffOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_delete_clusters: Option<Vec<super::analysis::InsertDeleteCluster>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_regions: Option<Vec<super::analysis::DiffRegion>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Vec<InstructionDiffOutput>>,
 }
@@ -248,6 +261,17 @@ pub struct InstructionSummary {
     pub mismatch_percent: f32,
 }
 
+/// Options for markdown rendering
+#[derive(Default)]
+pub struct MarkdownOptions {
+    /// Show N instructions of context before/after each mismatch
+    pub context: Option<usize>,
+    /// Show all instructions, not just mismatches
+    pub full_listing: bool,
+    /// Concise output: match%, compact summary, pattern one-liners, verdict headline
+    pub concise: bool,
+}
+
 impl InstructionSummary {
     pub fn from_instructions(instructions: &[InstructionDiffOutput]) -> Self {
         let mut s = Self::default();
@@ -301,7 +325,7 @@ pub struct Args {
     /// Output file ("-" for stdout, requires --format)
     output: Option<Utf8PlatformPathBuf>,
     #[argp(option, short = 'f')]
-    /// Output format: tui, json, json-pretty, markdown (default: tui)
+    /// Output format: markdown (default), tui, json, json-pretty
     format: Option<String>,
     #[argp(positional)]
     /// Function symbol to diff
@@ -336,161 +360,167 @@ pub struct Args {
     #[argp(option, from_str_fn(platform_path))]
     /// Path to MSVC linker map file for ICF symbol equivalence
     map_file: Option<Utf8PlatformPathBuf>,
+    #[argp(option, short = 'C')]
+    /// Show N instructions of context before/after each mismatch (like grep -C)
+    context: Option<usize>,
+    #[argp(switch)]
+    /// Show all instructions in output, not just mismatches (implies --include-instructions)
+    full_listing: bool,
+    #[argp(switch)]
+    /// Concise output: match%, compact summary, pattern one-liners, verdict headline
+    concise: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let (target_path, base_path, project_config, unit_options, project_dir) =
-        match (&args.target, &args.base, &args.project, &args.unit) {
-            (Some(_), Some(_), None, None)
-            | (Some(_), None, None, None)
-            | (None, Some(_), None, None) => (args.target.clone(), args.base.clone(), None, None, None),
-            (None, None, p, u) => {
-                let project = match p {
-                    Some(project) => project.clone(),
-                    _ => check_path_buf(
-                        std::env::current_dir().context("Failed to get the current directory")?,
-                    )
-                    .context("Current directory is not valid UTF-8")?,
-                };
-                let Some((project_config, project_config_info)) =
-                    objdiff_core::config::try_project_config(project.as_ref())
-                else {
-                    bail!("Project config not found in {}", &project)
-                };
-                let project_config = project_config.with_context(|| {
-                    format!("Reading project config {}", project_config_info.path.display())
-                })?;
-                let target_obj_dir = project_config
-                    .target_dir
-                    .as_ref()
-                    .map(|p| project.join(p.with_platform_encoding()));
-                let base_obj_dir = project_config
-                    .base_dir
-                    .as_ref()
-                    .map(|p| project.join(p.with_platform_encoding()));
-                let units = project_config.units.as_deref().unwrap_or_default();
-                let objects = units
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, o)| {
-                        (
-                            ObjectConfig::new(
-                                o,
-                                &project,
-                                target_obj_dir.as_deref(),
-                                base_obj_dir.as_deref(),
-                            ),
-                            idx,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let (object, unit_idx) = if let Some(u) = u {
-                    objects
-                        .iter()
-                        .find(|(obj, _)| obj.name == *u)
-                        .map(|(obj, idx)| (obj, *idx))
-                        .ok_or_else(|| anyhow!("Unit not found: {}", u))?
-                } else if let Some(symbol_name) = &args.symbol {
-                    // Build a minimal diff config for demangling during symbol lookup
-                    let mut lookup_config = DiffObjConfig::default();
-                    if let Some(options) = project_config.options.as_ref() {
-                        let _ = apply_project_options(&mut lookup_config, options);
-                    }
-                    let _ = apply_config_args(&mut lookup_config, &args.config);
-
-                    // First, try exact match on mangled name (fast path)
-                    let mut idx = None;
-                    let mut count = 0usize;
-                    for (i, (obj, unit_idx)) in objects.iter().enumerate() {
-                        if obj
-                            .target_path
-                            .as_deref()
-                            .map(|o| obj::read::has_function(o.as_ref(), symbol_name))
-                            .transpose()?
-                            .unwrap_or(false)
-                        {
-                            idx = Some((i, *unit_idx, symbol_name.clone()));
-                            count += 1;
-                            if count > 1 {
-                                break;
-                            }
-                        }
-                    }
-
-                    // If no exact match, try demangled matching
-                    if count == 0 {
-                        let mut exact_matches: Vec<(usize, usize, obj::read::SymbolMatch)> = Vec::new();
-                        let mut partial_matches: Vec<(usize, usize, obj::read::SymbolMatch)> = Vec::new();
-
-                        for (i, (obj, unit_idx)) in objects.iter().enumerate() {
-                            if let Some(target_path) = obj.target_path.as_deref() {
-                                let matches = obj::read::match_symbol_by_query(
-                                    target_path.as_ref(),
-                                    symbol_name,
-                                    &lookup_config,
-                                )?;
-                                for m in matches {
-                                    if m.exact {
-                                        exact_matches.push((i, *unit_idx, m));
-                                    } else {
-                                        partial_matches.push((i, *unit_idx, m));
-                                    }
-                                }
-                            }
-                        }
-
-                        // Prefer exact matches, fall back to partial if there's exactly one
-                        let all_matches = if !exact_matches.is_empty() {
-                            exact_matches
-                        } else {
-                            partial_matches
-                        };
-
-                        match all_matches.len() {
-                            0 => bail!("Symbol not found: {}", symbol_name),
-                            1 => {
-                                let (i, unit_idx, m) = all_matches.into_iter().next().unwrap();
-                                idx = Some((i, unit_idx, m.name));
-                                count = 1;
-                            }
-                            _ => {
-                                // Multiple matches - show disambiguation
-                                eprintln!(
-                                    "Multiple matches for '{}'. Did you mean:",
-                                    symbol_name
-                                );
-                                for (_, unit_idx, m) in &all_matches {
-                                    let unit_name = &units[*unit_idx].name();
-                                    let display_name = m.demangled.as_ref().unwrap_or(&m.name);
-                                    eprintln!("  {} ({})", display_name, unit_name);
-                                }
-                                bail!(
-                                    "Ambiguous symbol '{}'. Use --unit or provide more specific name.",
-                                    symbol_name
-                                );
-                            }
-                        }
-                    }
-
-                    match (count, idx) {
-                        (0, None) => bail!("Symbol not found: {}", symbol_name),
-                        (1, Some((i, unit_idx, _resolved_name))) => (&objects[i].0, unit_idx),
-                        (2.., Some(_)) => bail!(
-                            "Multiple instances of {} were found, try specifying a unit",
-                            symbol_name
+    let (target_path, base_path, project_config, unit_options, project_dir) = match (
+        &args.target,
+        &args.base,
+        &args.project,
+        &args.unit,
+    ) {
+        (Some(_), Some(_), None, None)
+        | (Some(_), None, None, None)
+        | (None, Some(_), None, None) => (args.target.clone(), args.base.clone(), None, None, None),
+        (None, None, p, u) => {
+            let project = match p {
+                Some(project) => project.clone(),
+                _ => check_path_buf(
+                    std::env::current_dir().context("Failed to get the current directory")?,
+                )
+                .context("Current directory is not valid UTF-8")?,
+            };
+            let Some((project_config, project_config_info)) =
+                objdiff_core::config::try_project_config(project.as_ref())
+            else {
+                bail!("Project config not found in {}", &project)
+            };
+            let project_config = project_config.with_context(|| {
+                format!("Reading project config {}", project_config_info.path.display())
+            })?;
+            let target_obj_dir = project_config
+                .target_dir
+                .as_ref()
+                .map(|p| project.join(p.with_platform_encoding()));
+            let base_obj_dir =
+                project_config.base_dir.as_ref().map(|p| project.join(p.with_platform_encoding()));
+            let units = project_config.units.as_deref().unwrap_or_default();
+            let objects = units
+                .iter()
+                .enumerate()
+                .map(|(idx, o)| {
+                    (
+                        ObjectConfig::new(
+                            o,
+                            &project,
+                            target_obj_dir.as_deref(),
+                            base_obj_dir.as_deref(),
                         ),
-                        _ => unreachable!(),
+                        idx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (object, unit_idx) = if let Some(u) = u {
+                objects
+                    .iter()
+                    .find(|(obj, _)| obj.name == *u)
+                    .map(|(obj, idx)| (obj, *idx))
+                    .ok_or_else(|| anyhow!("Unit not found: {}", u))?
+            } else if let Some(symbol_name) = &args.symbol {
+                // Build a minimal diff config for demangling during symbol lookup
+                let mut lookup_config = DiffObjConfig::default();
+                if let Some(options) = project_config.options.as_ref() {
+                    let _ = apply_project_options(&mut lookup_config, options);
+                }
+                let _ = apply_config_args(&mut lookup_config, &args.config);
+
+                // First, try exact match on mangled name (fast path)
+                let mut idx = None;
+                let mut count = 0usize;
+                for (i, (obj, unit_idx)) in objects.iter().enumerate() {
+                    if obj
+                        .target_path
+                        .as_deref()
+                        .map(|o| obj::read::has_function(o.as_ref(), symbol_name))
+                        .transpose()?
+                        .unwrap_or(false)
+                    {
+                        idx = Some((i, *unit_idx, symbol_name.clone()));
+                        count += 1;
+                        if count > 1 {
+                            break;
+                        }
                     }
-                } else {
-                    bail!("Must specify one of: symbol, project and unit, target and base objects")
-                };
-                let unit_options = units.get(unit_idx).and_then(|u| u.options().cloned());
-                let target_path = object.target_path.clone();
-                let base_path = object.base_path.clone();
-                (target_path, base_path, Some(project_config), unit_options, Some(project))
-            }
-            _ => bail!("Either target and base or project and unit must be specified"),
-        };
+                }
+
+                // If no exact match, try demangled matching
+                if count == 0 {
+                    let mut exact_matches: Vec<(usize, usize, obj::read::SymbolMatch)> = Vec::new();
+                    let mut partial_matches: Vec<(usize, usize, obj::read::SymbolMatch)> =
+                        Vec::new();
+
+                    for (i, (obj, unit_idx)) in objects.iter().enumerate() {
+                        if let Some(target_path) = obj.target_path.as_deref() {
+                            let matches = obj::read::match_symbol_by_query(
+                                target_path.as_ref(),
+                                symbol_name,
+                                &lookup_config,
+                            )?;
+                            for m in matches {
+                                if m.exact {
+                                    exact_matches.push((i, *unit_idx, m));
+                                } else {
+                                    partial_matches.push((i, *unit_idx, m));
+                                }
+                            }
+                        }
+                    }
+
+                    // Prefer exact matches, fall back to partial if there's exactly one
+                    let all_matches =
+                        if !exact_matches.is_empty() { exact_matches } else { partial_matches };
+
+                    match all_matches.len() {
+                        0 => bail!("Symbol not found: {}", symbol_name),
+                        1 => {
+                            let (i, unit_idx, m) = all_matches.into_iter().next().unwrap();
+                            idx = Some((i, unit_idx, m.name));
+                            count = 1;
+                        }
+                        _ => {
+                            // Multiple matches - show disambiguation
+                            eprintln!("Multiple matches for '{}'. Did you mean:", symbol_name);
+                            for (_, unit_idx, m) in &all_matches {
+                                let unit_name = &units[*unit_idx].name();
+                                let display_name = m.demangled.as_ref().unwrap_or(&m.name);
+                                eprintln!("  {} ({})", display_name, unit_name);
+                            }
+                            bail!(
+                                "Ambiguous symbol '{}'. Use --unit or provide more specific name.",
+                                symbol_name
+                            );
+                        }
+                    }
+                }
+
+                match (count, idx) {
+                    (0, None) => bail!("Symbol not found: {}", symbol_name),
+                    (1, Some((i, unit_idx, _resolved_name))) => (&objects[i].0, unit_idx),
+                    (2.., Some(_)) => bail!(
+                        "Multiple instances of {} were found, try specifying a unit",
+                        symbol_name
+                    ),
+                    _ => unreachable!(),
+                }
+            } else {
+                bail!("Must specify one of: symbol, project and unit, target and base objects")
+            };
+            let unit_options = units.get(unit_idx).and_then(|u| u.options().cloned());
+            let target_path = object.target_path.clone();
+            let base_path = object.base_path.clone();
+            (target_path, base_path, Some(project_config), unit_options, Some(project))
+        }
+        _ => bail!("Either target and base or project and unit must be specified"),
+    };
 
     let output_format = DiffOutputFormat::from_option(args.format.as_deref())?;
 
@@ -525,9 +555,7 @@ pub fn run(args: Args) -> Result<()> {
             } else {
                 // Full build: build entire project
                 eprintln!("Building full project (--full-build specified)...");
-                let status = Command::new("ninja")
-                    .status()
-                    .context("Failed to run ninja")?;
+                let status = Command::new("ninja").status().context("Failed to run ninja")?;
 
                 if !status.success() {
                     bail!("Full build failed");
@@ -550,11 +578,26 @@ pub fn run(args: Args) -> Result<()> {
         DiffOutputFormat::Proto => {
             // Use upstream oneshot mode for proto output (binding format)
             let output = args.output.as_deref().unwrap_or(Utf8PlatformPath::new("-"));
-            run_oneshot(&args, output, target_path.as_deref(), base_path.as_deref(), unit_options, project_dir.as_deref())
+            run_oneshot(
+                &args,
+                output,
+                target_path.as_deref(),
+                base_path.as_deref(),
+                unit_options,
+                project_dir.as_deref(),
+            )
         }
         _ => {
             // Use enhanced JSON/markdown output with analysis support
-            run_json(args, target_path, base_path, project_config, unit_options, output_format, project_dir)
+            run_json(
+                args,
+                target_path,
+                base_path,
+                project_config,
+                unit_options,
+                output_format,
+                project_dir,
+            )
         }
     }
 }
@@ -569,7 +612,8 @@ fn run_oneshot(
 ) -> Result<()> {
     use crate::util::output::{OutputFormat, write_output};
     let output_format = OutputFormat::Proto; // Proto is the only format that uses oneshot
-    let (diff_config, mapping_config) = build_config_from_args(args, None, unit_options.as_ref(), project_dir)?;
+    let (diff_config, mapping_config) =
+        build_config_from_args(args, None, unit_options.as_ref(), project_dir)?;
     let target = target_path
         .map(|p| {
             obj::read::read(p.as_ref(), &diff_config, DiffSide::Target)
@@ -624,8 +668,7 @@ fn build_config_from_args(
         let file = std::fs::File::open(map_path.as_str())
             .with_context(|| format!("Failed to open map file: {}", map_path))?;
         let reader = std::io::BufReader::new(file);
-        mapping_config.symbol_equivalences =
-            objdiff_core::obj::map_file::parse_msvc_map(reader);
+        mapping_config.symbol_equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
         eprintln!(
             "Loaded {} ICF equivalence entries from {}",
             mapping_config.symbol_equivalences.len(),
@@ -651,8 +694,12 @@ fn run_json(
         bail!("JSON output mode requires a symbol name");
     };
 
-    let (diff_config, mapping_config) =
-        build_config_from_args(&args, project_config.as_ref(), unit_options.as_ref(), project_dir.as_deref())?;
+    let (diff_config, mapping_config) = build_config_from_args(
+        &args,
+        project_config.as_ref(),
+        unit_options.as_ref(),
+        project_dir.as_deref(),
+    )?;
 
     // Read target object
     let target_obj = target_path
@@ -673,13 +720,8 @@ fn run_json(
         .transpose()?;
 
     // Perform the diff
-    let diff_result = diff_objs(
-        target_obj.as_ref(),
-        base_obj.as_ref(),
-        None,
-        &diff_config,
-        &mapping_config,
-    )?;
+    let diff_result =
+        diff_objs(target_obj.as_ref(), base_obj.as_ref(), None, &diff_config, &mapping_config)?;
 
     // Find the symbol in the target or base object (supports both mangled and demangled names)
     let (symbol_idx, symbol, _obj, obj_diff) = if let Some(ref target) = target_obj {
@@ -715,24 +757,24 @@ fn run_json(
         .unwrap_or(0);
 
     // Get symbol indices for both sides (use demangled lookup)
-    let target_symbol_idx = target_obj
-        .as_ref()
-        .and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
-    let base_symbol_idx = base_obj
-        .as_ref()
-        .and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+    let target_symbol_idx =
+        target_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+    let base_symbol_idx =
+        base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
 
     // Get both sides of the diff
     let left_diff = diff_result.left.as_ref();
     let right_diff = diff_result.right.as_ref();
 
     // Handle flag implications: --verdict implies --analyze implies --summary
+    // --full-listing implies --include-instructions
     let wants_verdict = args.verdict;
     let wants_analyze = args.analyze || wants_verdict;
     let wants_summary = args.summary || wants_analyze;
+    let wants_instructions = args.include_instructions || args.full_listing;
 
     // Build instruction diffs if requested (or if summary/analyze/verdict is requested)
-    let instructions = if args.include_instructions || wants_summary {
+    let instructions = if wants_instructions || wants_summary {
         Some(build_instruction_diffs(
             target_obj.as_ref(),
             base_obj.as_ref(),
@@ -755,9 +797,7 @@ fn run_json(
 
     // Run pattern analysis if requested
     let analysis = if wants_analyze {
-        instructions
-            .as_ref()
-            .map(|instrs| super::analysis::analyze_instructions(instrs))
+        instructions.as_ref().map(|instrs| super::analysis::analyze_instructions(instrs))
     } else {
         None
     };
@@ -765,11 +805,50 @@ fn run_json(
     // Compute verdict if requested
     let verdict = if wants_verdict {
         match (&instruction_summary, &analysis) {
-            (Some(summary), Some(analysis)) => Some(super::analysis::compute_verdict(
-                summary,
-                analysis,
-                symbol_diff.match_percent,
-            )),
+            (Some(summary), Some(analysis)) => {
+                Some(super::analysis::compute_verdict(summary, analysis, symbol_diff.match_percent))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Compute structural analysis if analyze is requested (and there are mismatches)
+    let has_mismatches = instruction_summary.as_ref().map(|s| s.total > s.equal).unwrap_or(false);
+
+    let call_diff = if wants_analyze && has_mismatches {
+        instructions.as_ref().and_then(|instrs| super::analysis::compute_call_diff(instrs))
+    } else {
+        None
+    };
+
+    let insert_delete_clusters = if wants_analyze && has_mismatches {
+        instructions
+            .as_ref()
+            .map(|instrs| {
+                let clusters = super::analysis::compute_insert_delete_clusters(instrs);
+                if clusters.is_empty() {
+                    return Vec::new();
+                }
+                clusters
+            })
+            .filter(|v| !v.is_empty())
+    } else {
+        None
+    };
+
+    let diff_regions = if wants_analyze && has_mismatches {
+        match (&instructions, &analysis) {
+            (Some(instrs), Some(analysis)) => {
+                let regions = super::analysis::compute_diff_regions(instrs, analysis);
+                // Only include if there are mismatched regions (not just one 100% region)
+                if regions.len() > 1 || regions.iter().any(|r| r.match_percent < 100.0) {
+                    Some(regions)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     } else {
@@ -784,20 +863,29 @@ fn run_json(
         target_size,
         base_size,
         fuzzy_match_percent: symbol_diff.match_percent,
-        diff_score: symbol_diff.diff_score.map(|(score, max)| DiffScoreOutput {
-            score,
-            max_score: max,
-        }),
+        diff_score: symbol_diff
+            .diff_score
+            .map(|(score, max)| DiffScoreOutput { score, max_score: max }),
         build_status: None, // No build status in one-shot mode
         instruction_summary,
         analysis,
         verdict,
+        call_diff,
+        insert_delete_clusters,
+        diff_regions,
         // Only include instructions in output if explicitly requested (not just for summary)
-        instructions: if args.include_instructions { instructions } else { None },
+        instructions: if wants_instructions { instructions } else { None },
+    };
+
+    // Create markdown options
+    let md_options = MarkdownOptions {
+        context: args.context,
+        full_listing: args.full_listing,
+        concise: args.concise,
     };
 
     // Write output
-    write_diff_output(&output, args.output.as_deref(), output_format)?;
+    write_diff_output(&output, args.output.as_deref(), output_format, &md_options)?;
 
     Ok(())
 }
@@ -814,12 +902,12 @@ fn build_instruction_diffs(
     let mut instructions = Vec::new();
 
     // Get the instruction rows from left (target) side
-    let left_rows = left_diff
-        .and_then(|d| target_symbol_idx.map(|idx| &d.symbols[idx].instruction_rows));
+    let left_rows =
+        left_diff.and_then(|d| target_symbol_idx.map(|idx| &d.symbols[idx].instruction_rows));
 
     // Get the instruction rows from right (base) side
-    let right_rows = right_diff
-        .and_then(|d| base_symbol_idx.map(|idx| &d.symbols[idx].instruction_rows));
+    let right_rows =
+        right_diff.and_then(|d| base_symbol_idx.map(|idx| &d.symbols[idx].instruction_rows));
 
     // Determine the length based on available data
     let row_count = match (left_rows, right_rows) {
@@ -847,17 +935,16 @@ fn build_instruction_diffs(
         };
 
         // Get base instruction info
-        let base_info = if let (Some(row), Some(obj), Some(sym_idx)) =
-            (right_row, base_obj, base_symbol_idx)
-        {
-            if let Some(ins_ref) = row.ins_ref {
-                Some(build_instruction_info(obj, sym_idx, ins_ref, diff_config)?)
+        let base_info =
+            if let (Some(row), Some(obj), Some(sym_idx)) = (right_row, base_obj, base_symbol_idx) {
+                if let Some(ins_ref) = row.ins_ref {
+                    Some(build_instruction_info(obj, sym_idx, ins_ref, diff_config)?)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Use the diff kind from whichever side is available
         let kind = left_row
@@ -931,11 +1018,7 @@ fn compute_arg_diff_breakdown(
         }
     }
 
-    if arguments.is_empty() {
-        None
-    } else {
-        Some(InstructionDiffBreakdown { arguments })
-    }
+    if arguments.is_empty() { None } else { Some(InstructionDiffBreakdown { arguments }) }
 }
 
 /// Check if two TypedArgs are equal for diff purposes.
@@ -966,9 +1049,8 @@ fn typed_arg_type(arg: &TypedArg) -> String {
 }
 
 /// Regex to detect register names (r0-r31, f0-f31, cr0-cr7, etc.)
-static REGISTER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^([rf]\d+|cr\d+|sp|lr|ctr|xer)$").unwrap()
-});
+static REGISTER_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^([rf]\d+|cr\d+|sp|lr|ctr|xer)$").unwrap());
 
 /// Convert an InstructionArg to a TypedArg for JSON serialization.
 fn convert_to_typed_arg(
@@ -992,9 +1074,8 @@ fn convert_to_typed_arg(
         },
         InstructionArg::Reloc => {
             // Get symbol name from relocation if available
-            let symbol_name = relocation
-                .map(|r| r.symbol.name.clone())
-                .unwrap_or_else(|| "<reloc>".to_string());
+            let symbol_name =
+                relocation.map(|r| r.symbol.name.clone()).unwrap_or_else(|| "<reloc>".to_string());
             TypedArg::Symbol(symbol_name)
         }
         InstructionArg::BranchDest(addr) => TypedArg::BranchDest(*addr),
@@ -1021,9 +1102,10 @@ fn build_instruction_info(
             .iter()
             .map(|arg| match arg {
                 objdiff_core::obj::InstructionArg::Value(v) => v.to_string(),
-                objdiff_core::obj::InstructionArg::Reloc => {
-                    resolved.relocation.as_ref().map_or("<reloc>".to_string(), |r| r.symbol.name.clone())
-                }
+                objdiff_core::obj::InstructionArg::Reloc => resolved
+                    .relocation
+                    .as_ref()
+                    .map_or("<reloc>".to_string(), |r| r.symbol.name.clone()),
                 objdiff_core::obj::InstructionArg::BranchDest(d) => format!("{:#x}", d),
             })
             .collect();
@@ -1053,17 +1135,11 @@ fn build_instruction_info(
     });
 
     // Extract line number and source file from section line_info
-    let line_info = resolved
-        .section
-        .line_info
-        .range(..=ins_ref.address)
-        .last()
-        .map(|(_, info)| info);
+    let line_info =
+        resolved.section.line_info.range(..=ins_ref.address).last().map(|(_, info)| info);
 
     let line_number = line_info.map(|(line, _)| *line);
-    let source_file = line_info
-        .map(|(_, file)| file.clone())
-        .filter(|f| !f.is_empty());
+    let source_file = line_info.map(|(_, file)| file.clone()).filter(|f| !f.is_empty());
 
     Ok(InstructionInfo {
         address: format!("{:#x}", ins_ref.address),
@@ -1100,7 +1176,8 @@ pub fn analyze_symbol(
         (idx, obj, diff)
     } else if let Some(idx) = base_symbol_idx {
         let obj = base_obj.unwrap();
-        let diff = diff_result.right.as_ref().ok_or_else(|| anyhow!("Missing right diff result"))?;
+        let diff =
+            diff_result.right.as_ref().ok_or_else(|| anyhow!("Missing right diff result"))?;
         (idx, obj, diff)
     } else {
         // Symbol not found in either object
@@ -1128,8 +1205,11 @@ pub fn analyze_symbol(
     // Compute summary, analysis, verdict
     let instruction_summary = InstructionSummary::from_instructions(&instructions);
     let analysis = super::analysis::analyze_instructions(&instructions);
-    let verdict =
-        super::analysis::compute_verdict(&instruction_summary, &analysis, symbol_diff.match_percent);
+    let verdict = super::analysis::compute_verdict(
+        &instruction_summary,
+        &analysis,
+        symbol_diff.match_percent,
+    );
 
     Ok(Some(SymbolAnalysisResult {
         symbol: symbol.name.clone(),
@@ -1142,14 +1222,114 @@ pub fn analyze_symbol(
     }))
 }
 
-fn render_diff_markdown(output: &DiffOutput) -> String {
+/// Get guidance text based on match percentage.
+fn match_guidance(percent: f32) -> &'static str {
+    match percent {
+        p if p >= 99.0 => {
+            "Often unfixable (linker-merged, register allocation) - verify patterns first"
+        }
+        p if p >= 95.0 => {
+            "Check for unfixable patterns; if none, try variable reorder/inline assignment"
+        }
+        p if p >= 80.0 => "Fine-tuning: check comparison patterns, casting, operator selection",
+        p if p >= 50.0 => "Structural issues: try control flow, variable declarations",
+        _ => "Likely missing implementation - check RB3 reference, Ghidra decompilation",
+    }
+}
+
+fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> String {
     use std::fmt::Write;
-    use super::analysis::PatternDetails;
 
     let mut md = String::new();
 
-    // Header
     let display_name = output.demangled.as_ref().unwrap_or(&output.symbol);
+
+    if options.concise {
+        // --- Concise mode: compact ~10-15 line output ---
+
+        // Header: one-line with match%
+        if let Some(percent) = output.fuzzy_match_percent {
+            writeln!(md, "# {} -- Match: {:.1}%", display_name, percent).unwrap();
+        } else {
+            writeln!(md, "# {}", display_name).unwrap();
+        }
+        writeln!(md).unwrap();
+        if let Some(unit) = &output.unit {
+            writeln!(md, "- **Unit**: `{}`", unit).unwrap();
+        }
+        writeln!(md).unwrap();
+
+        // Instruction Summary: one-liner
+        if let Some(summary) = &output.instruction_summary {
+            let mut parts: Vec<String> = Vec::new();
+            if summary.diff_arg > 0 {
+                parts.push(format!("{} diff_arg", summary.diff_arg));
+            }
+            if summary.diff_op > 0 {
+                parts.push(format!("{} diff_op", summary.diff_op));
+            }
+            if summary.replace > 0 {
+                parts.push(format!("{} replace", summary.replace));
+            }
+            if summary.insert > 0 {
+                parts.push(format!("{} insert", summary.insert));
+            }
+            if summary.delete > 0 {
+                parts.push(format!("{} delete", summary.delete));
+            }
+            if parts.is_empty() {
+                writeln!(md, "**Instructions**: {} total | all equal", summary.total).unwrap();
+            } else {
+                writeln!(md, "**Instructions**: {} total | {}", summary.total, parts.join(", "))
+                    .unwrap();
+            }
+            writeln!(md).unwrap();
+        }
+
+        // Region Summary: skip
+        // Function Call Diff: skip
+        // Insert/Delete Clusters: skip
+
+        // Patterns: one-liner per pattern, no details
+        if let Some(analysis) = &output.analysis
+            && !analysis.patterns.is_empty()
+        {
+            let pattern_lines: Vec<String> = analysis
+                .patterns
+                .iter()
+                .map(|pattern| {
+                    let summary = pattern.summarize();
+                    format!(
+                        "{} ({:?}): {}",
+                        pattern.pattern.as_str(),
+                        pattern.fixability,
+                        summary.one_line
+                    )
+                })
+                .collect();
+            writeln!(md, "**Patterns**: {}", pattern_lines.join(" | ")).unwrap();
+            writeln!(md).unwrap();
+        }
+
+        // Verdict: one-liner
+        if let Some(verdict) = &output.verdict {
+            writeln!(
+                md,
+                "**Verdict**: {:?} ({:?}) -- {}",
+                verdict.classification, verdict.confidence, verdict.recommendation
+            )
+            .unwrap();
+            writeln!(md).unwrap();
+        }
+
+        // Instructions: skip entirely in concise mode
+
+        return md;
+    }
+
+    // --- Full mode (existing behavior) ---
+
+    // Header
     writeln!(md, "# Diff: {}", display_name).unwrap();
     writeln!(md).unwrap();
 
@@ -1163,6 +1343,9 @@ fn render_diff_markdown(output: &DiffOutput) -> String {
     }
     if let Some(percent) = output.fuzzy_match_percent {
         writeln!(md, "- **Match**: {:.1}%", percent).unwrap();
+        // Add match guidance
+        let guidance = match_guidance(percent);
+        writeln!(md, "  - {}", guidance).unwrap();
     }
     writeln!(md, "- **Target Size**: {} bytes", output.target_size).unwrap();
     writeln!(md, "- **Base Size**: {} bytes", output.base_size).unwrap();
@@ -1202,98 +1385,162 @@ fn render_diff_markdown(output: &DiffOutput) -> String {
         writeln!(md).unwrap();
     }
 
-    // Patterns
-    if let Some(analysis) = &output.analysis {
-        if !analysis.patterns.is_empty() {
-            writeln!(md, "## Patterns Detected").unwrap();
-            writeln!(md).unwrap();
-            for pattern in &analysis.patterns {
-                writeln!(
-                    md,
-                    "- **{}**: {} instruction(s), {:?} fixability",
-                    pattern.pattern.as_str(),
-                    pattern.instruction_count,
-                    pattern.fixability
-                )
-                .unwrap();
-
-                // Format pattern details
-                match &pattern.details {
-                    PatternDetails::MergedFunctions { merged_functions } => {
-                        for mf in merged_functions {
-                            writeln!(md, "  - `{}`: {} call(s)", mf.name, mf.count).unwrap();
-                        }
-                    }
-                    PatternDetails::BoolMask { bit_positions } => {
-                        writeln!(md, "  - Bit positions: {:?}", bit_positions).unwrap();
-                    }
-                    PatternDetails::RegisterSwap { swaps } => {
-                        for swap in swaps {
-                            writeln!(
-                                md,
-                                "  - {} ↔ {}: {} occurrence(s)",
-                                swap.target_reg, swap.base_reg, swap.count
-                            )
-                            .unwrap();
-                        }
-                    }
-                    PatternDetails::ComparisonStyle { comparisons } => {
-                        for cmp in comparisons {
-                            writeln!(
-                                md,
-                                "  - Index {}: {} ({} vs {})",
-                                cmp.index, cmp.opcode, cmp.target_value, cmp.base_value
-                            )
-                            .unwrap();
-                        }
-                    }
-                    PatternDetails::ControlFlow { branch_diffs } => {
-                        for bd in branch_diffs {
-                            let target = bd.target_opcode.as_deref().unwrap_or("-");
-                            let base = bd.base_opcode.as_deref().unwrap_or("-");
-                            writeln!(
-                                md,
-                                "  - Index {}: {} vs {} ({})",
-                                bd.index, target, base, bd.match_type
-                            )
-                            .unwrap();
-                        }
-                    }
-                    PatternDetails::CommutativeOpOrder { swaps } => {
-                        for swap in swaps {
-                            writeln!(
-                                md,
-                                "  - Index {}: {} operands swapped ({} vs {})",
-                                swap.index,
-                                swap.opcode,
-                                swap.target_operands.join(", "),
-                                swap.base_operands.join(", ")
-                            )
-                            .unwrap();
-                        }
-                    }
-                    PatternDetails::OffsetSwap { swaps } => {
-                        for swap in swaps {
-                            writeln!(
-                                md,
-                                "  - Indices {:?}: offsets {:?} vs {:?}",
-                                swap.indices, swap.target_offsets, swap.base_offsets
-                            )
-                            .unwrap();
-                        }
-                    }
-                }
-            }
-            writeln!(md).unwrap();
+    // Region Summary (before patterns, gives structural overview)
+    if let Some(regions) = &output.diff_regions
+        && !regions.is_empty()
+    {
+        writeln!(md, "## Region Summary").unwrap();
+        writeln!(md).unwrap();
+        writeln!(md, "| Region | Instructions | Match % | Notes |").unwrap();
+        writeln!(md, "|--------|------------:|--------:|-------|").unwrap();
+        for region in regions {
+            let notes = region.notes.as_deref().unwrap_or("");
+            writeln!(
+                md,
+                "| {}-{} | {} | {:.0}% | {} |",
+                region.start_index,
+                region.end_index,
+                region.instruction_count,
+                region.match_percent,
+                notes,
+            )
+            .unwrap();
         }
+        writeln!(md).unwrap();
+    }
+
+    // Patterns (summarized for markdown)
+    if let Some(analysis) = &output.analysis
+        && !analysis.patterns.is_empty()
+    {
+        writeln!(md, "## Patterns Detected").unwrap();
+        writeln!(md).unwrap();
+        for pattern in &analysis.patterns {
+            let summary = pattern.summarize();
+            writeln!(
+                md,
+                "- **{}** ({:?}): {}",
+                pattern.pattern.as_str(),
+                pattern.fixability,
+                summary.one_line,
+            )
+            .unwrap();
+
+            // Show top details (max 3)
+            for detail in &summary.top_details {
+                writeln!(md, "  - {}", detail).unwrap();
+            }
+            if summary.truncated {
+                writeln!(md, "  - ...and {} more", summary.total_items - summary.top_details.len())
+                    .unwrap();
+            }
+        }
+        writeln!(md).unwrap();
+
+        // Analysis Summary (compact)
+        writeln!(
+            md,
+            "**Unattributed mismatches**: {} | **Patterns checked**: {}",
+            analysis.unattributed_mismatches,
+            analysis.patterns_checked.len()
+        )
+        .unwrap();
+        writeln!(md).unwrap();
+    }
+
+    // Function Call Diff
+    if let Some(call_diff) = &output.call_diff {
+        writeln!(md, "## Function Call Diff").unwrap();
+        writeln!(md).unwrap();
+        if !call_diff.target_only.is_empty() {
+            let entries: Vec<String> = call_diff
+                .target_only
+                .iter()
+                .map(|e| format!("`{}` ({})", e.name, e.count))
+                .collect();
+            writeln!(md, "**Target only:** {}", entries.join(", ")).unwrap();
+        }
+        if !call_diff.base_only.is_empty() {
+            let entries: Vec<String> =
+                call_diff.base_only.iter().map(|e| format!("`{}` ({})", e.name, e.count)).collect();
+            writeln!(md, "**Base only:** {}", entries.join(", ")).unwrap();
+        }
+        if !call_diff.count_differs.is_empty() {
+            let entries: Vec<String> = call_diff
+                .count_differs
+                .iter()
+                .map(|e| format!("`{}`: target {}, base {}", e.name, e.target_count, e.base_count))
+                .collect();
+            writeln!(md, "**Count differs:** {}", entries.join("; ")).unwrap();
+        }
+        writeln!(md).unwrap();
+    }
+
+    // Insert/Delete Clusters
+    if let Some(clusters) = &output.insert_delete_clusters
+        && !clusters.is_empty()
+    {
+        writeln!(md, "## Insert/Delete Clusters").unwrap();
+        writeln!(md).unwrap();
+        writeln!(md, "| Range | Inserts | Deletes | Dominant Opcodes |").unwrap();
+        writeln!(md, "|-------|--------:|--------:|------------------|").unwrap();
+        for cluster in clusters {
+            writeln!(
+                md,
+                "| {}-{} | {} | {} | {} |",
+                cluster.start_index,
+                cluster.end_index,
+                cluster.insert_count,
+                cluster.delete_count,
+                cluster.dominant_opcodes.join(", "),
+            )
+            .unwrap();
+        }
+        writeln!(md).unwrap();
     }
 
     // Verdict
     if let Some(verdict) = &output.verdict {
-        writeln!(md, "## Verdict: {:?}", verdict.classification).unwrap();
+        writeln!(
+            md,
+            "## Verdict: {:?} ({:?} confidence)",
+            verdict.classification, verdict.confidence
+        )
+        .unwrap();
         writeln!(md).unwrap();
         writeln!(md, "{}", verdict.explanation).unwrap();
         writeln!(md).unwrap();
+
+        // Verdict Factors Table
+        if !verdict.factors.is_empty() {
+            writeln!(md, "### Verdict Factors").unwrap();
+            writeln!(md).unwrap();
+            writeln!(md, "| Factor | Value | Threshold | Result |").unwrap();
+            writeln!(md, "|--------|-------|-----------|--------|").unwrap();
+            for factor in &verdict.factors {
+                let value_str = match &factor.value {
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Number(n) => {
+                        if let Some(f) = n.as_f64() {
+                            format!("{:.2}", f)
+                        } else {
+                            n.to_string()
+                        }
+                    }
+                    v => v.to_string(),
+                };
+                let threshold_str =
+                    factor.threshold.map_or("-".to_string(), |t| format!("{:.1}", t));
+                writeln!(
+                    md,
+                    "| {} | {} | {} | {} |",
+                    factor.name, value_str, threshold_str, factor.result
+                )
+                .unwrap();
+            }
+            writeln!(md).unwrap();
+        }
+
         writeln!(md, "**Recommendation**: {}", verdict.recommendation).unwrap();
         writeln!(md).unwrap();
 
@@ -1307,60 +1554,150 @@ fn render_diff_markdown(output: &DiffOutput) -> String {
         }
     }
 
-    // Instructions (mismatches only)
+    // Instructions
     if let Some(instructions) = &output.instructions {
-        let mismatches: Vec<_> =
-            instructions.iter().filter(|i| i.match_type != "equal").collect();
-
-        if !mismatches.is_empty() {
-            writeln!(md, "## Instruction Mismatches").unwrap();
+        if options.full_listing {
+            // Full listing: show all instructions
+            writeln!(md, "## Full Instruction Listing").unwrap();
             writeln!(md).unwrap();
             writeln!(md, "| Index | Target | Base | Match |").unwrap();
             writeln!(md, "|------:|--------|------|-------|").unwrap();
 
-            for instr in mismatches {
-                let target_str = instr
-                    .target
-                    .as_ref()
-                    .map(|t| {
-                        if let Some(args) = &t.args {
-                            format!("`{} {}`", t.opcode, args)
-                        } else {
-                            format!("`{}`", t.opcode)
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-
-                let base_str = instr
-                    .base
-                    .as_ref()
-                    .map(|b| {
-                        if let Some(args) = &b.args {
-                            format!("`{} {}`", b.opcode, args)
-                        } else {
-                            format!("`{}`", b.opcode)
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-
-                writeln!(
-                    md,
-                    "| {} | {} | {} | {} |",
-                    instr.index, target_str, base_str, instr.match_type
-                )
-                .unwrap();
+            for instr in instructions {
+                let is_mismatch = instr.match_type != "equal";
+                let (target_str, base_str, match_str) = format_instruction_row(instr, is_mismatch);
+                writeln!(md, "| {} | {} | {} | {} |", instr.index, target_str, base_str, match_str)
+                    .unwrap();
             }
             writeln!(md).unwrap();
+        } else if let Some(context) = options.context {
+            // Context mode: show N instructions before/after each mismatch
+            let mismatch_indices: Vec<usize> = instructions
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.match_type != "equal")
+                .map(|(idx, _)| idx)
+                .collect();
+
+            if !mismatch_indices.is_empty() {
+                writeln!(md, "## Instruction Mismatches (with context)").unwrap();
+                writeln!(md).unwrap();
+                writeln!(md, "| Index | Target | Base | Match |").unwrap();
+                writeln!(md, "|------:|--------|------|-------|").unwrap();
+
+                // Build set of indices to show (mismatch + context)
+                let mut indices_to_show: Vec<usize> = Vec::new();
+                for &mismatch_idx in &mismatch_indices {
+                    let start = mismatch_idx.saturating_sub(context);
+                    let end = (mismatch_idx + context + 1).min(instructions.len());
+                    for i in start..end {
+                        if !indices_to_show.contains(&i) {
+                            indices_to_show.push(i);
+                        }
+                    }
+                }
+                indices_to_show.sort();
+
+                // Track last printed index for separator detection
+                let mut last_idx: Option<usize> = None;
+
+                for &idx in &indices_to_show {
+                    // Add separator if there's a gap
+                    if let Some(last) = last_idx
+                        && idx > last + 1
+                    {
+                        writeln!(md, "| ... | | | |").unwrap();
+                    }
+
+                    let instr = &instructions[idx];
+                    let is_mismatch = instr.match_type != "equal";
+                    let (target_str, base_str, match_str) =
+                        format_instruction_row(instr, is_mismatch);
+
+                    if is_mismatch {
+                        // Bold mismatch lines
+                        writeln!(
+                            md,
+                            "| **{}** | **{}** | **{}** | **{}** |",
+                            instr.index, target_str, base_str, match_str
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(md, "| {} | {} | {} | |", instr.index, target_str, base_str)
+                            .unwrap();
+                    }
+
+                    last_idx = Some(idx);
+                }
+                writeln!(md).unwrap();
+            }
+        } else {
+            // Default: mismatches only
+            let mismatches: Vec<_> =
+                instructions.iter().filter(|i| i.match_type != "equal").collect();
+
+            if !mismatches.is_empty() {
+                writeln!(md, "## Instruction Mismatches").unwrap();
+                writeln!(md).unwrap();
+                writeln!(md, "| Index | Target | Base | Match |").unwrap();
+                writeln!(md, "|------:|--------|------|-------|").unwrap();
+
+                for instr in mismatches {
+                    let (target_str, base_str, match_str) = format_instruction_row(instr, true);
+                    writeln!(
+                        md,
+                        "| {} | {} | {} | {} |",
+                        instr.index, target_str, base_str, match_str
+                    )
+                    .unwrap();
+                }
+                writeln!(md).unwrap();
+            }
         }
     }
 
     md
 }
 
+/// Format an instruction for markdown table output.
+fn format_instruction_row(
+    instr: &InstructionDiffOutput,
+    include_match: bool,
+) -> (String, String, String) {
+    let target_str = instr
+        .target
+        .as_ref()
+        .map(|t| {
+            if let Some(args) = &t.args {
+                format!("`{} {}`", t.opcode, args)
+            } else {
+                format!("`{}`", t.opcode)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    let base_str = instr
+        .base
+        .as_ref()
+        .map(|b| {
+            if let Some(args) = &b.args {
+                format!("`{} {}`", b.opcode, args)
+            } else {
+                format!("`{}`", b.opcode)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    let match_str = if include_match { instr.match_type.clone() } else { String::new() };
+
+    (target_str, base_str, match_str)
+}
+
 fn write_diff_output(
     output: &DiffOutput,
     path: Option<&Utf8PlatformPath>,
     format: DiffOutputFormat,
+    md_options: &MarkdownOptions,
 ) -> Result<()> {
     let write_content = |writer: &mut dyn Write| -> Result<()> {
         match format {
@@ -1372,7 +1709,7 @@ fn write_diff_output(
                     .context("Failed to write JSON output")?;
             }
             DiffOutputFormat::Markdown => {
-                let md = render_diff_markdown(output);
+                let md = render_diff_markdown(output, md_options);
                 writer.write_all(md.as_bytes()).context("Failed to write markdown output")?;
             }
             DiffOutputFormat::Tui | DiffOutputFormat::Proto => unreachable!(),
@@ -1529,9 +1866,13 @@ impl AppState {
 pub struct TermWaker(pub AtomicBool);
 
 impl Wake for TermWaker {
-    fn wake(self: Arc<Self>) { self.0.store(true, Ordering::Relaxed); }
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 
-    fn wake_by_ref(self: &Arc<Self>) { self.0.store(true, Ordering::Relaxed); }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 fn run_interactive(
@@ -1545,8 +1886,12 @@ fn run_interactive(
     let Some(symbol_name) = &args.symbol else { bail!("Interactive mode requires a symbol name") };
     let time_format = time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]")
         .context("Failed to parse time format")?;
-    let (diff_obj_config, mapping_config) =
-        build_config_from_args(&args, project_config.as_ref(), unit_options.as_ref(), project_dir.as_deref())?;
+    let (diff_obj_config, mapping_config) = build_config_from_args(
+        &args,
+        project_config.as_ref(),
+        unit_options.as_ref(),
+        project_dir.as_deref(),
+    )?;
     let mut state = AppState {
         jobs: Default::default(),
         waker: Default::default(),
@@ -1638,4 +1983,211 @@ fn run_interactive(
     crossterm::execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_instr(
+        index: usize,
+        match_type: &str,
+        target_op: Option<&str>,
+        target_args: Option<&str>,
+        base_op: Option<&str>,
+        base_args: Option<&str>,
+    ) -> InstructionDiffOutput {
+        InstructionDiffOutput {
+            index,
+            target: target_op.map(|op| InstructionInfo {
+                address: format!("{:#x}", index * 4),
+                opcode: op.to_string(),
+                args: target_args.map(|s| s.to_string()),
+                typed_args: None,
+                branch_dest: None,
+                line_number: None,
+                source_file: None,
+            }),
+            base: base_op.map(|op| InstructionInfo {
+                address: format!("{:#x}", index * 4),
+                opcode: op.to_string(),
+                args: base_args.map(|s| s.to_string()),
+                typed_args: None,
+                branch_dest: None,
+                line_number: None,
+                source_file: None,
+            }),
+            match_type: match_type.to_string(),
+            diff_breakdown: None,
+        }
+    }
+
+    // =========================================================================
+    // match_guidance() tests
+    // =========================================================================
+
+    #[test]
+    fn test_match_guidance_thresholds() {
+        let g99 = match_guidance(99.5);
+        assert!(g99.contains("unfixable"));
+
+        let g95 = match_guidance(96.0);
+        assert!(g95.contains("unfixable patterns"));
+
+        let g80 = match_guidance(85.0);
+        assert!(g80.contains("Fine-tuning"));
+
+        let g50 = match_guidance(60.0);
+        assert!(g50.contains("Structural"));
+
+        let glow = match_guidance(30.0);
+        assert!(glow.contains("missing implementation"));
+    }
+
+    // =========================================================================
+    // format_instruction_row() tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_row_both_sides() {
+        let instr =
+            make_test_instr(0, "diff_arg", Some("mr"), Some("r3, r4"), Some("mr"), Some("r4, r3"));
+        let (target, base, match_str) = format_instruction_row(&instr, true);
+        assert!(target.contains("mr"));
+        assert!(target.contains("r3, r4"));
+        assert!(base.contains("r4, r3"));
+        assert_eq!(match_str, "diff_arg");
+    }
+
+    #[test]
+    fn test_format_row_missing_side() {
+        let instr = make_test_instr(0, "insert", None, None, Some("stw"), Some("r3, 0(r1)"));
+        let (target, base, match_str) = format_instruction_row(&instr, true);
+        assert_eq!(target, "-");
+        assert!(base.contains("stw"));
+        assert_eq!(match_str, "insert");
+    }
+
+    #[test]
+    fn test_format_row_no_match() {
+        let instr =
+            make_test_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4"));
+        let (_, _, match_str) = format_instruction_row(&instr, false);
+        assert!(match_str.is_empty());
+    }
+
+    // =========================================================================
+    // render_diff_markdown() tests
+    // =========================================================================
+
+    fn make_test_output(
+        instructions: Vec<InstructionDiffOutput>,
+        analysis: Option<super::super::analysis::Analysis>,
+        verdict: Option<super::super::analysis::Verdict>,
+    ) -> DiffOutput {
+        let summary = InstructionSummary::from_instructions(&instructions);
+        DiffOutput {
+            symbol: "test_func".to_string(),
+            demangled: Some("TestFunc()".to_string()),
+            unit: Some("test.o".to_string()),
+            target_size: 100,
+            base_size: 100,
+            fuzzy_match_percent: Some(90.0),
+            diff_score: None,
+            build_status: None,
+            instruction_summary: Some(summary),
+            analysis,
+            verdict,
+            call_diff: None,
+            insert_delete_clusters: None,
+            diff_regions: None,
+            instructions: Some(instructions),
+        }
+    }
+
+    #[test]
+    fn test_markdown_concise_mode() {
+        let instructions = vec![
+            make_test_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")),
+            make_test_instr(1, "diff_arg", Some("mr"), Some("r3, r4"), Some("mr"), Some("r4, r3")),
+        ];
+        let output = make_test_output(instructions, None, None);
+        let options = MarkdownOptions { concise: true, ..Default::default() };
+        let md = render_diff_markdown(&output, &options);
+        assert!(md.contains("Match: 90.0%"));
+        assert!(md.contains("**Instructions**"));
+        // Concise mode should not include instruction table
+        assert!(!md.contains("| Index |"));
+    }
+
+    #[test]
+    fn test_markdown_context_mode() {
+        let mut instructions = Vec::new();
+        // Mismatch at index 3 and index 15 (far apart, will create a gap with context=2)
+        for i in 0..20 {
+            if i == 3 || i == 15 {
+                instructions.push(make_test_instr(
+                    i,
+                    "diff_arg",
+                    Some("mr"),
+                    Some("r3, r4"),
+                    Some("mr"),
+                    Some("r4, r3"),
+                ));
+            } else {
+                instructions.push(make_test_instr(
+                    i,
+                    "equal",
+                    Some("mr"),
+                    Some("r3, r4"),
+                    Some("mr"),
+                    Some("r3, r4"),
+                ));
+            }
+        }
+        let output = make_test_output(instructions, None, None);
+        let options = MarkdownOptions { context: Some(2), ..Default::default() };
+        let md = render_diff_markdown(&output, &options);
+        assert!(md.contains("with context"));
+        // Gap between context windows of mismatch at 3 (shows 1-5) and 15 (shows 13-17)
+        assert!(md.contains("..."));
+    }
+
+    #[test]
+    fn test_markdown_full_listing() {
+        let instructions = vec![
+            make_test_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")),
+            make_test_instr(1, "diff_arg", Some("mr"), Some("r3, r4"), Some("mr"), Some("r4, r3")),
+            make_test_instr(2, "equal", Some("blr"), None, Some("blr"), None),
+        ];
+        let output = make_test_output(instructions, None, None);
+        let options = MarkdownOptions { full_listing: true, ..Default::default() };
+        let md = render_diff_markdown(&output, &options);
+        assert!(md.contains("Full Instruction Listing"));
+        // Should show all 3 instructions
+        assert!(md.contains("| 0 |"));
+        assert!(md.contains("| 1 |"));
+        assert!(md.contains("| 2 |"));
+    }
+
+    #[test]
+    fn test_markdown_default_mismatches_only() {
+        let instructions = vec![
+            make_test_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")),
+            make_test_instr(1, "diff_arg", Some("mr"), Some("r3, r4"), Some("mr"), Some("r4, r3")),
+            make_test_instr(2, "equal", Some("blr"), None, Some("blr"), None),
+        ];
+        let output = make_test_output(instructions, None, None);
+        let options = MarkdownOptions::default();
+        let md = render_diff_markdown(&output, &options);
+        assert!(md.contains("Instruction Mismatches"));
+        // Should show only the mismatch at index 1 in the instruction table
+        assert!(md.contains("| 1 |"));
+        // The mismatch section should not have rows for index 0 or 2
+        // (Note: summary table may contain "| 2 |" for counts, so check within instruction section)
+        let instr_section = md.split("## Instruction Mismatches").nth(1).unwrap();
+        assert!(!instr_section.contains("| 0 |"));
+        // Index 2 should not appear in the mismatch table
+        assert!(!instr_section.contains("\n| 2 |"));
+    }
 }
