@@ -1,4 +1,58 @@
-# objdiff [![Build Status]][actions]
+# objdiff (MiloHax fork)
+
+> **This is the [MiloHax](https://github.com/milohax) fork of [encounter/objdiff](https://github.com/encounter/objdiff).**
+> It adds automated analysis and pattern detection on top of upstream objdiff, designed to be consumed by AI agents working on decompilation at scale.
+
+## Why this fork?
+
+This fork was built for [dc3-decomp](https://github.com/rjkiv/dc3-decomp), the Dance Central 3 decompilation project targeting Xbox 360 (PowerPC). That project has ~47,000 functions to match against the original binary. Manually inspecting every mismatch to figure out what's wrong and whether it's fixable doesn't scale -- so we made objdiff do the diagnosis automatically.
+
+### The problem
+
+Large decompilation projects produce hundreds of functions that _almost_ match but don't quite. Some are genuinely fixable with a one-line change. Others are stuck at 97-99% because the linker merged identical functions (ICF) or the compiler's register allocator made different choices. Telling the difference requires reading raw assembly diffs instruction-by-instruction, which is slow and error-prone for humans and opaque to AI agents.
+
+### The solution: machine-readable analysis
+
+This fork adds an **analysis engine** to objdiff-cli that examines instruction diffs, detects common mismatch patterns, classifies each function with a **fixability verdict**, and outputs everything as structured JSON or human-readable markdown. The key insight is that this output is designed to be consumed by AI agents via MCP (Model Context Protocol), not just read by humans.
+
+In dc3-decomp, an **MCP orchestrator server** wraps objdiff-cli and exposes tools like `run_objdiff` and `run_diff_inspect` to Claude Code agents. An agent working on a function calls `run_objdiff`, gets back a verdict like `LIKELY_FIXABLE` with pattern details ("register swap on r3/r4, 5 occurrences -- try reordering variable declarations"), makes a code change, rebuilds in ~2-4 seconds, and checks the new diff. This tight loop runs autonomously, with 6-10 agents working in parallel on different functions using isolated git worktrees.
+
+The structured output -- verdicts, pattern types, match percentages, call diffs, instruction clusters -- gives agents the context they need to make targeted fixes without staring at raw PowerPC assembly. It also tells them when to stop: if the verdict is `AT_LIMIT` because 80%+ of remaining mismatches are linker-merged calls, there's nothing more to try.
+
+### What it adds
+
+- **7 mismatch pattern detectors**: LinkerMerged, BoolMask, RegisterSwap, ComparisonStyle, ControlFlow, CommutativeOpOrder, OffsetSwap
+- **Fixability verdicts**: Complete, LikelyFixable, MaybeFixable, AtLimit, NeedsInvestigation -- so agents (and humans) can prioritize what to work on
+- **Pattern summaries**: human-readable explanations of what's wrong and what to try next
+- **Call diff analysis**: detects when target and base call different functions or different counts
+- **Insert/delete cluster detection**: identifies groups of added/removed instructions and their dominant opcodes
+- **Diff region computation**: breaks a function into localized regions with per-region match percentages
+- **Markdown diff output**: concise, context, and full-listing rendering modes for CI reports and MCP tool responses
+- **`analysis` and `report` CLI subcommands**: batch-analyze entire projects and export structured JSON or readable markdown
+- **Map file support**: resolve symbols from linker map files
+- **DWARF2 line info**: extract source file and line number from debug info
+
+### How AI agents use it
+
+In the dc3-decomp workflow, the MCP orchestrator exposes these objdiff-powered tools to agents:
+
+| Tool | What it does |
+|------|-------------|
+| `run_objdiff` | Incremental build + diff a single function. Returns match %, verdict, detected patterns. |
+| `run_diff_inspect` | Deep analysis modes: `diagnose` (root cause), `clusters`, `regswaps`, `offsets`, `replaces`, `mismatches` |
+| `run_analyze_function` | Combined objdiff + Ghidra analysis with struct field resolution for offset mismatches |
+
+Agents follow a structured workflow: receive pre-computed context (RB3 reference code, Ghidra decompilation, objdiff analysis) -> edit source -> rebuild + diff via `run_objdiff` -> respond to verdict -> iterate or accept limit. The verdict system prevents wasted effort -- agents learn that `AT_LIMIT` means stop, `LIKELY_FIXABLE` means try control flow changes, and `MAYBE_FIXABLE` means try variable reordering.
+
+See the [dc3-decomp docs](https://github.com/rjkiv/dc3-decomp/tree/main/docs) for the full orchestrator setup, master agent prompt, and subagent strategy.
+
+### Upstream compatibility
+
+This fork tracks upstream `encounter/objdiff` and periodically rebases or merges. The core diffing engine, GUI, configuration format, and all existing features are preserved. The analysis features are additive -- they live in the CLI and don't affect the GUI or library API.
+
+---
+
+[![Build Status]][actions]
 
 [Build Status]: https://github.com/encounter/objdiff/actions/workflows/build.yaml/badge.svg
 [actions]: https://github.com/encounter/objdiff/actions
@@ -168,7 +222,7 @@ If specified, objdiff displays a list of objects in the sidebar for easy navigat
 Install Rust via [rustup](https://rustup.rs).
 
 ```shell
-git clone https://github.com/encounter/objdiff.git
+git clone https://github.com/freeqaz/objdiff.git
 cd objdiff
 cargo run --release
 ```
@@ -176,7 +230,7 @@ cargo run --release
 Or install directly with cargo:
 
 ```shell
-cargo install --locked --git https://github.com/encounter/objdiff.git objdiff-gui objdiff-cli
+cargo install --locked --git https://github.com/freeqaz/objdiff.git objdiff-gui objdiff-cli
 ```
 
 Binaries will be installed to `~/.cargo/bin` as `objdiff` and `objdiff-cli`.
