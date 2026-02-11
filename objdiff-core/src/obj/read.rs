@@ -756,10 +756,9 @@ fn parse_line_info_dwarf1(obj_file: &object::File, sections: &mut [Section]) -> 
                 }
                 let address_delta = read_u32(obj_file, &mut section_data)? as u64;
                 // DWARF1 doesn't have per-instruction source file info
-                out_section.line_info.insert(
-                    base_address + address_delta,
-                    (line_number, String::new()),
-                );
+                out_section
+                    .line_info
+                    .insert(base_address + address_delta, (line_number, String::new()));
             }
         }
     }

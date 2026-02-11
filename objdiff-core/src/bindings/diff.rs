@@ -191,9 +191,7 @@ impl DiffInstruction {
             .map(|(_, info)| info);
 
         let line_number = line_info.map(|(line, _)| *line);
-        let source_file = line_info
-            .map(|(_, file)| file.clone())
-            .filter(|f| !f.is_empty());
+        let source_file = line_info.map(|(_, file)| file.clone()).filter(|f| !f.is_empty());
 
         Ok(Self {
             address: resolved.ins_ref.address,
