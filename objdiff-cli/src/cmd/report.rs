@@ -317,9 +317,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
         let reader = std::io::BufReader::new(file);
         let equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
         info!("Loaded {} ICF equivalence entries from {}", equivalences.len(), map_path);
-        let mut mc = diff::MappingConfig::default();
-        mc.symbol_equivalences = equivalences;
-        mc
+        diff::MappingConfig { symbol_equivalences: equivalences, ..Default::default() }
     } else {
         diff::MappingConfig::default()
     };
@@ -336,8 +334,12 @@ fn generate(args: GenerateArgs) -> Result<()> {
                 project_units.get(*unit_idx).and_then(ProjectObject::options),
                 &args.config,
             )?;
-            if let Some(unit) = report_object(object, &diff_config, Some(&mut existing_functions), Some(&mapping_config))?
-            {
+            if let Some(unit) = report_object(
+                object,
+                &diff_config,
+                Some(&mut existing_functions),
+                Some(&mapping_config),
+            )? {
                 units.push(unit);
             }
         }
@@ -928,16 +930,15 @@ fn query(args: QueryArgs) -> Result<()> {
 
     for unit in &report.units {
         // Check unit filter
-        if let Some(ref glob) = unit_glob {
-            if !glob.is_match(&unit.name) {
-                continue;
-            }
+        if let Some(ref glob) = unit_glob
+            && !glob.is_match(&unit.name)
+        {
+            continue;
         }
 
         if args.functions {
             // Output function-level data
             for func in &unit.functions {
-
                 // Apply function name filter
                 if let Some(ref regex) = function_regex {
                     let matches_name = regex.is_match(&func.name);
@@ -955,27 +956,27 @@ fn query(args: QueryArgs) -> Result<()> {
                 if args.unimplemented && func.fuzzy_match_percent != 0.0 {
                     continue;
                 }
-                if let Some(min) = args.min_percent {
-                    if func.fuzzy_match_percent < min {
-                        continue;
-                    }
+                if let Some(min) = args.min_percent
+                    && func.fuzzy_match_percent < min
+                {
+                    continue;
                 }
-                if let Some(max) = args.max_percent {
-                    if func.fuzzy_match_percent > max {
-                        continue;
-                    }
+                if let Some(max) = args.max_percent
+                    && func.fuzzy_match_percent > max
+                {
+                    continue;
                 }
 
                 // Apply size filters
-                if let Some(min) = args.min_size {
-                    if func.size < min {
-                        continue;
-                    }
+                if let Some(min) = args.min_size
+                    && func.size < min
+                {
+                    continue;
                 }
-                if let Some(max) = args.max_size {
-                    if func.size > max {
-                        continue;
-                    }
+                if let Some(max) = args.max_size
+                    && func.size > max
+                {
+                    continue;
                 }
 
                 items.push(QueryItem {
@@ -998,27 +999,27 @@ fn query(args: QueryArgs) -> Result<()> {
             if args.unimplemented && match_percent != 0.0 {
                 continue;
             }
-            if let Some(min) = args.min_percent {
-                if match_percent < min {
-                    continue;
-                }
+            if let Some(min) = args.min_percent
+                && match_percent < min
+            {
+                continue;
             }
-            if let Some(max) = args.max_percent {
-                if match_percent > max {
-                    continue;
-                }
+            if let Some(max) = args.max_percent
+                && match_percent > max
+            {
+                continue;
             }
 
             // Apply size filters at unit level
-            if let Some(min) = args.min_size {
-                if total_size < min {
-                    continue;
-                }
+            if let Some(min) = args.min_size
+                && total_size < min
+            {
+                continue;
             }
-            if let Some(max) = args.max_size {
-                if total_size > max {
-                    continue;
-                }
+            if let Some(max) = args.max_size
+                && total_size > max
+            {
+                continue;
             }
 
             items.push(QueryItem {
@@ -1203,8 +1204,8 @@ fn function(args: FunctionArgs) -> Result<()> {
     } else {
         args.function_name.clone()
     };
-    let regex = Regex::new(&pattern)
-        .with_context(|| format!("Invalid function pattern: {}", pattern))?;
+    let regex =
+        Regex::new(&pattern).with_context(|| format!("Invalid function pattern: {}", pattern))?;
 
     // Search for matching functions
     let mut matches: Vec<FunctionMatch> = Vec::new();
@@ -1233,11 +1234,8 @@ fn function(args: FunctionArgs) -> Result<()> {
     }
 
     // Build result
-    let result = FunctionResult {
-        found: !matches.is_empty(),
-        query: args.function_name.clone(),
-        matches,
-    };
+    let result =
+        FunctionResult { found: !matches.is_empty(), query: args.function_name.clone(), matches };
 
     // Write output
     write_function_output(&result, args.output.as_deref(), output_format)?;
@@ -1416,15 +1414,15 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
             }
 
             // Apply percent filters
-            if let Some(min) = args.min_percent {
-                if func.fuzzy_match_percent < min {
-                    continue;
-                }
+            if let Some(min) = args.min_percent
+                && func.fuzzy_match_percent < min
+            {
+                continue;
             }
-            if let Some(max) = args.max_percent {
-                if func.fuzzy_match_percent > max {
-                    continue;
-                }
+            if let Some(max) = args.max_percent
+                && func.fuzzy_match_percent > max
+            {
+                continue;
             }
 
             candidates.push((unit, func));
@@ -1460,9 +1458,7 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
         let reader = std::io::BufReader::new(file);
         let equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
         info!("Loaded {} ICF equivalence entries from {}", equivalences.len(), map_path);
-        let mut mc = diff::MappingConfig::default();
-        mc.symbol_equivalences = equivalences;
-        mc
+        diff::MappingConfig { symbol_equivalences: equivalences, ..Default::default() }
     } else {
         diff::MappingConfig::default()
     };
@@ -1586,7 +1582,9 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
 fn render_analyze_csv(output: &AnalyzeOutput) -> String {
     let mut csv = String::new();
     // Header
-    csv.push_str("verdict,name,demangled,unit,fuzzy_match_percent,size,primary_pattern,suggestion\n");
+    csv.push_str(
+        "verdict,name,demangled,unit,fuzzy_match_percent,size,primary_pattern,suggestion\n",
+    );
 
     // Helper to write functions for a verdict category
     let write_functions = |csv: &mut String, verdict: &str, funcs: &[AnalyzedFunction]| {
@@ -1745,9 +1743,7 @@ fn trending(args: TrendingArgs) -> Result<()> {
     for path in &args.reports {
         let report = read_report(path)?;
         let mtime = if args.by_mtime {
-            std::fs::metadata(path.as_path())
-                .ok()
-                .and_then(|m| m.modified().ok())
+            std::fs::metadata(path.as_path()).ok().and_then(|m| m.modified().ok())
         } else {
             None
         };
@@ -1780,7 +1776,9 @@ fn trending(args: TrendingArgs) -> Result<()> {
                 .iter()
                 .find(|c| &c.id == category_id)
                 .and_then(|c| c.measures.as_ref())
-                .with_context(|| format!("Category '{}' not found in report {}", category_id, path))?
+                .with_context(|| {
+                    format!("Category '{}' not found in report {}", category_id, path)
+                })?
         } else {
             report.measures.as_ref().with_context(|| format!("Report {} has no measures", path))?
         };
@@ -1794,8 +1792,7 @@ fn trending(args: TrendingArgs) -> Result<()> {
         });
 
         let delta_fuzzy = prev_fuzzy.map(|p| measures.fuzzy_match_percent - p);
-        let delta_functions =
-            prev_functions.map(|p| measures.matched_functions as i32 - p as i32);
+        let delta_functions = prev_functions.map(|p| measures.matched_functions as i32 - p as i32);
         let delta_code = prev_code.map(|p| measures.matched_code as i64 - p as i64);
 
         entries.push(TrendingReportEntry {
@@ -2044,11 +2041,11 @@ mod tests {
     fn test_is_mangled_name_edge_cases() {
         // Edge cases
         assert!(!is_mangled_name(""));
-        assert!(!is_mangled_name("?"));  // Single ? alone is not mangled
-        assert!(is_mangled_name("?A"));  // But ?X (2+ chars) is mangled
+        assert!(!is_mangled_name("?")); // Single ? alone is not mangled
+        assert!(is_mangled_name("?A")); // But ?X (2+ chars) is mangled
         assert!(is_mangled_name("?foo"));
         assert!(!is_mangled_name("_"));
-        assert!(!is_mangled_name("_foo"));  // _foo alone is not mangled
+        assert!(!is_mangled_name("_foo")); // _foo alone is not mangled
         assert!(is_mangled_name("??"));
         assert!(is_mangled_name("_Z"));
     }
