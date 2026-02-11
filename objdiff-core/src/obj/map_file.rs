@@ -8,8 +8,8 @@ use regex::Regex;
 /// Each symbol name maps to the set of all symbol names sharing the same address.
 /// Only addresses with multiple symbols (ICF-merged) produce entries.
 pub fn parse_msvc_map(reader: impl BufRead) -> HashMap<String, HashSet<String>> {
-    let pattern = Regex::new(r"^\s*\d{4}:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]{8})\s+")
-        .expect("invalid regex");
+    let pattern =
+        Regex::new(r"^\s*\d{4}:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]{8})\s+").expect("invalid regex");
 
     let mut address_to_symbols: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -24,7 +24,7 @@ pub fn parse_msvc_map(reader: impl BufRead) -> HashMap<String, HashSet<String>> 
 
     // Build equivalence map: only for addresses with multiple symbols
     let mut equivalences: HashMap<String, HashSet<String>> = HashMap::new();
-    for (_addr, symbols) in &address_to_symbols {
+    for symbols in address_to_symbols.values() {
         if symbols.len() > 1 {
             let group: HashSet<String> = symbols.iter().cloned().collect();
             for sym in symbols {

@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use anyhow::{Context, Result, bail, ensure};
 use object::{Endianness, Object, ObjectSection};

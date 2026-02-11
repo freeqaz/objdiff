@@ -125,15 +125,14 @@ fn extract_file_path<R: gimli::Reader>(
     let mut path = String::new();
 
     // Get the directory if present
-    if let Some(dir) = file_entry.directory(header) {
-        if let Some(dir_str) = attr_value_to_string(dir) {
-            if !dir_str.is_empty() {
-                path.push_str(&dir_str);
-                // Add separator if needed (handle both Unix and Windows paths)
-                if !path.ends_with('/') && !path.ends_with('\\') {
-                    path.push('/');
-                }
-            }
+    if let Some(dir) = file_entry.directory(header)
+        && let Some(dir_str) = attr_value_to_string(dir)
+        && !dir_str.is_empty()
+    {
+        path.push_str(&dir_str);
+        // Add separator if needed (handle both Unix and Windows paths)
+        if !path.ends_with('/') && !path.ends_with('\\') {
+            path.push('/');
         }
     }
 
