@@ -65,6 +65,20 @@ pub enum PatternType {
     CommutativeOpOrder,
     /// Two offsets swapped between target and base
     OffsetSwap,
+    /// Anonymous namespace TU hash mismatch (unfixable)
+    AnonymousNamespaceHash,
+    /// Static guard counter (`$S#`) mismatch from wrong TU function order
+    StaticGuardCounter,
+    /// Unnecessary dynamic_cast — base calls `__dynamic_cast`, target doesn't
+    DynamicCastMismatch,
+    /// Dead store elimination — base stores zero to RAII member, target omits it
+    DeadStoreElimination,
+    /// Prologue saves different number of callee-saved registers
+    PrologueMismatch,
+    /// One side uses `_alloca` intrinsic, other uses CRT `alloca` wrapper
+    AllocaMismatch,
+    /// Scope counter `?N?` in static local name differs (extra braces in source)
+    ScopeCounterMismatch,
 }
 
 impl PatternType {
@@ -77,6 +91,13 @@ impl PatternType {
             PatternType::ControlFlow => "CONTROL_FLOW",
             PatternType::CommutativeOpOrder => "COMMUTATIVE_OP_ORDER",
             PatternType::OffsetSwap => "OFFSET_SWAP",
+            PatternType::AnonymousNamespaceHash => "ANONYMOUS_NAMESPACE_HASH",
+            PatternType::StaticGuardCounter => "STATIC_GUARD_COUNTER",
+            PatternType::DynamicCastMismatch => "DYNAMIC_CAST_MISMATCH",
+            PatternType::DeadStoreElimination => "DEAD_STORE_ELIMINATION",
+            PatternType::PrologueMismatch => "PROLOGUE_MISMATCH",
+            PatternType::AllocaMismatch => "ALLOCA_MISMATCH",
+            PatternType::ScopeCounterMismatch => "SCOPE_COUNTER_MISMATCH",
         }
     }
 }
@@ -150,6 +171,28 @@ pub struct OffsetSwapInfo {
     pub base_offsets: (i64, i64),
 }
 
+/// Information about an anonymous namespace TU hash mismatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnonNamespaceInfo {
+    pub symbol: String,
+    pub target_hash: String,
+    pub base_hash: String,
+}
+
+/// Information about a static guard counter mismatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaticGuardInfo {
+    pub target_immediate: i64,
+    pub base_immediate: i64,
+}
+
+/// Information about a prologue register count mismatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrologueMismatchInfo {
+    pub target_first_reg: u32,
+    pub base_first_reg: u32,
+}
+
 /// Details specific to each pattern type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -168,6 +211,20 @@ pub enum PatternDetails {
     CommutativeOpOrder { swaps: Vec<CommutativeOpInfo> },
     /// Offset swaps between instruction pairs
     OffsetSwap { swaps: Vec<OffsetSwapInfo> },
+    /// Anonymous namespace TU hash mismatches
+    AnonymousNamespaceHash { mismatches: Vec<AnonNamespaceInfo> },
+    /// Static guard counter mismatches
+    StaticGuardCounter { guards: Vec<StaticGuardInfo> },
+    /// Dynamic cast calls present in base but not target
+    DynamicCastMismatch { count: usize },
+    /// Dead store elimination — null stores in base not in target
+    DeadStoreElimination { count: usize },
+    /// Prologue saves different registers
+    PrologueMismatch { info: PrologueMismatchInfo },
+    /// Alloca intrinsic vs CRT wrapper mismatch
+    AllocaMismatch { target_uses_intrinsic: bool },
+    /// Scope counter mismatch in static local names
+    ScopeCounterMismatch { count: usize },
 }
 
 /// A detected pattern in the instruction diff.
@@ -178,6 +235,8 @@ pub struct Pattern {
     pub instruction_count: usize,
     pub fixability: Fixability,
     pub details: PatternDetails,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub doc_urls: Vec<String>,
 }
 
 /// Full analysis results.
@@ -417,6 +476,75 @@ impl Pattern {
                     total_items: swaps.len(),
                 }
             }
+            PatternDetails::AnonymousNamespaceHash { mismatches } => PatternSummary {
+                one_line: format!("{} anon namespace hash mismatch(es) (unfixable)", mismatches.len()),
+                top_details: mismatches
+                    .iter()
+                    .take(3)
+                    .map(|m| format!("{}: {} vs {}", m.symbol, m.target_hash, m.base_hash))
+                    .collect(),
+                truncated: mismatches.len() > 3,
+                total_items: mismatches.len(),
+            },
+            PatternDetails::StaticGuardCounter { guards } => PatternSummary {
+                one_line: format!(
+                    "{} static guard counter mismatch(es) (fixable: reorder TU definitions)",
+                    guards.len()
+                ),
+                top_details: guards
+                    .iter()
+                    .take(3)
+                    .map(|g| format!("target imm {} vs base imm {}", g.target_immediate, g.base_immediate))
+                    .collect(),
+                truncated: guards.len() > 3,
+                total_items: guards.len(),
+            },
+            PatternDetails::DynamicCastMismatch { count } => PatternSummary {
+                one_line: format!(
+                    "{} dynamic_cast call(s) in base not in target (use GetObj instead)",
+                    count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: *count,
+            },
+            PatternDetails::DeadStoreElimination { count } => PatternSummary {
+                one_line: format!(
+                    "{} dead store(s) in base eliminated by target compiler (unfixable)",
+                    count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: *count,
+            },
+            PatternDetails::PrologueMismatch { info } => PatternSummary {
+                one_line: format!(
+                    "prologue saves r{}-r31 (target) vs r{}-r31 (base) -- variable count differs",
+                    info.target_first_reg, info.base_first_reg
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: 1,
+            },
+            PatternDetails::AllocaMismatch { target_uses_intrinsic } => PatternSummary {
+                one_line: format!(
+                    "target uses {} alloca, base uses {} -- change to match",
+                    if *target_uses_intrinsic { "_alloca (intrinsic)" } else { "alloca (CRT)" },
+                    if *target_uses_intrinsic { "alloca (CRT)" } else { "_alloca (intrinsic)" }
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: 1,
+            },
+            PatternDetails::ScopeCounterMismatch { count } => PatternSummary {
+                one_line: format!(
+                    "{} scope counter `?N?` mismatch(es) -- remove extra braces in source",
+                    count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: *count,
+            },
         }
     }
 }
@@ -694,6 +822,13 @@ pub fn compute_diff_regions(
                         PatternType::BoolMask => "bool masks",
                         PatternType::ComparisonStyle => "comparison style",
                         PatternType::CommutativeOpOrder => "commutative ops",
+                        PatternType::AnonymousNamespaceHash => "anon namespace hash",
+                        PatternType::StaticGuardCounter => "static guard counter",
+                        PatternType::DynamicCastMismatch => "dynamic_cast",
+                        PatternType::DeadStoreElimination => "dead stores",
+                        PatternType::PrologueMismatch => "prologue mismatch",
+                        PatternType::AllocaMismatch => "alloca mismatch",
+                        PatternType::ScopeCounterMismatch => "scope counter",
                     };
                     note_parts.push(format!("{} {}", region_instr_count, pname));
                 }
@@ -837,6 +972,27 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
             let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
             swaps.iter().filter(|s| s.index >= start_idx && s.index <= end_idx).count()
         }
+        PatternDetails::AnonymousNamespaceHash { mismatches } => mismatches.len().min(
+            instructions.iter().filter(|i| i.match_type == "diff_arg").count(),
+        ),
+        PatternDetails::StaticGuardCounter { guards } => guards.len().min(
+            instructions.iter().filter(|i| i.match_type == "diff_arg").count(),
+        ),
+        PatternDetails::DynamicCastMismatch { count } => {
+            instructions.iter().filter(|i| i.match_type == "insert").count().min(*count)
+        }
+        PatternDetails::DeadStoreElimination { count } => {
+            instructions.iter().filter(|i| i.match_type == "insert").count().min(*count)
+        }
+        PatternDetails::PrologueMismatch { .. } => {
+            instructions.iter().filter(|i| i.index < 10 && i.match_type == "diff_arg").count()
+        }
+        PatternDetails::AllocaMismatch { .. } => {
+            instructions.iter().filter(|i| i.index < 10 && i.match_type == "diff_arg").count()
+        }
+        PatternDetails::ScopeCounterMismatch { count } => {
+            instructions.iter().filter(|i| i.match_type == "diff_arg").count().min(*count)
+        }
     }
 }
 
@@ -874,6 +1030,8 @@ pub struct VerdictFactor {
 #[derive(Debug, Clone, Serialize)]
 pub struct Suggestion {
     pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_url: Option<String>,
 }
 
 /// Final verdict on function fixability.
@@ -885,6 +1043,57 @@ pub struct Verdict {
     pub factors: Vec<VerdictFactor>,
     pub recommendation: String,
     pub suggestions: Vec<Suggestion>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub doc_urls: Vec<String>,
+}
+
+// =============================================================================
+// Pattern Documentation URLs
+// =============================================================================
+
+/// Base URL prefix for pattern documentation (relative to DC3 decomp root).
+const DOC_BASE: &str = "docs/decomp/patterns/";
+
+/// Return documentation URLs for a pattern type.
+pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
+    let paths: &[&str] = match pattern {
+        PatternType::LinkerMerged => &["verifiable-icf.md#linker-merged-icf"],
+        PatternType::BoolMask => &["fixable-bool-mask.md#step-1-detect"],
+        PatternType::RegisterSwap => &[
+            "unfixable-compiler.md#register-allocation",
+            "fixable-declarations.md#variable-declaration-order",
+        ],
+        PatternType::ComparisonStyle => &["fixable-comparison.md#comparison-style"],
+        PatternType::ControlFlow => &[
+            "fixable-control-flow.md#branch-polarity-steering-beqbne-blebge",
+            "fixable-comparison.md#unsigned-zero-comparison",
+        ],
+        PatternType::CommutativeOpOrder => &["fixable-operators.md#commutative-operand-order"],
+        PatternType::OffsetSwap => &["fixable-declarations.md#offset-swap"],
+        PatternType::AnonymousNamespaceHash => {
+            &["unfixable-compiler.md#anonymous-namespace-hash-mismatch"]
+        }
+        PatternType::StaticGuardCounter => &[
+            "fixable-declarations.md#function-definition-order-tu-wide-static-guard-counters",
+            "fixable-declarations.md#static-symbol-order",
+        ],
+        PatternType::DynamicCastMismatch => {
+            &["fixable-casting.md#avoid-unnecessary-dynamic_cast-getobj-vs-objt"]
+        }
+        PatternType::DeadStoreElimination => {
+            &["unfixable-compiler.md#dead-store-elimination--destructor-merging"]
+        }
+        PatternType::PrologueMismatch => {
+            &["fixable-declarations.md#variable-declaration-order"]
+        }
+        PatternType::AllocaMismatch => {
+            &["fixable-declarations.md#alloca-vs-_alloca-intrinsic-stack-allocation"]
+        }
+        PatternType::ScopeCounterMismatch => {
+            &["fixable-declarations.md#braced-vs-braceless-if-scope-counter"]
+        }
+    };
+    paths.iter().map(|p| format!("{}{}", DOC_BASE, p)).collect()
 }
 
 // =============================================================================
@@ -937,6 +1146,7 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
         instruction_count: total_count,
         fixability: Fixability::Unfixable,
         details: PatternDetails::MergedFunctions { merged_functions },
+        doc_urls: pattern_doc_urls(PatternType::LinkerMerged),
     })
 }
 
@@ -1046,6 +1256,7 @@ pub fn detect_bool_mask(instructions: &[InstructionDiffOutput]) -> Option<Patter
         instruction_count: mask_count,
         fixability: Fixability::UsuallyUnfixable,
         details: PatternDetails::BoolMask { bit_positions },
+        doc_urls: pattern_doc_urls(PatternType::BoolMask),
     })
 }
 
@@ -1119,6 +1330,7 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
         instruction_count: total,
         fixability: Fixability::MaybeFixable,
         details: PatternDetails::RegisterSwap { swaps },
+        doc_urls: pattern_doc_urls(PatternType::RegisterSwap),
     })
 }
 
@@ -1184,6 +1396,7 @@ pub fn detect_comparison_style(instructions: &[InstructionDiffOutput]) -> Option
         instruction_count: count,
         fixability: Fixability::MaybeFixable,
         details: PatternDetails::ComparisonStyle { comparisons },
+        doc_urls: pattern_doc_urls(PatternType::ComparisonStyle),
     })
 }
 
@@ -1275,6 +1488,7 @@ pub fn detect_control_flow(instructions: &[InstructionDiffOutput]) -> Option<Pat
         instruction_count: count,
         fixability: Fixability::LikelyFixable,
         details: PatternDetails::ControlFlow { branch_diffs },
+        doc_urls: pattern_doc_urls(PatternType::ControlFlow),
     })
 }
 
@@ -1376,6 +1590,7 @@ pub fn detect_commutative_op_order(instructions: &[InstructionDiffOutput]) -> Op
         instruction_count: count,
         fixability: Fixability::LikelyFixable,
         details: PatternDetails::CommutativeOpOrder { swaps },
+        doc_urls: pattern_doc_urls(PatternType::CommutativeOpOrder),
     })
 }
 
@@ -1498,6 +1713,400 @@ pub fn detect_offset_swap(instructions: &[InstructionDiffOutput]) -> Option<Patt
         instruction_count: count,
         fixability: Fixability::LikelyFixable,
         details: PatternDetails::OffsetSwap { swaps },
+        doc_urls: pattern_doc_urls(PatternType::OffsetSwap),
+    })
+}
+
+// =============================================================================
+// New Pattern Detection Functions (Phase 3)
+// =============================================================================
+
+/// Regex for anonymous namespace TU hash symbols (`?A0xHEXHASH@@`)
+static ANON_NS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\?A0x([0-9a-fA-F]+)@@").unwrap());
+
+/// Regex for static guard symbols (`$S\d+`)
+static STATIC_GUARD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$S(\d+)").unwrap());
+
+/// Regex for prologue save calls (`__savegprlr_(\d+)` or `__savefpr_(\d+)`)
+static SAVE_REG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"__(savegprlr|savefpr)_(\d+)").unwrap());
+
+/// Detect anonymous namespace TU hash mismatches.
+///
+/// These appear when static functions inside anonymous namespaces have different
+/// TU-hash suffixes between the target and decomp build (e.g., `?A0x7ea4e606@@` vs
+/// `?A0x00000000@@`). The machine code is identical; only the relocation symbol name
+/// differs. This is unfixable — the hash is derived from the TU path.
+pub fn detect_anonymous_namespace_hash(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut mismatches: Vec<AnonNamespaceInfo> = Vec::new();
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+        let t_args = target.args.as_deref().unwrap_or("");
+        let b_args = base.args.as_deref().unwrap_or("");
+
+        // Find anon namespace hash in both sides
+        let t_cap = ANON_NS_RE.captures(t_args);
+        let b_cap = ANON_NS_RE.captures(b_args);
+
+        match (t_cap, b_cap) {
+            (Some(tc), Some(bc)) => {
+                let t_hash = tc.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                let b_hash = bc.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                if t_hash != b_hash {
+                    // Verify the rest of the symbol matches by replacing the hash
+                    let t_normalized = ANON_NS_RE.replace_all(t_args, "?A0xNORM@@");
+                    let b_normalized = ANON_NS_RE.replace_all(b_args, "?A0xNORM@@");
+                    if t_normalized == b_normalized {
+                        mismatches.push(AnonNamespaceInfo {
+                            symbol: t_normalized.to_string(),
+                            target_hash: t_hash,
+                            base_hash: b_hash,
+                        });
+                    }
+                }
+            }
+            (Some(tc), None) | (None, Some(tc)) => {
+                // One side has anon ns, other doesn't — still flag it
+                let hash = tc.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                mismatches.push(AnonNamespaceInfo {
+                    symbol: t_args.to_string(),
+                    target_hash: hash.clone(),
+                    base_hash: "none".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if mismatches.is_empty() {
+        return None;
+    }
+
+    let count = mismatches.len();
+    Some(Pattern {
+        pattern: PatternType::AnonymousNamespaceHash,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::Unfixable,
+        details: PatternDetails::AnonymousNamespaceHash { mismatches },
+        doc_urls: pattern_doc_urls(PatternType::AnonymousNamespaceHash),
+    })
+}
+
+/// Detect static guard counter (`$S#`) mismatches.
+///
+/// MSVC assigns `$S1`, `$S2`, ... counters to `static` local variables in TU order.
+/// When function definitions are in the wrong order, the counter numbers shift.
+/// Detected by: `diff_arg` on `ori` or `rlwinm.` with power-of-2 immediate values,
+/// or symbol references containing `$S` with different numbers.
+pub fn detect_static_guard_counter(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut guards: Vec<StaticGuardInfo> = Vec::new();
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+
+        // Check for $S symbol references in args
+        let t_args = target.args.as_deref().unwrap_or("");
+        let b_args = base.args.as_deref().unwrap_or("");
+
+        let t_guard = STATIC_GUARD_RE.captures(t_args);
+        let b_guard = STATIC_GUARD_RE.captures(b_args);
+
+        if let (Some(tc), Some(bc)) = (&t_guard, &b_guard) {
+            let t_num: i64 = tc.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let b_num: i64 = bc.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            if t_num != b_num {
+                guards.push(StaticGuardInfo { target_immediate: t_num, base_immediate: b_num });
+                continue;
+            }
+        }
+
+        // Also check for power-of-2 immediate differences in ori/rlwinm. (guard bit patterns)
+        if !matches!(target.opcode.as_str(), "ori" | "rlwinm." | "rlwinm") {
+            continue;
+        }
+        if target.opcode != base.opcode {
+            continue;
+        }
+
+        // Try to find immediate values
+        let t_imm = extract_last_immediate(t_args);
+        let b_imm = extract_last_immediate(b_args);
+
+        if let (Some(t_val), Some(b_val)) = (t_imm, b_imm)
+            && t_val != b_val
+            && t_val > 0
+            && b_val > 0
+            && t_val.count_ones() == 1
+            && b_val.count_ones() == 1
+        {
+            guards.push(StaticGuardInfo {
+                target_immediate: t_val as i64,
+                base_immediate: b_val as i64,
+            });
+        }
+    }
+
+    if guards.is_empty() {
+        return None;
+    }
+
+    let count = guards.len();
+    Some(Pattern {
+        pattern: PatternType::StaticGuardCounter,
+        confidence: Confidence::Medium,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::StaticGuardCounter { guards },
+        doc_urls: pattern_doc_urls(PatternType::StaticGuardCounter),
+    })
+}
+
+/// Extract the last integer immediate from an instruction's args string.
+fn extract_last_immediate(args: &str) -> Option<u64> {
+    // Split by comma and take the last, try to parse as u64
+    let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
+    let last = parts.last()?;
+    if let Some(hex) = last.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        last.parse::<u64>().ok()
+    }
+}
+
+/// Detect dynamic_cast mismatch — base calls `__dynamic_cast` but target doesn't.
+///
+/// The original code often uses `GetObj<T>(i)` directly rather than `DataArray::Obj<T>(i)`
+/// which internally calls `dynamic_cast`. Fix: replace `DataArray::Obj<T>(i)` with `GetObj(i)`.
+pub fn detect_dynamic_cast_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut count = 0usize;
+
+    for instr in instructions {
+        if instr.match_type != "insert" {
+            continue;
+        }
+        // insert = base has instruction that target doesn't
+        let Some(base) = &instr.base else { continue };
+
+        if base.opcode == "bl" {
+            let args = base.args.as_deref().unwrap_or("");
+            if args.contains("dynamic_cast") || args.contains("__dynamic_cast") {
+                count += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::DynamicCastMismatch,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::DynamicCastMismatch { count },
+        doc_urls: pattern_doc_urls(PatternType::DynamicCastMismatch),
+    })
+}
+
+/// Detect dead store elimination — base stores zero to stack slot, target doesn't.
+///
+/// Common with RAII wrappers (e.g., `CritSecTracker`) where the original compiler
+/// would null out member pointers at scope end, but a newer/different compiler
+/// recognizes these as dead stores and eliminates them.
+pub fn detect_dead_store_elimination(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut count = 0usize;
+    let mut i = 0;
+
+    while i < instructions.len() {
+        // Look for two consecutive inserts: li rN, 0x0 then stw rN, offset(rFP)
+        if instructions[i].match_type == "insert" {
+            if let Some(base_i) = &instructions[i].base
+                && base_i.opcode == "li"
+                && base_i.args.as_deref().unwrap_or("").contains("0x0")
+            {
+                // Check next instruction
+                if i + 1 < instructions.len()
+                    && instructions[i + 1].match_type == "insert"
+                    && let Some(base_next) = &instructions[i + 1].base
+                    && matches!(base_next.opcode.as_str(), "stw" | "stb" | "sth")
+                {
+                    count += 2;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::DeadStoreElimination,
+        confidence: Confidence::Medium,
+        instruction_count: count,
+        fixability: Fixability::Unfixable,
+        details: PatternDetails::DeadStoreElimination { count },
+        doc_urls: pattern_doc_urls(PatternType::DeadStoreElimination),
+    })
+}
+
+/// Detect prologue register count mismatch — different `__savegprlr_N` values.
+///
+/// When target saves r28-r31 (`__savegprlr_28`) but base saves r29-r31
+/// (`__savegprlr_29`), the target has one extra local variable forcing use
+/// of an extra callee-saved register.
+pub fn detect_prologue_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    // Check only the first 10 instructions (prologue)
+    for instr in instructions.iter().take(10) {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+        if target.opcode != "bl" || base.opcode != "bl" {
+            continue;
+        }
+
+        let t_args = target.args.as_deref().unwrap_or("");
+        let b_args = base.args.as_deref().unwrap_or("");
+
+        let t_cap = SAVE_REG_RE.captures(t_args);
+        let b_cap = SAVE_REG_RE.captures(b_args);
+
+        if let (Some(tc), Some(bc)) = (t_cap, b_cap) {
+            let t_reg: u32 = tc.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let b_reg: u32 = bc.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            if t_reg != b_reg {
+                return Some(Pattern {
+                    pattern: PatternType::PrologueMismatch,
+                    confidence: Confidence::High,
+                    instruction_count: 1,
+                    fixability: Fixability::MaybeFixable,
+                    details: PatternDetails::PrologueMismatch {
+                        info: PrologueMismatchInfo {
+                            target_first_reg: t_reg,
+                            base_first_reg: b_reg,
+                        },
+                    },
+                    doc_urls: pattern_doc_urls(PatternType::PrologueMismatch),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Detect `alloca` vs `_alloca` mismatch.
+///
+/// One side calls `_RtlCheckStack12` (intrinsic `_alloca` with stack probe),
+/// the other calls the CRT `alloca` wrapper. Fix: change `alloca(...)` to `_alloca(...)`.
+pub fn detect_alloca_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut target_uses_intrinsic = false;
+    let mut found = false;
+
+    // Check prologue instructions for the pattern
+    for instr in instructions.iter().take(20) {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+        if target.opcode != "bl" || base.opcode != "bl" {
+            continue;
+        }
+
+        let t_args = target.args.as_deref().unwrap_or("");
+        let b_args = base.args.as_deref().unwrap_or("");
+
+        let t_has_intrinsic =
+            t_args.contains("_RtlCheckStack") || t_args.contains("RtlCheckStack");
+        let b_has_intrinsic =
+            b_args.contains("_RtlCheckStack") || b_args.contains("RtlCheckStack");
+        let t_has_crt =
+            t_args == "alloca" || t_args.ends_with("/alloca") || t_args.contains("alloca");
+        let b_has_crt =
+            b_args == "alloca" || b_args.ends_with("/alloca") || b_args.contains("alloca");
+
+        if (t_has_intrinsic && b_has_crt) || (t_has_crt && b_has_intrinsic) {
+            target_uses_intrinsic = t_has_intrinsic;
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::AllocaMismatch,
+        confidence: Confidence::High,
+        instruction_count: 1,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::AllocaMismatch { target_uses_intrinsic },
+        doc_urls: pattern_doc_urls(PatternType::AllocaMismatch),
+    })
+}
+
+/// Detect scope counter `?N?` mismatch in static local names.
+///
+/// MSVC numbers static locals by scope depth. Extra `{}` blocks increment the counter.
+/// Detected when both sides reference the same static but with different `?N?` numbers.
+pub fn detect_scope_counter_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    static SCOPE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\?(\d+)\?").unwrap());
+
+    let mut count = 0usize;
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+        let t_args = target.args.as_deref().unwrap_or("");
+        let b_args = base.args.as_deref().unwrap_or("");
+
+        let t_cap = SCOPE_RE.captures(t_args);
+        let b_cap = SCOPE_RE.captures(b_args);
+
+        if let (Some(tc), Some(bc)) = (t_cap, b_cap) {
+            let t_num = tc.get(1).map(|m| m.as_str()).unwrap_or("");
+            let b_num = bc.get(1).map(|m| m.as_str()).unwrap_or("");
+            if t_num != b_num {
+                // Verify rest of symbol matches by normalizing scope number
+                let t_norm = SCOPE_RE.replace_all(t_args, "?N?");
+                let b_norm = SCOPE_RE.replace_all(b_args, "?N?");
+                if t_norm == b_norm {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::ScopeCounterMismatch,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::ScopeCounterMismatch { count },
+        doc_urls: pattern_doc_urls(PatternType::ScopeCounterMismatch),
     })
 }
 
@@ -1531,6 +2140,27 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
     if let Some(p) = detect_offset_swap(instructions) {
         patterns.push(p);
     }
+    if let Some(p) = detect_anonymous_namespace_hash(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_static_guard_counter(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_dynamic_cast_mismatch(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_dead_store_elimination(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_prologue_mismatch(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_alloca_mismatch(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_scope_counter_mismatch(instructions) {
+        patterns.push(p);
+    }
 
     // Count total mismatches
     let total_mismatches = instructions.iter().filter(|i| i.match_type != "equal").count();
@@ -1552,6 +2182,13 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
             "CONTROL_FLOW",
             "COMMUTATIVE_OP_ORDER",
             "OFFSET_SWAP",
+            "ANONYMOUS_NAMESPACE_HASH",
+            "STATIC_GUARD_COUNTER",
+            "DYNAMIC_CAST_MISMATCH",
+            "DEAD_STORE_ELIMINATION",
+            "PROLOGUE_MISMATCH",
+            "ALLOCA_MISMATCH",
+            "SCOPE_COUNTER_MISMATCH",
         ],
         unattributed_mismatches: unattributed,
     }
@@ -1570,6 +2207,17 @@ pub fn compute_verdict(
     let total_mismatches = summary.total - summary.equal;
     let mut factors = Vec::new();
 
+    // Collect all doc_urls from detected patterns for verdict-level reference
+    let verdict_doc_urls: Vec<String> = {
+        let mut urls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for p in &analysis.patterns {
+            for u in &p.doc_urls {
+                urls.insert(u.clone());
+            }
+        }
+        urls.into_iter().collect()
+    };
+
     // Check for complete match
     if total_mismatches == 0 {
         return Verdict {
@@ -1584,6 +2232,7 @@ pub fn compute_verdict(
             }],
             recommendation: "No action needed.".to_string(),
             suggestions: vec![],
+            doc_urls: vec![],
         };
     }
 
@@ -1607,7 +2256,9 @@ pub fn compute_verdict(
             recommendation: "Inspect the few mismatched instructions directly.".to_string(),
             suggestions: vec![Suggestion {
                 action: "Review diff output for specific differences".to_string(),
+                doc_url: None,
             }],
+            doc_urls: verdict_doc_urls.clone(),
         };
     }
 
@@ -1634,7 +2285,15 @@ pub fn compute_verdict(
                 "Accept current match ({:.1}%). This is a compiler optimization difference.",
                 match_percent.unwrap_or(0.0)
             ),
-            suggestions: vec![],
+            suggestions: vec![Suggestion {
+                action: "Accept current match — bool return masking is a compiler artifact."
+                    .to_string(),
+                doc_url: Some(format!(
+                    "{}fixable-bool-mask.md#step-4-when-its-actually-unfixable",
+                    DOC_BASE
+                )),
+            }],
+            doc_urls: verdict_doc_urls.clone(),
         };
     }
 
@@ -1678,7 +2337,11 @@ pub fn compute_verdict(
                 "Accept current match ({:.1}%). Effort better spent elsewhere.",
                 match_percent.unwrap_or(0.0)
             ),
-            suggestions: vec![],
+            suggestions: vec![Suggestion {
+                action: "Accept current match — merged calls are a linker artifact.".to_string(),
+                doc_url: Some(format!("{}verifiable-icf.md#linker-merged-icf", DOC_BASE)),
+            }],
+            doc_urls: verdict_doc_urls.clone(),
         };
     }
 
@@ -1699,15 +2362,22 @@ pub fn compute_verdict(
             analysis.patterns.iter().find(|p| p.pattern == PatternType::ControlFlow)
         {
             let cf_summary = cf_pattern.summarize();
-            suggestions.push(Suggestion { action: cf_summary.one_line.clone() });
+            suggestions.push(Suggestion {
+                action: cf_summary.one_line.clone(),
+                doc_url: cf_pattern.doc_urls.first().cloned(),
+            });
             // Add specific indices from top details
             for detail in cf_summary.top_details.iter().take(2) {
-                suggestions.push(Suggestion { action: detail.clone() });
+                suggestions.push(Suggestion { action: detail.clone(), doc_url: None });
             }
         }
 
         suggestions.push(Suggestion {
             action: "Try `> 0` vs `!= 0`, `>=` vs `>`, if/else inversion".to_string(),
+            doc_url: Some(format!(
+                "{}fixable-comparison.md#unsigned-zero-comparison",
+                DOC_BASE
+            )),
         });
 
         return Verdict {
@@ -1721,6 +2391,7 @@ pub fn compute_verdict(
             factors,
             recommendation: "Investigate control flow structure.".to_string(),
             suggestions,
+            doc_urls: verdict_doc_urls.clone(),
         };
     }
 
@@ -1743,12 +2414,22 @@ pub fn compute_verdict(
             analysis.patterns.iter().find(|p| p.pattern == PatternType::RegisterSwap)
         {
             let rs_summary = rs_pattern.summarize();
-            suggestions.push(Suggestion { action: rs_summary.one_line.clone() });
+            suggestions.push(Suggestion {
+                action: rs_summary.one_line.clone(),
+                doc_url: rs_pattern.doc_urls.first().cloned(),
+            });
         }
 
-        suggestions.push(Suggestion { action: "Reorder local variable declarations".to_string() });
+        suggestions.push(Suggestion {
+            action: "Reorder local variable declarations".to_string(),
+            doc_url: Some(format!(
+                "{}fixable-declarations.md#variable-declaration-order",
+                DOC_BASE
+            )),
+        });
         suggestions.push(Suggestion {
             action: "Move variable initialization closer to first use".to_string(),
+            doc_url: Some(format!("{}fixable-declarations.md#variable-extraction", DOC_BASE)),
         });
 
         let explanation = if register_swap_count > 20 {
@@ -1771,6 +2452,7 @@ pub fn compute_verdict(
             recommendation: "Try reordering variable declarations or delaying assignments."
                 .to_string(),
             suggestions,
+            doc_urls: verdict_doc_urls.clone(),
         };
     }
 
@@ -1778,8 +2460,10 @@ pub fn compute_verdict(
     let mut suggestions = Vec::new();
     for pattern in &analysis.patterns {
         let ps = pattern.summarize();
-        suggestions
-            .push(Suggestion { action: format!("{}: {}", pattern.pattern.as_str(), ps.one_line) });
+        suggestions.push(Suggestion {
+            action: format!("{}: {}", pattern.pattern.as_str(), ps.one_line),
+            doc_url: pattern.doc_urls.first().cloned(),
+        });
     }
     if summary.delete > 0 || summary.insert > 0 {
         suggestions.push(Suggestion {
@@ -1787,11 +2471,13 @@ pub fn compute_verdict(
                 "{} delete(s), {} insert(s) -- check for missing/extra code blocks",
                 summary.delete, summary.insert
             ),
+            doc_url: None,
         });
     }
     if suggestions.is_empty() {
         suggestions.push(Suggestion {
             action: "Use --include-instructions to inspect specific differences".to_string(),
+            doc_url: None,
         });
     }
 
@@ -1806,6 +2492,7 @@ pub fn compute_verdict(
         recommendation: "Review instruction diff manually to understand mismatch causes."
             .to_string(),
         suggestions,
+        doc_urls: verdict_doc_urls,
     }
 }
 
@@ -2002,6 +2689,7 @@ mod tests {
                         count: 4,
                     }],
                 },
+                doc_urls: vec![],
             }],
             patterns_checked: vec!["LINKER_MERGED", "BOOL_MASK", "REGISTER_SWAP"],
             unattributed_mismatches: 1,
@@ -2495,6 +3183,7 @@ mod tests {
                     count: 5,
                 }],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("1 pair"));
@@ -2535,6 +3224,7 @@ mod tests {
                     },
                 ],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("dominated by"));
@@ -2558,6 +3248,7 @@ mod tests {
                     base_offsets: (0x8, 0x4),
                 }],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("swap"));
@@ -2587,6 +3278,7 @@ mod tests {
                     },
                 ],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("offset swaps"));
@@ -2616,6 +3308,7 @@ mod tests {
                     },
                 ],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("inversion"));
@@ -2636,6 +3329,7 @@ mod tests {
                     MergedFunctionCount { name: "OnlyReturns".to_string(), count: 2 },
                 ],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("5 call(s)"));
@@ -2652,6 +3346,7 @@ mod tests {
             instruction_count: 2,
             fixability: Fixability::UsuallyUnfixable,
             details: PatternDetails::BoolMask { bit_positions: vec![24, 31] },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("bit positions: [24, 31]"));
@@ -2681,6 +3376,7 @@ mod tests {
                     },
                 ],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("2 comparison(s)"));
@@ -2702,6 +3398,7 @@ mod tests {
                     base_operands: vec!["f0".to_string(), "f13".to_string()],
                 }],
             },
+            doc_urls: vec![],
         };
         let summary = pattern.summarize();
         assert!(summary.one_line.contains("1 commutative"));
@@ -2985,6 +3682,7 @@ mod tests {
                     },
                 ],
             },
+            doc_urls: vec![],
         };
         // Range covers indices 3-10 (only branch at index 5 is in range)
         let instructions: Vec<InstructionDiffOutput> = (3..=10)
@@ -3010,6 +3708,7 @@ mod tests {
                     count: 4,
                 }],
             },
+            doc_urls: vec![],
         };
         let instructions = vec![
             make_instr(0, "diff_arg", Some("mr"), Some("r30, r3"), Some("mr"), Some("r31, r3")),
@@ -3046,6 +3745,7 @@ mod tests {
                         MergedFunctionCount { name: "OnlyReturns".to_string(), count: 1 },
                     ],
                 },
+                doc_urls: vec![],
             }],
             patterns_checked: vec!["LINKER_MERGED"],
             unattributed_mismatches: 1,
@@ -3079,6 +3779,7 @@ mod tests {
                         match_type: "diff_op".to_string(),
                     }],
                 },
+                doc_urls: vec![],
             }],
             patterns_checked: vec!["CONTROL_FLOW"],
             unattributed_mismatches: 2,

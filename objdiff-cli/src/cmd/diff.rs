@@ -1299,12 +1299,20 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
                 .iter()
                 .map(|pattern| {
                     let summary = pattern.summarize();
-                    format!(
-                        "{} ({:?}): {}",
-                        pattern.pattern.as_str(),
-                        pattern.fixability,
-                        summary.one_line
-                    )
+                    {
+                        let doc_part = if let Some(url) = pattern.doc_urls.first() {
+                            format!(" [docs]({})", url)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "{} ({:?}): {}{}",
+                            pattern.pattern.as_str(),
+                            pattern.fixability,
+                            summary.one_line,
+                            doc_part
+                        )
+                    }
                 })
                 .collect();
             writeln!(md, "**Patterns**: {}", pattern_lines.join(" | ")).unwrap();
@@ -1417,14 +1425,22 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
         writeln!(md).unwrap();
         for pattern in &analysis.patterns {
             let summary = pattern.summarize();
-            writeln!(
-                md,
-                "- **{}** ({:?}): {}",
-                pattern.pattern.as_str(),
-                pattern.fixability,
-                summary.one_line,
-            )
-            .unwrap();
+            {
+                let doc_part = if let Some(url) = pattern.doc_urls.first() {
+                    format!(" [docs]({})", url)
+                } else {
+                    String::new()
+                };
+                writeln!(
+                    md,
+                    "- **{}** ({:?}): {}{}",
+                    pattern.pattern.as_str(),
+                    pattern.fixability,
+                    summary.one_line,
+                    doc_part,
+                )
+                .unwrap();
+            }
 
             // Show top details (max 3)
             for detail in &summary.top_details {
@@ -1548,7 +1564,20 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
             writeln!(md, "### Suggestions").unwrap();
             writeln!(md).unwrap();
             for (i, suggestion) in verdict.suggestions.iter().enumerate() {
-                writeln!(md, "{}. {}", i + 1, suggestion.action).unwrap();
+                if let Some(url) = &suggestion.doc_url {
+                    writeln!(md, "{}. {} ([docs]({}))", i + 1, suggestion.action, url).unwrap();
+                } else {
+                    writeln!(md, "{}. {}", i + 1, suggestion.action).unwrap();
+                }
+            }
+            writeln!(md).unwrap();
+        }
+
+        if !verdict.doc_urls.is_empty() {
+            writeln!(md, "### Related Documentation").unwrap();
+            writeln!(md).unwrap();
+            for url in &verdict.doc_urls {
+                writeln!(md, "- [{}]({})", url, url).unwrap();
             }
             writeln!(md).unwrap();
         }
