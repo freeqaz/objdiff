@@ -144,6 +144,10 @@ pub struct DiffOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_match_percent: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_match_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_match_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_score: Option<DiffScoreOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_status: Option<BuildStatusOutput>,
@@ -641,7 +645,11 @@ fn build_config_from_args(
     unit_options: Option<&ProjectOptions>,
     project_dir: Option<&Utf8PlatformPath>,
 ) -> Result<(DiffObjConfig, MappingConfig)> {
-    let mut diff_config = DiffObjConfig::default();
+    // Use relocation-normalized matching by default unless project/unit/CLI overrides it.
+    let mut diff_config = DiffObjConfig {
+        function_reloc_diffs: diff::FunctionRelocDiffs::DataValue,
+        ..Default::default()
+    };
     if let Some(options) = project_config.and_then(|config| config.options.as_ref()) {
         apply_project_options(&mut diff_config, options)?;
     }
@@ -855,6 +863,60 @@ fn run_json(
         None
     };
 
+    let primary_match_percent = symbol_diff.match_percent;
+    let (normalized_match_percent, raw_match_percent) = match diff_config.function_reloc_diffs {
+        diff::FunctionRelocDiffs::NameAddress => {
+            let mut alt_config = diff_config.clone();
+            alt_config.function_reloc_diffs = diff::FunctionRelocDiffs::DataValue;
+            let alt_result = diff_objs(
+                target_obj.as_ref(),
+                base_obj.as_ref(),
+                None,
+                &alt_config,
+                &mapping_config,
+            )?;
+            let alt_match = if target_obj.is_some() {
+                alt_result
+                    .left
+                    .as_ref()
+                    .and_then(|d| d.symbols.get(symbol_idx))
+                    .and_then(|s| s.match_percent)
+            } else {
+                alt_result
+                    .right
+                    .as_ref()
+                    .and_then(|d| d.symbols.get(symbol_idx))
+                    .and_then(|s| s.match_percent)
+            };
+            (alt_match, primary_match_percent)
+        }
+        _ => {
+            let mut alt_config = diff_config.clone();
+            alt_config.function_reloc_diffs = diff::FunctionRelocDiffs::NameAddress;
+            let alt_result = diff_objs(
+                target_obj.as_ref(),
+                base_obj.as_ref(),
+                None,
+                &alt_config,
+                &mapping_config,
+            )?;
+            let alt_match = if target_obj.is_some() {
+                alt_result
+                    .left
+                    .as_ref()
+                    .and_then(|d| d.symbols.get(symbol_idx))
+                    .and_then(|s| s.match_percent)
+            } else {
+                alt_result
+                    .right
+                    .as_ref()
+                    .and_then(|d| d.symbols.get(symbol_idx))
+                    .and_then(|s| s.match_percent)
+            };
+            (primary_match_percent, alt_match)
+        }
+    };
+
     // Build the output
     let output = DiffOutput {
         symbol: symbol_name.clone(),
@@ -862,7 +924,9 @@ fn run_json(
         unit: args.unit.clone(),
         target_size,
         base_size,
-        fuzzy_match_percent: symbol_diff.match_percent,
+        fuzzy_match_percent: normalized_match_percent,
+        normalized_match_percent,
+        raw_match_percent,
         diff_score: symbol_diff
             .diff_score
             .map(|(score, max)| DiffScoreOutput { score, max_score: max }),
@@ -1248,8 +1312,17 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
         // --- Concise mode: compact ~10-15 line output ---
 
         // Header: one-line with match%
-        if let Some(percent) = output.fuzzy_match_percent {
-            writeln!(md, "# {} -- Match: {:.1}%", display_name, percent).unwrap();
+        if let Some(percent) = output.normalized_match_percent.or(output.fuzzy_match_percent) {
+            if let Some(raw) = output.raw_match_percent {
+                writeln!(
+                    md,
+                    "# {} -- Match: {:.1}% normalized ({:.1}% raw)",
+                    display_name, percent, raw
+                )
+                .unwrap();
+            } else {
+                writeln!(md, "# {} -- Match: {:.1}%", display_name, percent).unwrap();
+            }
         } else {
             writeln!(md, "# {}", display_name).unwrap();
         }
@@ -1349,8 +1422,12 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
     if let Some(unit) = &output.unit {
         writeln!(md, "- **Unit**: `{}`", unit).unwrap();
     }
-    if let Some(percent) = output.fuzzy_match_percent {
-        writeln!(md, "- **Match**: {:.1}%", percent).unwrap();
+    if let Some(percent) = output.normalized_match_percent.or(output.fuzzy_match_percent) {
+        if let Some(raw) = output.raw_match_percent {
+            writeln!(md, "- **Match**: {:.1}% normalized ({:.1}% raw)", percent, raw).unwrap();
+        } else {
+            writeln!(md, "- **Match**: {:.1}%", percent).unwrap();
+        }
         // Add match guidance
         let guidance = match_guidance(percent);
         writeln!(md, "  - {}", guidance).unwrap();
@@ -2122,6 +2199,8 @@ mod tests {
             target_size: 100,
             base_size: 100,
             fuzzy_match_percent: Some(90.0),
+            normalized_match_percent: Some(90.0),
+            raw_match_percent: Some(85.0),
             diff_score: None,
             build_status: None,
             instruction_summary: Some(summary),
