@@ -101,6 +101,8 @@ message ReportItem {
   optional ReportItemMetadata metadata = 4;
   // Address of the item (section-relative offset)
   optional uint64 address = 5;
+  // Match percent excluding arg-only differences (register/offset swaps)
+  optional float match_percent_normalized = 6;
 }
 
 // Extra metadata for an item

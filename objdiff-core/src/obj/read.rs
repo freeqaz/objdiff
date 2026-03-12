@@ -1134,6 +1134,37 @@ pub fn has_function(obj_path: &std::path::Path, symbol_name: &str) -> Result<boo
         .is_some())
 }
 
+/// List all *defined* function (Text) symbol names in an object file.
+///
+/// Only includes symbols that are defined in this object (have a section),
+/// not external references. Returns mangled symbol names.
+/// Useful for building cross-unit symbol indices.
+#[cfg(feature = "std")]
+pub fn list_function_symbols(obj_path: &std::path::Path) -> Result<Vec<String>> {
+    let data = {
+        let file = std::fs::File::open(obj_path)?;
+        unsafe { memmap2::Mmap::map(&file) }?
+    };
+    let file = object::File::parse(&*data)?;
+    let mut names = Vec::new();
+    for symbol in file.symbols() {
+        if symbol.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        // Skip undefined/external references — only include symbols
+        // that are actually defined in this object file.
+        if symbol.is_undefined() {
+            continue;
+        }
+        if let Ok(name) = symbol.name() {
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// A symbol match result from `match_symbol_by_query`
 #[derive(Debug, Clone)]
 pub struct SymbolMatch {

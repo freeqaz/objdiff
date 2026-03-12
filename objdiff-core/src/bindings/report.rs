@@ -435,6 +435,7 @@ impl From<LegacyReportItem> for ReportItem {
             name: value.name,
             size: value.size,
             fuzzy_match_percent: value.fuzzy_match_percent,
+            match_percent_normalized: None,
             metadata: Some(ReportItemMetadata {
                 demangled_name: value.demangled_name,
                 virtual_address: value.address,

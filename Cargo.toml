@@ -30,3 +30,4 @@ codegen-units = 1
 [profile.release-min]
 inherits = "release-lto"
 opt-level = "z"
+

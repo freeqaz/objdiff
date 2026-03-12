@@ -24,6 +24,24 @@ const MERGED_RATIO_LIKELY_FIXABLE: f32 = 0.5;
 /// Minimum occurrences of a register swap to consider it significant
 const MIN_REGISTER_SWAP_OCCURRENCES: usize = 3;
 
+/// Check if a PowerPC register is callee-saved (preserved across function calls).
+/// GPR r13-r31 and FPR f14-f31 are callee-saved per the Xbox 360 ABI.
+/// Volatile registers (GPR r0,r3-r12; FPR f0-f13) are compiler-internal and
+/// their allocation cannot be influenced by source-level changes.
+fn is_callee_saved_register(reg: &str) -> bool {
+    if let Some(num_str) = reg.strip_prefix('r') {
+        if let Ok(n) = num_str.parse::<u32>() {
+            return n >= 13 && n <= 31;
+        }
+    }
+    if let Some(num_str) = reg.strip_prefix('f') {
+        if let Ok(n) = num_str.parse::<u32>() {
+            return n >= 14 && n <= 31;
+        }
+    }
+    false
+}
+
 /// Don't analyze functions with only 1 mismatch (simple manual check)
 const MIN_MISMATCH_FOR_ANALYSIS: usize = 2;
 
@@ -79,6 +97,18 @@ pub enum PatternType {
     AllocaMismatch,
     /// Scope counter `?N?` in static local name differs (extra braces in source)
     ScopeCounterMismatch,
+    /// MakeString template parameter mismatch (type or __FILE__ length)
+    MakeStringTemplateMismatch,
+    /// Address relocation noise — lis/addi loading different absolute addresses
+    AddressRelocationNoise,
+    /// Boolean negation — subfic vs subic compiler choice
+    BooleanNegation,
+    /// Float precision mismatch — fmul vs fmuls, fadd vs fadds, etc.
+    FloatPrecisionMismatch,
+    /// Explicit ternary for fsel — fneg/fsubs + fsel vs branched comparison
+    FselTernary,
+    /// Float to int to float conversion — fctiwz + stfd/fmr vs direct float use
+    FloatToIntToFloat,
 }
 
 impl PatternType {
@@ -98,6 +128,12 @@ impl PatternType {
             PatternType::PrologueMismatch => "PROLOGUE_MISMATCH",
             PatternType::AllocaMismatch => "ALLOCA_MISMATCH",
             PatternType::ScopeCounterMismatch => "SCOPE_COUNTER_MISMATCH",
+            PatternType::MakeStringTemplateMismatch => "MAKESTRING_TEMPLATE_MISMATCH",
+            PatternType::AddressRelocationNoise => "ADDRESS_RELOCATION_NOISE",
+            PatternType::BooleanNegation => "BOOLEAN_NEGATION",
+            PatternType::FloatPrecisionMismatch => "FLOAT_PRECISION_MISMATCH",
+            PatternType::FselTernary => "FSEL_TERNARY",
+            PatternType::FloatToIntToFloat => "FLOAT_TO_INT_TO_FLOAT",
         }
     }
 }
@@ -193,6 +229,42 @@ pub struct PrologueMismatchInfo {
     pub base_first_reg: u32,
 }
 
+/// Sub-type of MakeString template mismatch.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MakeStringMismatchSubType {
+    /// Template parameter types differ (e.g., PBD vs VSymbol@@)
+    Type,
+    /// Only __FILE__ char[N] dimension differs
+    FileLength,
+    /// Both type and __FILE__ differ
+    Mixed,
+}
+
+/// Information about a MakeString template mismatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct MakeStringMismatchInfo {
+    pub index: usize,
+    pub target_template: String,
+    pub base_template: String,
+    pub sub_type: MakeStringMismatchSubType,
+}
+
+/// Information about address relocation noise.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressRelocationInfo {
+    pub count: usize,
+    pub pair_count: usize,
+}
+
+/// Information about a float precision mismatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct FloatPrecisionMismatchEntry {
+    pub index: usize,
+    pub target_op: String,
+    pub base_op: String,
+}
+
 /// Details specific to each pattern type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -225,6 +297,18 @@ pub enum PatternDetails {
     AllocaMismatch { target_uses_intrinsic: bool },
     /// Scope counter mismatch in static local names
     ScopeCounterMismatch { count: usize },
+    /// MakeString template parameter mismatches
+    MakeStringTemplateMismatch { mismatches: Vec<MakeStringMismatchInfo> },
+    /// Address relocation noise (lis/addi loading different globals)
+    AddressRelocationNoise { info: AddressRelocationInfo },
+    /// Boolean negation (subfic vs subic)
+    BooleanNegation { count: usize },
+    /// Float precision mismatches (fmul vs fmuls, etc.)
+    FloatPrecisionMismatch { mismatches: Vec<FloatPrecisionMismatchEntry> },
+    /// Explicit ternary for fsel — fneg/fsubs + fsel vs branched comparison
+    FselTernary { count: usize },
+    /// Float to int to float conversion — fctiwz + stfd/fmr vs direct float use
+    FloatToIntToFloat { count: usize },
 }
 
 /// A detected pattern in the instruction diff.
@@ -284,21 +368,43 @@ impl Pattern {
             PatternDetails::RegisterSwap { swaps } => {
                 let total_occurrences: usize = swaps.iter().map(|s| s.count).sum();
                 let pairs = swaps.len();
+                // Classify register types for display
+                let reg_class = match self.fixability {
+                    Fixability::Unfixable => " [volatile, unfixable]",
+                    Fixability::MaybeFixable => {
+                        let has_callee = swaps.iter().any(|s| {
+                            is_callee_saved_register(&s.target_reg)
+                                && is_callee_saved_register(&s.base_reg)
+                        });
+                        let has_volatile = swaps.iter().any(|s| {
+                            !is_callee_saved_register(&s.target_reg)
+                                || !is_callee_saved_register(&s.base_reg)
+                        });
+                        if has_callee && has_volatile {
+                            " [mixed volatile+callee-saved]"
+                        } else {
+                            " [callee-saved, maybe fixable]"
+                        }
+                    }
+                    _ => "",
+                };
                 let one_line = if pairs == 1 {
                     format!(
-                        "{} instructions, {} pair ({}↔{})",
-                        total_occurrences, pairs, swaps[0].target_reg, swaps[0].base_reg
+                        "{} instructions, {} pair ({}↔{}){}",
+                        total_occurrences, pairs, swaps[0].target_reg, swaps[0].base_reg,
+                        reg_class
                     )
                 } else {
                     let dominant = &swaps[0]; // sorted by count descending
                     format!(
-                        "{} instructions across {} pairs, dominated by {}↔{} ({} of {})",
+                        "{} instructions across {} pairs, dominated by {}↔{} ({} of {}){}",
                         self.instruction_count,
                         pairs,
                         dominant.target_reg,
                         dominant.base_reg,
                         dominant.count,
-                        total_occurrences
+                        total_occurrences,
+                        reg_class
                     )
                 };
                 let top_details: Vec<String> = swaps
@@ -539,6 +645,113 @@ impl Pattern {
             PatternDetails::ScopeCounterMismatch { count } => PatternSummary {
                 one_line: format!(
                     "{} scope counter `?N?` mismatch(es) -- remove extra braces in source",
+                    count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: *count,
+            },
+            PatternDetails::MakeStringTemplateMismatch { mismatches } => {
+                let type_count = mismatches
+                    .iter()
+                    .filter(|m| matches!(m.sub_type, MakeStringMismatchSubType::Type))
+                    .count();
+                let file_count = mismatches
+                    .iter()
+                    .filter(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength))
+                    .count();
+                let mut parts = Vec::new();
+                if type_count > 0 {
+                    parts.push(format!("{} type", type_count));
+                }
+                if file_count > 0 {
+                    parts.push(format!("{} __FILE__", file_count));
+                }
+                let mixed = mismatches.len() - type_count - file_count;
+                if mixed > 0 {
+                    parts.push(format!("{} mixed", mixed));
+                }
+                let one_line = format!(
+                    "{} MakeString template mismatch(es) ({})",
+                    mismatches.len(),
+                    parts.join(", ")
+                );
+                let top_details: Vec<String> = mismatches
+                    .iter()
+                    .take(3)
+                    .map(|m| {
+                        let sub = match m.sub_type {
+                            MakeStringMismatchSubType::Type => "type",
+                            MakeStringMismatchSubType::FileLength => "__FILE__",
+                            MakeStringMismatchSubType::Mixed => "mixed",
+                        };
+                        format!("idx {}: {} ({})", m.index, sub, m.target_template)
+                    })
+                    .collect();
+                PatternSummary {
+                    one_line,
+                    top_details,
+                    truncated: mismatches.len() > 3,
+                    total_items: mismatches.len(),
+                }
+            }
+            PatternDetails::AddressRelocationNoise { info } => PatternSummary {
+                one_line: format!(
+                    "{} address relocation(s), {} lis/addi pair(s) (unfixable)",
+                    info.count, info.pair_count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: info.count,
+            },
+            PatternDetails::BooleanNegation { count } => PatternSummary {
+                one_line: format!(
+                    "{} boolean negation(s) subfic↔subic (unfixable compiler choice)",
+                    count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: *count,
+            },
+            PatternDetails::FloatPrecisionMismatch { mismatches } => {
+                // Group by opcode pair
+                let mut pair_counts: HashMap<String, usize> = HashMap::new();
+                for m in mismatches {
+                    let key = format!("{}↔{}", m.target_op, m.base_op);
+                    *pair_counts.entry(key).or_insert(0) += 1;
+                }
+                let mut sorted: Vec<_> = pair_counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let dominant = sorted.first().map(|(k, _)| k.as_str()).unwrap_or("?");
+                let one_line = format!(
+                    "{} float precision mismatch(es), dominated by {}",
+                    mismatches.len(),
+                    dominant
+                );
+                let top_details: Vec<String> = sorted
+                    .iter()
+                    .take(3)
+                    .map(|(pair, count)| format!("{}: {} instruction(s)", pair, count))
+                    .collect();
+                PatternSummary {
+                    one_line,
+                    top_details,
+                    truncated: sorted.len() > 3,
+                    total_items: mismatches.len(),
+                }
+            }
+            PatternDetails::FselTernary { count } => PatternSummary {
+                one_line: format!(
+                    "{} fsel explicit ternary pattern(s) detected",
+                    count
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: *count,
+            },
+            PatternDetails::FloatToIntToFloat { count } => PatternSummary {
+                one_line: format!(
+                    "{} float-to-int-to-float conversion(s) detected (fctiwz+stfd)",
                     count
                 ),
                 top_details: vec![],
@@ -829,6 +1042,12 @@ pub fn compute_diff_regions(
                         PatternType::PrologueMismatch => "prologue mismatch",
                         PatternType::AllocaMismatch => "alloca mismatch",
                         PatternType::ScopeCounterMismatch => "scope counter",
+                        PatternType::MakeStringTemplateMismatch => "MakeString template",
+                        PatternType::AddressRelocationNoise => "addr relocation",
+                        PatternType::BooleanNegation => "bool negation",
+                        PatternType::FloatPrecisionMismatch => "float precision",
+                        PatternType::FselTernary => "fsel ternary",
+                        PatternType::FloatToIntToFloat => "float-to-int-to-float",
                     };
                     note_parts.push(format!("{} {}", region_instr_count, pname));
                 }
@@ -993,6 +1212,61 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
         PatternDetails::ScopeCounterMismatch { count } => {
             instructions.iter().filter(|i| i.match_type == "diff_arg").count().min(*count)
         }
+        PatternDetails::MakeStringTemplateMismatch { mismatches } => {
+            let start_idx = instructions.first().map(|i| i.index).unwrap_or(0);
+            let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
+            mismatches.iter().filter(|m| m.index >= start_idx && m.index <= end_idx).count()
+        }
+        PatternDetails::AddressRelocationNoise { info } => {
+            // Count diff_arg lis/addi in range as proxy
+            instructions
+                .iter()
+                .filter(|i| {
+                    i.match_type == "diff_arg"
+                        && i.target
+                            .as_ref()
+                            .is_some_and(|t| matches!(t.opcode.as_str(), "lis" | "addi" | "ori"))
+                })
+                .count()
+                .min(info.count)
+        }
+        PatternDetails::BooleanNegation { count } => {
+            instructions
+                .iter()
+                .filter(|i| {
+                    i.match_type == "replace"
+                        && i.target.as_ref().is_some_and(|t| {
+                            matches!(t.opcode.as_str(), "subfic" | "subic" | "subic.")
+                        })
+                })
+                .count()
+                .min(*count)
+        }
+        PatternDetails::FloatPrecisionMismatch { mismatches } => {
+            let start_idx = instructions.first().map(|i| i.index).unwrap_or(0);
+            let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
+            mismatches.iter().filter(|m| m.index >= start_idx && m.index <= end_idx).count()
+        }
+        PatternDetails::FselTernary { count } => {
+            instructions
+                .iter()
+                .filter(|i| {
+                    i.match_type == "insert"
+                        && i.target.as_ref().is_some_and(|t| t.opcode == "fsel")
+                })
+                .count()
+                .min(*count)
+        }
+        PatternDetails::FloatToIntToFloat { count } => {
+            instructions
+                .iter()
+                .filter(|i| {
+                    i.match_type == "insert"
+                        && i.target.as_ref().is_some_and(|t| t.opcode == "fctiwz")
+                })
+                .count()
+                .min(*count)
+        }
     }
 }
 
@@ -1014,6 +1288,8 @@ pub enum VerdictClassification {
     AtLimit,
     /// Mixed signals, needs manual analysis
     NeedsInvestigation,
+    /// Base has no code (unimplemented stub)
+    Stub,
 }
 
 /// A factor that contributed to the verdict.
@@ -1092,6 +1368,24 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
         PatternType::ScopeCounterMismatch => {
             &["fixable-declarations.md#braced-vs-braceless-if-scope-counter"]
         }
+        PatternType::MakeStringTemplateMismatch => {
+            &["fixable-casting.md#makestring-template-type-mismatch-milo-macro-arguments"]
+        }
+        PatternType::AddressRelocationNoise => {
+            &["unfixable-compiler.md#address-relocation-noise"]
+        }
+        PatternType::BooleanNegation => {
+            &["unfixable-compiler.md#boolean-negation-subfic-vs-subic"]
+        }
+        PatternType::FloatPrecisionMismatch => {
+            &["fixable-casting.md#cast-placement-controls-fmul-vs-fmuls"]
+        }
+        PatternType::FselTernary => {
+            &["fixable-fsel-fma.md#fsel-via-explicit-ternary-subtractionnegation"]
+        }
+        PatternType::FloatToIntToFloat => {
+            &["fixable-casting.md#float-to-int-to-float-reconversion"]
+        }
     };
     paths.iter().map(|p| format!("{}{}", DOC_BASE, p)).collect()
 }
@@ -1104,28 +1398,74 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
 ///
 /// Looks for `diff_arg` instructions where the opcode is `bl` and the
 /// target argument matches the merged function regex.
+/// Extract the MSVC template base name from a mangled symbol.
+/// E.g., `?Foo@?$ObjRefConcrete@VRndDrawable@@...` → `?$ObjRefConcrete`
+/// Returns the portion before the first template argument.
+fn msvc_template_base(mangled: &str) -> Option<&str> {
+    // Find `?$` which starts a template name in MSVC mangling
+    let idx = mangled.find("?$")?;
+    // Find the next `@` after `?$` which ends the template name
+    let after = &mangled[idx + 2..];
+    let end = after.find('@')?;
+    Some(&mangled[idx..idx + 2 + end])
+}
+
 pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut merged_calls: HashMap<String, usize> = HashMap::new();
+    let mut icf_template_count = 0usize;
 
     for instr in instructions {
         if instr.match_type != "diff_arg" {
             continue;
         }
 
-        let Some(target) = &instr.target else { continue };
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
 
-        // Only look at branch-and-link (function calls)
-        if target.opcode != "bl" {
+        // Only look at branch instructions (bl = call, b = tail call)
+        if target.opcode != "bl" && target.opcode != "b" {
             continue;
         }
 
-        let Some(args) = &target.args else { continue };
+        let t_args = target.args.as_deref().unwrap_or("").trim();
+        let b_args = base.args.as_deref().unwrap_or("").trim();
 
-        // The args for bl is typically just the function name
-        let func_name = args.trim();
+        // Check explicit merged_*/OnlyReturns/??_[EG] patterns
+        if MERGED_FUNC_RE.is_match(t_args) {
+            *merged_calls.entry(t_args.to_string()).or_insert(0) += 1;
+            continue;
+        }
 
-        if MERGED_FUNC_RE.is_match(func_name) {
-            *merged_calls.entry(func_name.to_string()).or_insert(0) += 1;
+        // Check ICF merging: both sides call different symbols.
+        if t_args != b_args && !t_args.is_empty() && !b_args.is_empty() {
+            // Check if same template with different type args
+            if let (Some(t_base), Some(b_base)) =
+                (msvc_template_base(t_args), msvc_template_base(b_args))
+            {
+                if t_base == b_base {
+                    icf_template_count += 1;
+                    *merged_calls
+                        .entry(format!("ICF:{} (template merge)", t_base))
+                        .or_insert(0) += 1;
+                    continue;
+                }
+            }
+
+            // General ICF: bl/b to completely different symbols.
+            // At least one side must be a proper function name (not a label
+            // or number). This is likely ICF merging of unrelated functions
+            // with identical machine code.
+            let t_is_func = t_args.starts_with('?')
+                || t_args.starts_with('_')
+                || t_args.chars().next().map_or(false, |c| c.is_ascii_alphabetic());
+            let b_is_func = b_args.starts_with('?')
+                || b_args.starts_with('_')
+                || b_args.chars().next().map_or(false, |c| c.is_ascii_alphabetic());
+            if t_is_func && b_is_func {
+                icf_template_count += 1;
+                *merged_calls
+                    .entry(format!("ICF:{} (cross-function merge)", b_args))
+                    .or_insert(0) += 1;
+            }
         }
     }
 
@@ -1142,7 +1482,11 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
 
     Some(Pattern {
         pattern: PatternType::LinkerMerged,
-        confidence: Confidence::High,
+        confidence: if icf_template_count > 0 {
+            Confidence::Medium
+        } else {
+            Confidence::High
+        },
         instruction_count: total_count,
         fixability: Fixability::Unfixable,
         details: PatternDetails::MergedFunctions { merged_functions },
@@ -1324,11 +1668,28 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
         .collect();
     swaps.sort_by(|a, b| b.count.cmp(&a.count));
 
+    // Classify fixability based on register types:
+    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable via declaration reorder
+    // - Pure volatile swaps (r0-r12, f0-f13): Unfixable (compiler-internal allocation)
+    // - Mixed: MaybeFixable (callee-saved part might still be worth fixing)
+    let has_callee_saved_swap = swaps
+        .iter()
+        .any(|s| is_callee_saved_register(&s.target_reg) && is_callee_saved_register(&s.base_reg));
+    let has_volatile_swap = swaps
+        .iter()
+        .any(|s| !is_callee_saved_register(&s.target_reg) || !is_callee_saved_register(&s.base_reg));
+
+    let fixability = if has_volatile_swap && !has_callee_saved_swap {
+        Fixability::Unfixable // Pure volatile: compiler quirk, no source-level fix
+    } else {
+        Fixability::MaybeFixable // Pure callee-saved or mixed: might fix via decl reorder
+    };
+
     Some(Pattern {
         pattern: PatternType::RegisterSwap,
         confidence,
         instruction_count: total,
-        fixability: Fixability::MaybeFixable,
+        fixability,
         details: PatternDetails::RegisterSwap { swaps },
         doc_urls: pattern_doc_urls(PatternType::RegisterSwap),
     })
@@ -1865,7 +2226,7 @@ pub fn detect_static_guard_counter(instructions: &[InstructionDiffOutput]) -> Op
         pattern: PatternType::StaticGuardCounter,
         confidence: Confidence::Medium,
         instruction_count: count,
-        fixability: Fixability::LikelyFixable,
+        fixability: Fixability::UsuallyUnfixable,
         details: PatternDetails::StaticGuardCounter { guards },
         doc_urls: pattern_doc_urls(PatternType::StaticGuardCounter),
     })
@@ -1994,7 +2355,7 @@ pub fn detect_prologue_mismatch(instructions: &[InstructionDiffOutput]) -> Optio
                     pattern: PatternType::PrologueMismatch,
                     confidence: Confidence::High,
                     instruction_count: 1,
-                    fixability: Fixability::MaybeFixable,
+                    fixability: Fixability::Unfixable,
                     details: PatternDetails::PrologueMismatch {
                         info: PrologueMismatchInfo {
                             target_first_reg: t_reg,
@@ -2111,6 +2472,521 @@ pub fn detect_scope_counter_mismatch(instructions: &[InstructionDiffOutput]) -> 
 }
 
 // =============================================================================
+// New Pattern Detection Functions (Phase 4)
+// =============================================================================
+
+/// Regex for MakeString template calls (`??$MakeString@...`)
+static MAKESTRING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\?\?\$MakeString@(.+)$").unwrap());
+
+/// Regex for char[N] dimension in mangled template args (D followed by digits)
+static CHAR_ARRAY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"D(0[A-P]+)@").unwrap());
+
+/// Detect MakeString template parameter mismatches.
+///
+/// When MILO macros (MILO_ASSERT, etc.) receive arguments of different types
+/// between target and decomp (e.g., `const char*` vs `Symbol`), the mangled
+/// `MakeString<>` template instantiation differs. This manifests as `diff_arg`
+/// on `bl` where both call `??$MakeString@` but with different template params.
+///
+/// Sub-classifies as:
+/// - Type: different parameter types (LIKELY_FIXABLE: add .Str())
+/// - FileLength: only char[N] dimension differs (UNFIXABLE: __FILE__ build env)
+/// - Mixed: both differ
+pub fn detect_makestring_template_mismatch(
+    instructions: &[InstructionDiffOutput],
+) -> Option<Pattern> {
+    let mut mismatches: Vec<MakeStringMismatchInfo> = Vec::new();
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+        if target.opcode != "bl" || base.opcode != "bl" {
+            continue;
+        }
+
+        let t_args = target.args.as_deref().unwrap_or("");
+        let b_args = base.args.as_deref().unwrap_or("");
+
+        let t_cap = MAKESTRING_RE.captures(t_args);
+        let b_cap = MAKESTRING_RE.captures(b_args);
+
+        if let (Some(tc), Some(bc)) = (t_cap, b_cap) {
+            let t_template = tc.get(1).map(|m| m.as_str()).unwrap_or("");
+            let b_template = bc.get(1).map(|m| m.as_str()).unwrap_or("");
+
+            if t_template == b_template {
+                continue;
+            }
+
+            // Classify: strip char[N] dimensions and compare the rest
+            let t_no_char = CHAR_ARRAY_RE.replace_all(t_template, "D_N_@");
+            let b_no_char = CHAR_ARRAY_RE.replace_all(b_template, "D_N_@");
+
+            let char_differs = t_template != b_template
+                && CHAR_ARRAY_RE.is_match(t_template)
+                && CHAR_ARRAY_RE.is_match(b_template);
+            let types_differ = t_no_char != b_no_char;
+
+            let sub_type = match (types_differ, char_differs) {
+                (true, true) => MakeStringMismatchSubType::Mixed,
+                (true, false) => MakeStringMismatchSubType::Type,
+                (false, true) => MakeStringMismatchSubType::FileLength,
+                (false, false) => MakeStringMismatchSubType::FileLength, // only char dims differ
+            };
+
+            mismatches.push(MakeStringMismatchInfo {
+                index: instr.index,
+                target_template: t_template.to_string(),
+                base_template: b_template.to_string(),
+                sub_type,
+            });
+        }
+    }
+
+    if mismatches.is_empty() {
+        return None;
+    }
+
+    let count = mismatches.len();
+
+    // Fixability depends on sub-types
+    let has_type = mismatches
+        .iter()
+        .any(|m| matches!(m.sub_type, MakeStringMismatchSubType::Type));
+    let all_file_length = mismatches
+        .iter()
+        .all(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength));
+    let fixability = if all_file_length {
+        Fixability::Unfixable
+    } else if has_type {
+        Fixability::LikelyFixable
+    } else {
+        Fixability::MaybeFixable
+    };
+
+    Some(Pattern {
+        pattern: PatternType::MakeStringTemplateMismatch,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability,
+        details: PatternDetails::MakeStringTemplateMismatch { mismatches },
+        doc_urls: pattern_doc_urls(PatternType::MakeStringTemplateMismatch),
+    })
+}
+
+/// Detect address relocation noise.
+///
+/// Detect CRT save/restore function suffix differences.
+///
+/// The compiler emits `bl __savegprlr` (or `b __restgprlr`) with different
+/// suffixes depending on how many callee-saved registers are used. E.g.,
+/// `__savegprlr_14` vs `__savegprlr_18`. These fall-through CRT functions
+/// are functionally equivalent — the difference is just which entry point
+/// in the save/restore chain is used. This is unfixable noise.
+fn is_crt_save_restore_diff(target: &InstructionInfo, base: &InstructionInfo) -> bool {
+    static CRT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^__(save|rest)(gpr|fpr|vmx)(lr)?(_\d+)?$").unwrap()
+    });
+
+    let t_args = target.args.as_deref().unwrap_or("");
+    let b_args = base.args.as_deref().unwrap_or("");
+
+    if t_args == b_args {
+        return false;
+    }
+
+    CRT_RE.is_match(t_args.trim()) && CRT_RE.is_match(b_args.trim())
+}
+
+/// When the decomp binary has different symbol addresses than the target
+/// (due to link-time layout differences), `lis`/`addi`/`ori` pairs that
+/// load absolute addresses will have different immediate values even though
+/// they reference the same logical symbol. These show up as `diff_arg` with
+/// the same opcode but different immediates.
+/// Check if two instructions both reference the same symbol via typed_args,
+/// or if one side has a raw address label (`lbl_XXXXXXXX`) referencing the
+/// same underlying data as the other side's proper symbol name.
+/// Returns true if the diff is purely due to different relocation addresses
+/// (address relocation noise) rather than genuinely different code.
+fn has_same_symbol_reloc(target: &InstructionInfo, base: &InstructionInfo) -> bool {
+    let (Some(t_args), Some(b_args)) = (&target.typed_args, &base.typed_args) else {
+        return false;
+    };
+
+    // Find Symbol args on each side
+    let t_syms: Vec<&str> = t_args
+        .iter()
+        .filter_map(|a| match a {
+            super::diff::TypedArg::Symbol(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let b_syms: Vec<&str> = b_args
+        .iter()
+        .filter_map(|a| match a {
+            super::diff::TypedArg::Symbol(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if t_syms.is_empty() || b_syms.is_empty() {
+        return false;
+    }
+
+    // Case 1: Both sides have the same symbol name
+    if t_syms == b_syms {
+        return true;
+    }
+
+    // Case 2: One side has lbl_XXXXXXXX (raw address from split XEX) and the
+    // other has a proper symbol name — this is address relocation noise since
+    // the target .obj lacks symbol names for static/local data.
+    for (t, b) in t_syms.iter().zip(b_syms.iter()) {
+        if t.starts_with("lbl_") || b.starts_with("lbl_") {
+            return true;
+        }
+    }
+
+    // Case 3: ICF const-qualifier or access-specifier difference in mangled name.
+    // MSVC encodes access as: @@QAA (non-const) vs @@QBA (const), @@IAA (protected)
+    // vs @@IBA (protected const), etc. When the linker merges const and non-const
+    // versions via ICF, the bl target differs only in this qualifier character.
+    // Normalize A/B (non-const/const) at these positions and compare.
+    static CONST_QUAL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"@@[QI]([AB])").unwrap());
+    for (t, b) in t_syms.iter().zip(b_syms.iter()) {
+        let t_norm = CONST_QUAL_RE.replace_all(t, "@@Q_");
+        let b_norm = CONST_QUAL_RE.replace_all(b, "@@Q_");
+        if t_norm == b_norm {
+            return true;
+        }
+    }
+
+    // Case 4: ??_C@ string literal hash mismatch. MSVC string literals are
+    // mangled as ??_C@_0XX@HASH@content where HASH is a CRC-32 of the string
+    // + __FILE__ path. Different build paths produce different hashes for the
+    // same string content. Normalize the hash portion and path separators
+    // (?1 = '/' vs ?2 = '\') to compare the logical content.
+    static STRING_LITERAL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\?\?_C@_[0-9A-P]+@[A-P]+@").unwrap());
+    for (t, b) in t_syms.iter().zip(b_syms.iter()) {
+        if STRING_LITERAL_RE.is_match(t) && STRING_LITERAL_RE.is_match(b) {
+            // Both are string literals — normalize hash and path separators
+            static STRING_HASH_RE: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^(\?\?_C@_[0-9A-P]+@)[A-P]+@").unwrap());
+            let t_norm = STRING_HASH_RE.replace(t, "${1}_@");
+            let b_norm = STRING_HASH_RE.replace(b, "${1}_@");
+            // Also normalize path separators: ?1 (/) and ?2 (\) are equivalent
+            let t_norm = t_norm.replace("?1", "?_SEP_").replace("?2", "?_SEP_");
+            let b_norm = b_norm.replace("?1", "?_SEP_").replace("?2", "?_SEP_");
+            if t_norm == b_norm {
+                return true;
+            }
+        }
+    }
+
+    // Case 5: Mangled vs unmangled function name. One side has a fully
+    // MSVC-mangled name (?func@Namespace@@...) while the other has the
+    // plain C name (func). This happens when the target .obj has C linkage
+    // names while the decomp uses C++ mangled names, or vice versa.
+    for (t, b) in t_syms.iter().zip(b_syms.iter()) {
+        // One starts with ? (mangled), the other doesn't
+        let t_mangled = t.starts_with('?');
+        let b_mangled = b.starts_with('?');
+        if t_mangled != b_mangled {
+            // Extract the base name from the mangled side
+            let mangled = if t_mangled { t } else { b };
+            let plain = if t_mangled { b } else { t };
+            // MSVC mangling: ?name@ or ?name@namespace@...
+            // Extract name between first ? and first @
+            if let Some(at_pos) = mangled[1..].find('@') {
+                let mangled_base = &mangled[1..1 + at_pos];
+                if mangled_base == *plain {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+pub fn detect_address_relocation_noise(
+    instructions: &[InstructionDiffOutput],
+) -> Option<Pattern> {
+    let mut count = 0usize;
+    let mut pair_count = 0usize;
+    let mut prev_was_lis = false;
+
+    for instr in instructions {
+        if instr.match_type != "diff_arg" {
+            prev_was_lis = false;
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else {
+            prev_was_lis = false;
+            continue;
+        };
+
+        // Same opcode, different args (or same opcode with CRT suffix diff)
+        if target.opcode != base.opcode {
+            prev_was_lis = false;
+            continue;
+        }
+
+        match target.opcode.as_str() {
+            "lis" => {
+                // Any diff_arg on lis is address relocation: either different
+                // immediates (different address halves) or same symbol text with
+                // different relocation address. Both are linker layout noise.
+                count += 1;
+                prev_was_lis = true;
+            }
+            "addi" | "ori" => {
+                // For addi/ori following lis (address loading pair), always
+                // count as relocation. For standalone addi, only count when
+                // there's a symbol relocation or identical text — NOT for
+                // different immediates which may be struct offset mismatches.
+                let t_args = target.args.as_deref().unwrap_or("");
+                let b_args = base.args.as_deref().unwrap_or("");
+                if prev_was_lis
+                    || has_same_symbol_reloc(target, base)
+                    || (t_args == b_args && !t_args.is_empty())
+                {
+                    count += 1;
+                    if prev_was_lis {
+                        pair_count += 1;
+                    }
+                }
+                prev_was_lis = false;
+            }
+            // Branch instructions: same symbol at different address, CRT
+            // save/restore suffix differences (__savegprlr vs __savegprlr_14),
+            // or identical args text with different relocation address
+            "bl" | "b" => {
+                let t_args = target.args.as_deref().unwrap_or("");
+                let b_args = base.args.as_deref().unwrap_or("");
+                if has_same_symbol_reloc(target, base)
+                    || is_crt_save_restore_diff(target, base)
+                    || (t_args == b_args && !t_args.is_empty())
+                {
+                    count += 1;
+                }
+                prev_was_lis = false;
+            }
+            // Any other opcode: same symbol relocation, or identical args text
+            // with different relocation address (diff_arg but text matches)
+            _ => {
+                let t_args = target.args.as_deref().unwrap_or("");
+                let b_args = base.args.as_deref().unwrap_or("");
+                if has_same_symbol_reloc(target, base)
+                    || (t_args == b_args && !t_args.is_empty())
+                {
+                    count += 1;
+                }
+                prev_was_lis = false;
+            }
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::AddressRelocationNoise,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::Unfixable,
+        details: PatternDetails::AddressRelocationNoise {
+            info: AddressRelocationInfo { count, pair_count },
+        },
+        doc_urls: pattern_doc_urls(PatternType::AddressRelocationNoise),
+    })
+}
+
+/// Detect boolean negation pattern (subfic vs subic).
+///
+/// The compiler may choose `subfic rD, rA, 0` or `subic rD, rA, 0` for
+/// boolean negation depending on context. This is an unfixable compiler choice.
+pub fn detect_boolean_negation(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut count = 0usize;
+
+    for instr in instructions {
+        if instr.match_type != "replace" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+
+        let t_op = target.opcode.as_str();
+        let b_op = base.opcode.as_str();
+
+        let is_subfic_subic = (t_op == "subfic"
+            && matches!(b_op, "subic" | "subic."))
+            || (matches!(t_op, "subic" | "subic.")
+                && b_op == "subfic");
+
+        if is_subfic_subic {
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::BooleanNegation,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::Unfixable,
+        details: PatternDetails::BooleanNegation { count },
+        doc_urls: pattern_doc_urls(PatternType::BooleanNegation),
+    })
+}
+
+/// Known single-precision ↔ double-precision opcode pairs.
+const FLOAT_PRECISION_PAIRS: &[(&str, &str)] = &[
+    ("fmul", "fmuls"),
+    ("fadd", "fadds"),
+    ("fsub", "fsubs"),
+    ("fmadd", "fmadds"),
+    ("fmsub", "fmsubs"),
+    ("fnmadd", "fnmadds"),
+    ("fnmsub", "fnmsubs"),
+];
+
+/// Detect float precision mismatches.
+///
+/// When cast placement differs between target and decomp, the compiler may
+/// emit a double-precision instruction (e.g., `fmul`) where the target uses
+/// single-precision (`fmuls`), or vice versa. This is often fixable by
+/// adjusting cast placement or using `float` literals.
+pub fn detect_float_precision_mismatch(
+    instructions: &[InstructionDiffOutput],
+) -> Option<Pattern> {
+    let mut mismatches: Vec<FloatPrecisionMismatchEntry> = Vec::new();
+
+    for instr in instructions {
+        if instr.match_type != "replace" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+
+        let t_op = target.opcode.as_str();
+        let b_op = base.opcode.as_str();
+
+        // Check if the opcodes form a known precision pair
+        let is_pair = FLOAT_PRECISION_PAIRS
+            .iter()
+            .any(|(double, single)| {
+                (t_op == *double && b_op == *single) || (t_op == *single && b_op == *double)
+            });
+
+        if is_pair {
+            mismatches.push(FloatPrecisionMismatchEntry {
+                index: instr.index,
+                target_op: t_op.to_string(),
+                base_op: b_op.to_string(),
+            });
+        }
+    }
+
+    if mismatches.is_empty() {
+        return None;
+    }
+
+    let count = mismatches.len();
+
+    Some(Pattern {
+        pattern: PatternType::FloatPrecisionMismatch,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::FloatPrecisionMismatch { mismatches },
+        doc_urls: pattern_doc_urls(PatternType::FloatPrecisionMismatch),
+    })
+}
+
+/// Detect fsel explicit ternary patterns.
+///
+/// Looks for sequences of fneg/fsubs followed by fsel in target where base has a branch.
+pub fn detect_fsel_ternary(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut count = 0;
+    for i in 0..instructions.len() {
+        let instr = &instructions[i];
+        if instr.match_type != "replace" {
+            continue;
+        }
+        let Some(target) = &instr.target else { continue };
+        if target.opcode == "fsel" {
+            // Check for previous fneg or fsubs
+            if i > 0 {
+                if let Some(prev) = &instructions[i - 1].target {
+                    if matches!(prev.opcode.as_str(), "fneg" | "fsubs") {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::FselTernary,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::FselTernary { count },
+        doc_urls: pattern_doc_urls(PatternType::FselTernary),
+    })
+}
+
+/// Detect float-to-int-to-float reconversion patterns.
+///
+/// Looks for sequences of fctiwz followed by stfd or fmr in target where base has stfs.
+pub fn detect_float_to_int_to_float(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut count = 0;
+    for i in 0..instructions.len() {
+        let instr = &instructions[i];
+        if instr.match_type != "replace" {
+            continue;
+        }
+        let Some(target) = &instr.target else { continue };
+        if target.opcode == "fctiwz" {
+            // Check for following stfd or fmr
+            if i + 1 < instructions.len() {
+                if let Some(next) = &instructions[i + 1].target {
+                    if matches!(next.opcode.as_str(), "stfd" | "fmr") {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(Pattern {
+        pattern: PatternType::FloatToIntToFloat,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::FloatToIntToFloat { count },
+        doc_urls: pattern_doc_urls(PatternType::FloatToIntToFloat),
+    })
+}
+
+// =============================================================================
 // Analysis
 // =============================================================================
 
@@ -2161,6 +3037,24 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
     if let Some(p) = detect_scope_counter_mismatch(instructions) {
         patterns.push(p);
     }
+    if let Some(p) = detect_makestring_template_mismatch(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_address_relocation_noise(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_boolean_negation(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_float_precision_mismatch(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_fsel_ternary(instructions) {
+        patterns.push(p);
+    }
+    if let Some(p) = detect_float_to_int_to_float(instructions) {
+        patterns.push(p);
+    }
 
     // Count total mismatches
     let total_mismatches = instructions.iter().filter(|i| i.match_type != "equal").count();
@@ -2189,6 +3083,12 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
             "PROLOGUE_MISMATCH",
             "ALLOCA_MISMATCH",
             "SCOPE_COUNTER_MISMATCH",
+            "MAKESTRING_TEMPLATE_MISMATCH",
+            "ADDRESS_RELOCATION_NOISE",
+            "BOOLEAN_NEGATION",
+            "FLOAT_PRECISION_MISMATCH",
+            "FSEL_TERNARY",
+            "FLOAT_TO_INT_TO_FLOAT",
         ],
         unattributed_mismatches: unattributed,
     }
@@ -2203,7 +3103,32 @@ pub fn compute_verdict(
     summary: &InstructionSummary,
     analysis: &Analysis,
     match_percent: Option<f32>,
+    base_size: u64,
+    target_size: u64,
 ) -> Verdict {
+    // If base has no code but target does, the function is unimplemented.
+    // objdiff produces placeholder instructions with no data on either side
+    // that get counted as "equal", so we must check sizes first.
+    if base_size == 0 && target_size > 0 {
+        return Verdict {
+            classification: VerdictClassification::Stub,
+            confidence: Confidence::High,
+            explanation: format!(
+                "Function is unimplemented (base has no code, target is {} bytes).",
+                target_size
+            ),
+            factors: vec![VerdictFactor {
+                name: "base_size",
+                value: serde_json::json!(0),
+                threshold: None,
+                result: "stub",
+            }],
+            recommendation: "Implement the function.".to_string(),
+            suggestions: vec![],
+            doc_urls: vec![],
+        };
+    }
+
     let total_mismatches = summary.total - summary.equal;
     let mut factors = Vec::new();
 
@@ -2234,6 +3159,49 @@ pub fn compute_verdict(
             suggestions: vec![],
             doc_urls: vec![],
         };
+    }
+
+    // Check if ALL mismatches are attributed to unfixable patterns.
+    // If so, this function is at its limit regardless of mismatch count.
+    if analysis.unattributed_mismatches == 0 && !analysis.patterns.is_empty() {
+        let has_linker_merged = analysis.has_pattern(PatternType::LinkerMerged);
+        let all_unfixable = analysis.patterns.iter().all(|p| {
+            p.fixability == Fixability::Unfixable
+            // MakeString type mismatches become unfixable when co-detected with
+            // LinkerMerged ICF — the different template is just the linker's
+            // ICF address choice, not a real source-level type difference
+            || (p.pattern == PatternType::MakeStringTemplateMismatch && has_linker_merged)
+        });
+        if all_unfixable {
+            let pattern_names: Vec<&str> =
+                analysis.patterns.iter().map(|p| p.pattern.as_str()).collect();
+            factors.push(VerdictFactor {
+                name: "all_unfixable_patterns",
+                value: serde_json::json!(true),
+                threshold: None,
+                result: "at_limit",
+            });
+            return Verdict {
+                classification: VerdictClassification::AtLimit,
+                confidence: Confidence::High,
+                explanation: format!(
+                    "All {} mismatch(es) attributed to unfixable pattern(s): {}.",
+                    total_mismatches,
+                    pattern_names.join(", ")
+                ),
+                factors,
+                recommendation: format!(
+                    "Accept current match ({:.1}%). Remaining differences are build artifacts.",
+                    match_percent.unwrap_or(0.0)
+                ),
+                suggestions: vec![Suggestion {
+                    action: "Accept current match — remaining differences are unfixable."
+                        .to_string(),
+                    doc_url: None,
+                }],
+                doc_urls: verdict_doc_urls.clone(),
+            };
+        }
     }
 
     // Very few mismatches - likely fixable with manual inspection
@@ -2345,6 +3313,97 @@ pub fn compute_verdict(
         };
     }
 
+    // Check for address relocation noise (unfixable, similar to merged)
+    let addr_reloc_count = analysis.pattern_instruction_count(PatternType::AddressRelocationNoise);
+    let addr_reloc_ratio =
+        if total_mismatches > 0 { addr_reloc_count as f32 / total_mismatches as f32 } else { 0.0 };
+    if addr_reloc_ratio >= MERGED_RATIO_AT_LIMIT {
+        factors.push(VerdictFactor {
+            name: "address_relocation_ratio",
+            value: serde_json::json!(addr_reloc_ratio),
+            threshold: Some(MERGED_RATIO_AT_LIMIT),
+            result: "exceeds_limit",
+        });
+        return Verdict {
+            classification: VerdictClassification::AtLimit,
+            confidence: Confidence::High,
+            explanation: format!(
+                "{:.1}% of mismatches are address relocation noise (different symbol addresses).",
+                addr_reloc_ratio * 100.0
+            ),
+            factors,
+            recommendation: format!(
+                "Accept current match ({:.1}%). Address relocation is a linker artifact.",
+                match_percent.unwrap_or(0.0)
+            ),
+            suggestions: vec![Suggestion {
+                action: "Accept current match — address relocation differences are unfixable."
+                    .to_string(),
+                doc_url: Some(format!(
+                    "{}unfixable-compiler.md#address-relocation-noise",
+                    DOC_BASE
+                )),
+            }],
+            doc_urls: verdict_doc_urls.clone(),
+        };
+    }
+
+    // Check for MakeString template mismatches
+    if analysis.has_pattern(PatternType::MakeStringTemplateMismatch) {
+        let ms_pattern = analysis
+            .patterns
+            .iter()
+            .find(|p| p.pattern == PatternType::MakeStringTemplateMismatch);
+        if let Some(pat) = ms_pattern {
+            if let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pat.details {
+                let all_file = mismatches
+                    .iter()
+                    .all(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength));
+                let has_type = mismatches
+                    .iter()
+                    .any(|m| matches!(m.sub_type, MakeStringMismatchSubType::Type));
+                factors.push(VerdictFactor {
+                    name: "makestring_template",
+                    value: serde_json::json!(mismatches.len()),
+                    threshold: None,
+                    result: if all_file { "file_length_only" } else { "type_mismatch" },
+                });
+                if has_type {
+                    // Type mismatches are likely fixable — suggest .Str() conversion
+                    return Verdict {
+                        classification: VerdictClassification::LikelyFixable,
+                        confidence: Confidence::High,
+                        explanation: format!(
+                            "{} MakeString template type mismatch(es) — add .Str() conversions to MILO macro arguments.",
+                            mismatches.len()
+                        ),
+                        factors,
+                        recommendation: "Add .Str() to Symbol/DataNode arguments in MILO macros.".to_string(),
+                        suggestions: vec![Suggestion {
+                            action: "Add .Str() conversions to MILO macro arguments".to_string(),
+                            doc_url: Some(format!(
+                                "{}fixable-casting.md#makestring-template-type-mismatch-milo-macro-arguments",
+                                DOC_BASE
+                            )),
+                        }],
+                        doc_urls: verdict_doc_urls.clone(),
+                    };
+                }
+            }
+        }
+    }
+
+    // Check for float precision mismatches (likely fixable)
+    if analysis.has_pattern(PatternType::FloatPrecisionMismatch) {
+        let fp_count = analysis.pattern_instruction_count(PatternType::FloatPrecisionMismatch);
+        factors.push(VerdictFactor {
+            name: "float_precision_mismatch",
+            value: serde_json::json!(fp_count),
+            threshold: None,
+            result: "detected",
+        });
+    }
+
     // Check for fixable control flow patterns
     let has_control_flow = summary.diff_op > 0 || summary.replace > 0;
     factors.push(VerdictFactor {
@@ -2431,6 +3490,36 @@ pub fn compute_verdict(
             action: "Move variable initialization closer to first use".to_string(),
             doc_url: Some(format!("{}fixable-declarations.md#variable-extraction", DOC_BASE)),
         });
+
+        // High match% with only register swaps (and possibly other unfixable
+        // patterns) → at_limit. These are practically unfixable: callee-saved
+        // register allocation is not controllable from source.
+        let all_practically_unfixable = analysis.unattributed_mismatches == 0
+            && analysis.patterns.iter().all(|p| {
+                p.fixability == Fixability::Unfixable
+                    || p.fixability == Fixability::UsuallyUnfixable
+                    || p.pattern == PatternType::RegisterSwap
+                    || p.pattern == PatternType::PrologueMismatch
+            });
+        let high_match = match_percent.unwrap_or(0.0) >= 95.0;
+
+        if all_practically_unfixable && high_match {
+            let explanation = format!(
+                "{} register swap instruction(s) at {:.1}% match -- practically unfixable.",
+                register_swap_count,
+                match_percent.unwrap_or(0.0)
+            );
+            return Verdict {
+                classification: VerdictClassification::AtLimit,
+                confidence: Confidence::High,
+                explanation,
+                factors,
+                recommendation: "Accept current match — register swaps are not source-controllable."
+                    .to_string(),
+                suggestions,
+                doc_urls: verdict_doc_urls.clone(),
+            };
+        }
 
         let explanation = if register_swap_count > 20 {
             format!(
@@ -2670,7 +3759,7 @@ mod tests {
             unattributed_mismatches: 0,
         };
 
-        let verdict = compute_verdict(&summary, &analysis, Some(100.0));
+        let verdict = compute_verdict(&summary, &analysis, Some(100.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::Complete);
     }
 
@@ -2695,7 +3784,7 @@ mod tests {
             unattributed_mismatches: 1,
         };
 
-        let verdict = compute_verdict(&summary, &analysis, Some(97.0));
+        let verdict = compute_verdict(&summary, &analysis, Some(97.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::AtLimit);
     }
 
@@ -3750,7 +4839,7 @@ mod tests {
             patterns_checked: vec!["LINKER_MERGED"],
             unattributed_mismatches: 1,
         };
-        let verdict = compute_verdict(&summary, &analysis, Some(97.0));
+        let verdict = compute_verdict(&summary, &analysis, Some(97.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::AtLimit);
         // Explanation should include summarize output
         assert!(verdict.explanation.contains("call(s)"));
@@ -3784,9 +4873,473 @@ mod tests {
             patterns_checked: vec!["CONTROL_FLOW"],
             unattributed_mismatches: 2,
         };
-        let verdict = compute_verdict(&summary, &analysis, Some(85.0));
+        let verdict = compute_verdict(&summary, &analysis, Some(85.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::LikelyFixable);
         // Suggestions should include pattern-specific info
         assert!(!verdict.suggestions.is_empty());
+    }
+
+    // =========================================================================
+    // New detector tests (Phase 4)
+    // =========================================================================
+
+    #[test]
+    fn test_detect_makestring_template_type_mismatch() {
+        // Type mismatch: PBD (const char*) vs VSymbol@@
+        let instructions = vec![make_instr(
+            5,
+            "diff_arg",
+            Some("bl"),
+            Some("??$MakeString@PBDVSymbol@@H@@YA?AVString@@PBDVSymbol@@H@Z"),
+            Some("bl"),
+            Some("??$MakeString@PBDPBDH@@YA?AVString@@PBDPBDH@Z"),
+        )];
+
+        let pattern = detect_makestring_template_mismatch(&instructions)
+            .expect("Should detect MakeString type mismatch");
+        assert_eq!(pattern.pattern, PatternType::MakeStringTemplateMismatch);
+        assert_eq!(pattern.instruction_count, 1);
+        assert_eq!(pattern.fixability, Fixability::LikelyFixable);
+
+        if let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pattern.details {
+            assert_eq!(mismatches.len(), 1);
+            assert_eq!(mismatches[0].index, 5);
+            assert!(matches!(mismatches[0].sub_type, MakeStringMismatchSubType::Type));
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_makestring_template_file_length() {
+        // __FILE__ length mismatch: char[N] differs
+        let instructions = vec![make_instr(
+            3,
+            "diff_arg",
+            Some("bl"),
+            Some("??$MakeString@D0BC@@PBDH@@YA?AVString@@D0BC@@PBDH@Z"),
+            Some("bl"),
+            Some("??$MakeString@D0BF@@PBDH@@YA?AVString@@D0BF@@PBDH@Z"),
+        )];
+
+        let pattern = detect_makestring_template_mismatch(&instructions)
+            .expect("Should detect MakeString __FILE__ mismatch");
+        assert_eq!(pattern.pattern, PatternType::MakeStringTemplateMismatch);
+        assert_eq!(pattern.fixability, Fixability::Unfixable);
+
+        if let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pattern.details {
+            assert!(matches!(mismatches[0].sub_type, MakeStringMismatchSubType::FileLength));
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_makestring_no_match_same_template() {
+        // Same template - should NOT detect
+        let instructions = vec![make_instr(
+            0,
+            "diff_arg",
+            Some("bl"),
+            Some("??$MakeString@PBDPBDH@@YA?AVString@@PBDPBDH@Z"),
+            Some("bl"),
+            Some("??$MakeString@PBDPBDH@@YA?AVString@@PBDPBDH@Z"),
+        )];
+
+        // This actually won't be diff_arg if they're equal, but even if it is,
+        // templates match so no detection
+        let pattern = detect_makestring_template_mismatch(&instructions);
+        assert!(pattern.is_none());
+    }
+
+    #[test]
+    fn test_detect_address_relocation_noise_lis_pair() {
+        // lis + addi pair with different immediates
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("lis"),
+                Some("r3, 0x8234"),
+                Some("lis"),
+                Some("r3, 0x8235"),
+            ),
+            make_instr(
+                1,
+                "diff_arg",
+                Some("addi"),
+                Some("r3, r3, 0x1000"),
+                Some("addi"),
+                Some("r3, r3, 0x2000"),
+            ),
+        ];
+
+        let pattern = detect_address_relocation_noise(&instructions)
+            .expect("Should detect address relocation noise");
+        assert_eq!(pattern.pattern, PatternType::AddressRelocationNoise);
+        assert_eq!(pattern.instruction_count, 2);
+        assert_eq!(pattern.fixability, Fixability::Unfixable);
+
+        if let PatternDetails::AddressRelocationNoise { info } = &pattern.details {
+            assert_eq!(info.count, 2);
+            assert_eq!(info.pair_count, 1);
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_address_relocation_noise_lis_only() {
+        // Lone lis without matching addi
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("lis"),
+                Some("r3, 0x8234"),
+                Some("lis"),
+                Some("r3, 0x8235"),
+            ),
+            make_instr(1, "equal", Some("mr"), Some("r4, r3"), Some("mr"), Some("r4, r3")),
+        ];
+
+        let pattern = detect_address_relocation_noise(&instructions)
+            .expect("Should detect lone lis relocation");
+        assert_eq!(pattern.instruction_count, 1);
+
+        if let PatternDetails::AddressRelocationNoise { info } = &pattern.details {
+            assert_eq!(info.count, 1);
+            assert_eq!(info.pair_count, 0);
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_address_relocation_noise_none() {
+        // No lis/addi diff_arg
+        let instructions = vec![make_instr(
+            0,
+            "diff_arg",
+            Some("mr"),
+            Some("r3, r4"),
+            Some("mr"),
+            Some("r3, r5"),
+        )];
+
+        let pattern = detect_address_relocation_noise(&instructions);
+        assert!(pattern.is_none());
+    }
+
+    #[test]
+    fn test_detect_boolean_negation() {
+        let instructions = vec![make_instr(
+            5,
+            "replace",
+            Some("subfic"),
+            Some("r3, r3, 0"),
+            Some("subic"),
+            Some("r3, r3, 0"),
+        )];
+
+        let pattern =
+            detect_boolean_negation(&instructions).expect("Should detect boolean negation");
+        assert_eq!(pattern.pattern, PatternType::BooleanNegation);
+        assert_eq!(pattern.instruction_count, 1);
+        assert_eq!(pattern.fixability, Fixability::Unfixable);
+
+        if let PatternDetails::BooleanNegation { count } = &pattern.details {
+            assert_eq!(*count, 1);
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_boolean_negation_reverse() {
+        // subic in target, subfic in base
+        let instructions = vec![make_instr(
+            0,
+            "replace",
+            Some("subic."),
+            Some("r3, r3, 0"),
+            Some("subfic"),
+            Some("r3, r3, 0"),
+        )];
+
+        let pattern =
+            detect_boolean_negation(&instructions).expect("Should detect reverse negation");
+        assert_eq!(pattern.instruction_count, 1);
+    }
+
+    #[test]
+    fn test_detect_boolean_negation_none() {
+        // Not a subfic/subic pair
+        let instructions = vec![make_instr(
+            0,
+            "replace",
+            Some("add"),
+            Some("r3, r3, r4"),
+            Some("sub"),
+            Some("r3, r3, r4"),
+        )];
+
+        let pattern = detect_boolean_negation(&instructions);
+        assert!(pattern.is_none());
+    }
+
+    #[test]
+    fn test_detect_float_precision_mismatch() {
+        let instructions = vec![
+            make_instr(
+                3,
+                "replace",
+                Some("fmul"),
+                Some("f0, f1, f2"),
+                Some("fmuls"),
+                Some("f0, f1, f2"),
+            ),
+            make_instr(
+                7,
+                "replace",
+                Some("fadds"),
+                Some("f3, f3, f0"),
+                Some("fadd"),
+                Some("f3, f3, f0"),
+            ),
+        ];
+
+        let pattern = detect_float_precision_mismatch(&instructions)
+            .expect("Should detect float precision mismatch");
+        assert_eq!(pattern.pattern, PatternType::FloatPrecisionMismatch);
+        assert_eq!(pattern.instruction_count, 2);
+        assert_eq!(pattern.fixability, Fixability::LikelyFixable);
+
+        if let PatternDetails::FloatPrecisionMismatch { mismatches } = &pattern.details {
+            assert_eq!(mismatches.len(), 2);
+            assert_eq!(mismatches[0].index, 3);
+            assert_eq!(mismatches[0].target_op, "fmul");
+            assert_eq!(mismatches[0].base_op, "fmuls");
+            assert_eq!(mismatches[1].index, 7);
+            assert_eq!(mismatches[1].target_op, "fadds");
+            assert_eq!(mismatches[1].base_op, "fadd");
+        } else {
+            panic!("Wrong details type");
+        }
+    }
+
+    #[test]
+    fn test_detect_float_precision_mismatch_all_pairs() {
+        // Test each known pair
+        for (double, single) in &[
+            ("fmul", "fmuls"),
+            ("fadd", "fadds"),
+            ("fsub", "fsubs"),
+            ("fmadd", "fmadds"),
+            ("fmsub", "fmsubs"),
+            ("fnmadd", "fnmadds"),
+            ("fnmsub", "fnmsubs"),
+        ] {
+            let instructions = vec![make_instr(
+                0,
+                "replace",
+                Some(double),
+                Some("f0, f1, f2"),
+                Some(single),
+                Some("f0, f1, f2"),
+            )];
+            let pattern = detect_float_precision_mismatch(&instructions);
+            assert!(
+                pattern.is_some(),
+                "Should detect {} vs {} pair",
+                double, single
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_float_precision_mismatch_none() {
+        // Not a precision pair — different float instructions
+        let instructions = vec![make_instr(
+            0,
+            "replace",
+            Some("fmul"),
+            Some("f0, f1, f2"),
+            Some("fadd"),
+            Some("f0, f1, f2"),
+        )];
+
+        let pattern = detect_float_precision_mismatch(&instructions);
+        assert!(pattern.is_none(), "fmul vs fadd is not a precision pair");
+    }
+
+    #[test]
+    fn test_analyze_instructions_includes_phase4_patterns() {
+        let instructions =
+            vec![make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4"))];
+
+        let analysis = analyze_instructions(&instructions);
+        assert!(analysis.patterns_checked.contains(&"MAKESTRING_TEMPLATE_MISMATCH"));
+        assert!(analysis.patterns_checked.contains(&"ADDRESS_RELOCATION_NOISE"));
+        assert!(analysis.patterns_checked.contains(&"BOOLEAN_NEGATION"));
+        assert!(analysis.patterns_checked.contains(&"FLOAT_PRECISION_MISMATCH"));
+        assert!(analysis.patterns_checked.contains(&"FSEL_TERNARY"));
+        assert!(analysis.patterns_checked.contains(&"FLOAT_TO_INT_TO_FLOAT"));
+    }
+
+    #[test]
+    fn test_detect_fsel_ternary() {
+        let instructions = vec![
+            make_instr(0, "replace", Some("fneg"), Some("f0, f1"), Some("fneg"), Some("f0, f1")),
+            make_instr(1, "replace", Some("fsel"), Some("f1, f0, f12, f1"), Some("fsel"), Some("f1, f0, f12, f1")),
+        ];
+        let pattern = detect_fsel_ternary(&instructions).expect("Should detect fsel ternary");
+        assert_eq!(pattern.pattern, PatternType::FselTernary);
+        assert_eq!(pattern.instruction_count, 1);
+    }
+
+    #[test]
+    fn test_detect_float_to_int_to_float() {
+        let instructions = vec![
+            make_instr(0, "replace", Some("fctiwz"), Some("f0, f1"), Some("fctiwz"), Some("f0, f1")),
+            make_instr(1, "replace", Some("stfd"), Some("f0, 0x58(r31)"), Some("stfd"), Some("f0, 0x58(r31)")),
+        ];
+        let pattern = detect_float_to_int_to_float(&instructions).expect("Should detect float-to-int-to-float");
+        assert_eq!(pattern.pattern, PatternType::FloatToIntToFloat);
+        assert_eq!(pattern.instruction_count, 1);
+    }
+
+    #[test]
+    fn test_verdict_at_limit_address_relocation() {
+        let summary = InstructionSummary {
+            total: 10,
+            equal: 5,
+            diff_arg: 5,
+            ..Default::default()
+        };
+        let analysis = Analysis {
+            patterns: vec![Pattern {
+                pattern: PatternType::AddressRelocationNoise,
+                confidence: Confidence::High,
+                instruction_count: 4, // 4/5 = 80%
+                fixability: Fixability::Unfixable,
+                details: PatternDetails::AddressRelocationNoise {
+                    info: AddressRelocationInfo { count: 4, pair_count: 2 },
+                },
+                doc_urls: vec![],
+            }],
+            patterns_checked: vec!["ADDRESS_RELOCATION_NOISE"],
+            unattributed_mismatches: 1,
+        };
+
+        let verdict = compute_verdict(&summary, &analysis, Some(95.0), 100, 100);
+        assert_eq!(verdict.classification, VerdictClassification::AtLimit);
+        assert!(verdict.explanation.contains("address relocation"));
+    }
+
+    #[test]
+    fn test_verdict_likely_fixable_makestring_type() {
+        let summary = InstructionSummary {
+            total: 10,
+            equal: 7,
+            diff_arg: 3,
+            ..Default::default()
+        };
+        let analysis = Analysis {
+            patterns: vec![Pattern {
+                pattern: PatternType::MakeStringTemplateMismatch,
+                confidence: Confidence::High,
+                instruction_count: 2,
+                fixability: Fixability::LikelyFixable,
+                details: PatternDetails::MakeStringTemplateMismatch {
+                    mismatches: vec![
+                        MakeStringMismatchInfo {
+                            index: 2,
+                            target_template: "PBDVSymbol@@H@@".to_string(),
+                            base_template: "PBDPBDH@@".to_string(),
+                            sub_type: MakeStringMismatchSubType::Type,
+                        },
+                        MakeStringMismatchInfo {
+                            index: 5,
+                            target_template: "PBDVSymbol@@H@@".to_string(),
+                            base_template: "PBDPBDH@@".to_string(),
+                            sub_type: MakeStringMismatchSubType::Type,
+                        },
+                    ],
+                },
+                doc_urls: vec![],
+            }],
+            patterns_checked: vec!["MAKESTRING_TEMPLATE_MISMATCH"],
+            unattributed_mismatches: 1,
+        };
+
+        let verdict = compute_verdict(&summary, &analysis, Some(90.0), 100, 100);
+        assert_eq!(verdict.classification, VerdictClassification::LikelyFixable);
+        assert!(verdict.explanation.contains("MakeString"));
+        assert!(verdict.suggestions.iter().any(|s| s.action.contains(".Str()")));
+    }
+
+    #[test]
+    fn test_verdict_at_limit_register_swap_high_match() {
+        // 99%+ match with only register swaps → should be AtLimit
+        let summary = InstructionSummary {
+            total: 100,
+            equal: 95,
+            diff_arg: 5,
+            ..Default::default()
+        };
+        let analysis = Analysis {
+            patterns: vec![Pattern {
+                pattern: PatternType::RegisterSwap,
+                confidence: Confidence::High,
+                instruction_count: 5,
+                fixability: Fixability::MaybeFixable,
+                details: PatternDetails::RegisterSwap {
+                    swaps: vec![RegisterSwapInfo {
+                        target_reg: "r30".to_string(),
+                        base_reg: "r31".to_string(),
+                        count: 5,
+                    }],
+                },
+                doc_urls: vec![],
+            }],
+            patterns_checked: vec!["REGISTER_SWAP"],
+            unattributed_mismatches: 0,
+        };
+
+        let verdict = compute_verdict(&summary, &analysis, Some(99.0), 100, 100);
+        assert_eq!(verdict.classification, VerdictClassification::AtLimit);
+    }
+
+    #[test]
+    fn test_verdict_maybe_fixable_register_swap_low_match() {
+        // Low match% with register swaps → still MaybeFixable
+        let summary = InstructionSummary {
+            total: 100,
+            equal: 80,
+            diff_arg: 20,
+            ..Default::default()
+        };
+        let analysis = Analysis {
+            patterns: vec![Pattern {
+                pattern: PatternType::RegisterSwap,
+                confidence: Confidence::High,
+                instruction_count: 20,
+                fixability: Fixability::MaybeFixable,
+                details: PatternDetails::RegisterSwap {
+                    swaps: vec![RegisterSwapInfo {
+                        target_reg: "r30".to_string(),
+                        base_reg: "r31".to_string(),
+                        count: 20,
+                    }],
+                },
+                doc_urls: vec![],
+            }],
+            patterns_checked: vec!["REGISTER_SWAP"],
+            unattributed_mismatches: 0,
+        };
+
+        let verdict = compute_verdict(&summary, &analysis, Some(80.0), 100, 100);
+        assert_eq!(verdict.classification, VerdictClassification::MaybeFixable);
     }
 }

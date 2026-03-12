@@ -1,7 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufWriter, Read, Write},
+    path::PathBuf,
+    sync::Mutex,
     time::Instant,
 };
 
@@ -28,6 +30,98 @@ use crate::{
     cmd::{apply_config_args, diff::ObjectConfig},
     util::output::{OutputFormat, write_output},
 };
+
+/// Content-hash based cache for report units. Avoids re-diffing unchanged .obj files.
+/// Cache format: u32 entry count, then for each entry: u64 hash, u32 data_len, data bytes.
+struct ReportCache {
+    entries: HashMap<u64, Vec<u8>>,
+    path: PathBuf,
+    hits: std::sync::atomic::AtomicU32,
+    misses: std::sync::atomic::AtomicU32,
+}
+
+impl ReportCache {
+    fn load(path: PathBuf) -> Self {
+        let mut entries = HashMap::new();
+        if let Ok(data) = std::fs::read(&path) {
+            let mut pos = 0;
+            if data.len() >= 4 {
+                let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                pos = 4;
+                for _ in 0..count {
+                    if pos + 12 > data.len() {
+                        break;
+                    }
+                    let hash = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let data_len =
+                        u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap()) as usize;
+                    pos += 12;
+                    if pos + data_len > data.len() {
+                        break;
+                    }
+                    entries.insert(hash, data[pos..pos + data_len].to_vec());
+                    pos += data_len;
+                }
+            }
+        }
+        ReportCache {
+            entries,
+            path,
+            hits: std::sync::atomic::AtomicU32::new(0),
+            misses: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn get(&self, hash: u64) -> Option<ReportUnit> {
+        if let Some(data) = self.entries.get(&hash) {
+            if let Ok(unit) = ReportUnit::decode(data.as_slice()) {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(unit);
+            }
+        }
+        self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+
+    fn save(&self, new_entries: &HashMap<u64, Vec<u8>>) {
+        // Merge old and new entries, new entries override
+        let mut merged = self.entries.clone();
+        for (k, v) in new_entries {
+            merged.insert(*k, v.clone());
+        }
+        let mut buf = Vec::with_capacity(4 + merged.len() * 128);
+        buf.extend_from_slice(&(merged.len() as u32).to_le_bytes());
+        for (hash, data) in &merged {
+            buf.extend_from_slice(&hash.to_le_bytes());
+            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+        let _ = std::fs::write(&self.path, buf);
+    }
+
+    /// Hash a unit's target and base .obj file contents together.
+    fn hash_unit(object: &ObjectConfig, config_args: &[String]) -> u64 {
+        use xxhash_rust::xxh3::xxh3_64;
+        let mut combined = Vec::new();
+        if let Some(p) = &object.target_path {
+            if let Ok(data) = std::fs::read(p.as_str()) {
+                combined.extend_from_slice(&data);
+            }
+        }
+        combined.push(0xFF); // separator
+        if let Some(p) = &object.base_path {
+            if let Ok(data) = std::fs::read(p.as_str()) {
+                combined.extend_from_slice(&data);
+            }
+        }
+        // Include config args in hash so different report configs get different caches
+        for arg in config_args {
+            combined.push(0xFE);
+            combined.extend_from_slice(arg.as_bytes());
+        }
+        xxh3_64(&combined)
+    }
+}
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Generate a progress report for a project.
@@ -322,6 +416,20 @@ fn generate(args: GenerateArgs) -> Result<()> {
         diff::MappingConfig::default()
     };
 
+    // Load content-hash based cache for incremental report generation.
+    // Cache key = xxHash3 of target+base .obj file contents + config args.
+    let cache_path = args
+        .output
+        .as_ref()
+        .map(|o| {
+            let mut p = std::path::PathBuf::from(o.as_str());
+            p.set_extension("cache");
+            p
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".objdiff_report_cache"));
+    let cache = ReportCache::load(cache_path);
+    let new_cache_entries: Mutex<HashMap<u64, Vec<u8>>> = Mutex::new(HashMap::new());
+
     let start = Instant::now();
     let mut units = vec![];
     let mut existing_functions: HashSet<String> = HashSet::new();
@@ -334,12 +442,17 @@ fn generate(args: GenerateArgs) -> Result<()> {
                 project_units.get(*unit_idx).and_then(ProjectObject::options),
                 &args.config,
             )?;
-            if let Some(unit) = report_object(
+            let hash = ReportCache::hash_unit(object, &args.config);
+            if let Some(cached_unit) = cache.get(hash) {
+                units.push(cached_unit);
+            } else if let Some(unit) = report_object(
                 object,
                 &diff_config,
                 Some(&mut existing_functions),
                 Some(&mapping_config),
             )? {
+                let encoded = unit.encode_to_vec();
+                new_cache_entries.lock().unwrap().insert(hash, encoded);
                 units.push(unit);
             }
         }
@@ -347,17 +460,40 @@ fn generate(args: GenerateArgs) -> Result<()> {
         let vec = objects
             .par_iter()
             .map(|(object, unit_idx)| {
+                let hash = ReportCache::hash_unit(object, &args.config);
+                if let Some(cached_unit) = cache.get(hash) {
+                    return Ok(Some(cached_unit));
+                }
                 let diff_config = build_unit_diff_config(
                     &base_diff_config,
                     project.options.as_ref(),
                     project_units.get(*unit_idx).and_then(ProjectObject::options),
                     &args.config,
                 )?;
-                report_object(object, &diff_config, None, Some(&mapping_config))
+                let result =
+                    report_object(object, &diff_config, None, Some(&mapping_config))?;
+                if let Some(ref unit) = result {
+                    let encoded = unit.encode_to_vec();
+                    new_cache_entries.lock().unwrap().insert(hash, encoded);
+                }
+                Ok(result)
             })
             .collect::<Result<Vec<Option<ReportUnit>>>>()?;
         units = vec.into_iter().flatten().collect();
     }
+
+    let hits = cache.hits.load(std::sync::atomic::Ordering::Relaxed);
+    let misses = cache.misses.load(std::sync::atomic::Ordering::Relaxed);
+    if hits + misses > 0 {
+        info!("Report cache: {} hits, {} misses", hits, misses);
+    }
+
+    // Save updated cache
+    let new_entries = new_cache_entries.into_inner().unwrap();
+    if !new_entries.is_empty() {
+        cache.save(&new_entries);
+    }
+
     let measures = units.iter().flat_map(|u| u.measures.into_iter()).collect();
     let mut categories = Vec::new();
     for category in project.progress_categories() {
@@ -455,14 +591,15 @@ fn report_object(
         if section.kind == SectionKind::Unknown {
             continue;
         }
-        let section_match_percent = section_diff.match_percent.unwrap_or_else(|| {
-            // Support cases where we don't have a target object,
-            // assume complete means 100% match
-            if object.complete.unwrap_or(false) { 100.0 } else { 0.0 }
-        });
+        let section_match_percent = match section_diff.match_percent {
+            Some(pct) => pct,
+            None if base.is_none() && object.complete.unwrap_or(false) => 100.0,
+            None => 0.0,
+        };
         sections.push(ReportItem {
             name: section.name.clone(),
             fuzzy_match_percent: section_match_percent,
+            match_percent_normalized: None,
             size: section.size,
             metadata: Some(ReportItemMetadata {
                 demangled_name: None,
@@ -498,12 +635,22 @@ fn report_object(
             {
                 continue;
             }
-            let match_percent = symbol_diff.match_percent.unwrap_or_else(|| {
-                // Support cases where we don't have a target object,
-                // assume complete means 100% match
-                if object.complete.unwrap_or(false) { 100.0 } else { 0.0 }
-            });
-            measures.fuzzy_match_percent += match_percent * symbol.size as f32;
+            let match_percent = match symbol_diff.match_percent {
+                Some(pct) => pct,
+                None if base.is_none() && object.complete.unwrap_or(false) => {
+                    // No target object but unit is marked complete: assume 100% match
+                    100.0
+                }
+                None => {
+                    // Symbol exists in target but has no source implementation (0% match).
+                    0.0
+                }
+            };
+            let match_percent_normalized = match symbol_diff.match_percent_normalized {
+                Some(pct) => pct,
+                _ => match_percent,
+            };
+            measures.fuzzy_match_percent += match_percent_normalized * symbol.size as f32;
             measures.total_code += symbol.size;
             if match_percent == 100.0 {
                 measures.matched_code += symbol.size;
@@ -512,13 +659,14 @@ fn report_object(
                 name: symbol.name.clone(),
                 size: symbol.size,
                 fuzzy_match_percent: match_percent,
+                match_percent_normalized: Some(match_percent_normalized),
                 metadata: Some(ReportItemMetadata {
                     demangled_name: symbol.demangled_name.clone(),
                     virtual_address: symbol.virtual_address,
                 }),
                 address: symbol.address.checked_sub(section.address),
             });
-            if match_percent == 100.0 {
+            if match_percent_normalized == 100.0 {
                 measures.matched_functions += 1;
             }
             measures.total_functions += 1;
@@ -1312,7 +1460,6 @@ fn write_function_output(
 // =============================================================================
 
 use crate::cmd::analysis::VerdictClassification;
-use std::collections::HashMap;
 
 /// Output structure for the analyze command.
 #[derive(Serialize)]
@@ -1558,6 +1705,7 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
                     results.needs_investigation.push(analyzed)
                 }
                 VerdictClassification::Complete => {} // Should not happen (filtered out)
+                VerdictClassification::Stub => {} // Unimplemented, skip
             }
         }
     }

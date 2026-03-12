@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     fs::File,
-    io::{BufWriter, Write, stdout},
+    io::{BufRead, BufWriter, Write, stdout},
     mem,
     process::Command,
     sync::{
@@ -373,9 +374,16 @@ pub struct Args {
     #[argp(switch)]
     /// Concise output: match%, compact summary, pattern one-liners, verdict headline
     concise: bool,
+    #[argp(switch)]
+    /// Batch mode: read symbols from stdin (one per line), group by unit, output JSONL
+    batch: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
+    if args.batch {
+        return run_batch(args);
+    }
+
     let (target_path, base_path, project_config, unit_options, project_dir) = match (
         &args.target,
         &args.base,
@@ -752,23 +760,34 @@ fn run_json(
 
     let symbol_diff = &obj_diff.symbols[symbol_idx];
 
-    // Get sizes from both objects (use demangled lookup)
-    let target_size = target_obj
-        .as_ref()
-        .and_then(|o| o.symbol_by_name_or_demangled(symbol_name))
-        .map(|idx| target_obj.as_ref().unwrap().symbols[idx].size)
-        .unwrap_or(0);
-    let base_size = base_obj
-        .as_ref()
-        .and_then(|o| o.symbol_by_name_or_demangled(symbol_name))
-        .map(|idx| base_obj.as_ref().unwrap().symbols[idx].size)
-        .unwrap_or(0);
-
-    // Get symbol indices for both sides (use demangled lookup)
-    let target_symbol_idx =
-        target_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
-    let base_symbol_idx =
-        base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+    // Get symbol indices and sizes for both sides.
+    // Use the diff result's matched symbol for the "other" side — this is more
+    // reliable than name lookup for anonymous namespace functions where the
+    // hash differs between builds (e.g. ?A0xaf4cfd2b@@ vs ?A0x12345678@@).
+    let (target_symbol_idx, base_symbol_idx, target_size, base_size) =
+        if target_obj.is_some() {
+            // Symbol was found in target; use diff match for base
+            let target_size = target_obj
+                .as_ref()
+                .map(|o| o.symbols[symbol_idx].size)
+                .unwrap_or(0);
+            let base_symbol_idx = symbol_diff.target_symbol;
+            let base_size = base_symbol_idx
+                .and_then(|idx| base_obj.as_ref().map(|o| o.symbols[idx].size))
+                .unwrap_or(0);
+            (Some(symbol_idx), base_symbol_idx, target_size, base_size)
+        } else {
+            // Symbol was found in base; use diff match for target
+            let base_size = base_obj
+                .as_ref()
+                .map(|o| o.symbols[symbol_idx].size)
+                .unwrap_or(0);
+            let target_symbol_idx = symbol_diff.target_symbol;
+            let target_size = target_symbol_idx
+                .and_then(|idx| target_obj.as_ref().map(|o| o.symbols[idx].size))
+                .unwrap_or(0);
+            (target_symbol_idx, Some(symbol_idx), target_size, base_size)
+        };
 
     // Get both sides of the diff
     let left_diff = diff_result.left.as_ref();
@@ -814,7 +833,7 @@ fn run_json(
     let verdict = if wants_verdict {
         match (&instruction_summary, &analysis) {
             (Some(summary), Some(analysis)) => {
-                Some(super::analysis::compute_verdict(summary, analysis, symbol_diff.match_percent))
+                Some(super::analysis::compute_verdict(summary, analysis, symbol_diff.match_percent, base_size, target_size))
             }
             _ => None,
         }
@@ -954,6 +973,514 @@ fn run_json(
     Ok(())
 }
 
+fn run_batch(args: Args) -> Result<()> {
+    use objdiff_core::diff::{DiffSide, diff_objs, diff_objs_filtered};
+
+    // Load project config
+    let project_dir = match &args.project {
+        Some(project) => project.clone(),
+        _ => check_path_buf(
+            std::env::current_dir().context("Failed to get the current directory")?,
+        )
+        .context("Current directory is not valid UTF-8")?,
+    };
+    let Some((project_config, project_config_info)) =
+        objdiff_core::config::try_project_config(project_dir.as_ref())
+    else {
+        bail!("Project config not found in {}", &project_dir)
+    };
+    let project_config = project_config.with_context(|| {
+        format!("Reading project config {}", project_config_info.path.display())
+    })?;
+
+    let target_obj_dir = project_config
+        .target_dir
+        .as_ref()
+        .map(|p| project_dir.join(p.with_platform_encoding()));
+    let base_obj_dir = project_config
+        .base_dir
+        .as_ref()
+        .map(|p| project_dir.join(p.with_platform_encoding()));
+    let units = project_config.units.as_deref().unwrap_or_default();
+
+    // Build object configs indexed by unit name
+    let object_configs: HashMap<String, (ObjectConfig, usize)> = units
+        .iter()
+        .enumerate()
+        .map(|(idx, o)| {
+            let config = ObjectConfig::new(
+                o,
+                &project_dir,
+                target_obj_dir.as_deref(),
+                base_obj_dir.as_deref(),
+            );
+            (config.name.clone(), (config, idx))
+        })
+        .collect();
+
+    // Build a lookup config for demangling during symbol resolution
+    let mut lookup_config = DiffObjConfig {
+        function_reloc_diffs: diff::FunctionRelocDiffs::DataValue,
+        ..Default::default()
+    };
+    if let Some(options) = project_config.options.as_ref() {
+        let _ = apply_project_options(&mut lookup_config, options);
+    }
+    let _ = apply_config_args(&mut lookup_config, &args.config);
+
+    // Load map file for ICF equivalences
+    let mut mapping_config = MappingConfig::default();
+    let map_file_path = args.map_file.clone().or_else(|| {
+        project_config.map_file.as_ref().map(|p| {
+            project_dir.join(p.with_platform_encoding())
+        })
+    });
+    if let Some(map_path) = &map_file_path {
+        let file = std::fs::File::open(map_path.as_str())
+            .with_context(|| format!("Failed to open map file: {}", map_path))?;
+        let reader = std::io::BufReader::new(file);
+        mapping_config.symbol_equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
+        eprintln!(
+            "Loaded {} ICF equivalence entries from {}",
+            mapping_config.symbol_equivalences.len(),
+            map_path
+        );
+    }
+
+    // Build symbol indexes: open each .obj file ONCE, extract all text symbols.
+    // This replaces the O(symbols × units) scan with O(units + symbols) lookups.
+    let index_start = std::time::Instant::now();
+
+    // Target index: mangled name → unit
+    let mut target_mangled_index: HashMap<String, String> = HashMap::new();
+    for (unit_name, (obj_config, _)) in &object_configs {
+        if let Some(target_path) = obj_config.target_path.as_deref() {
+            if let Ok(syms) = obj::read::list_function_symbols(target_path.as_ref()) {
+                for sym in syms {
+                    target_mangled_index
+                        .entry(sym)
+                        .or_insert_with(|| unit_name.clone());
+                }
+            }
+        }
+    }
+
+    // Base index for cross-unit COMDAT fallback
+    let mut base_symbol_index: HashMap<String, String> = HashMap::new();
+    for (unit_name, (obj_config, _)) in &object_configs {
+        if let Some(base_path) = obj_config.base_path.as_deref() {
+            if let Ok(syms) = obj::read::list_function_symbols(base_path.as_ref()) {
+                for sym in syms {
+                    base_symbol_index
+                        .entry(sym)
+                        .or_insert_with(|| unit_name.clone());
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "Symbol index built in {:.1}s: {} target mangled, {} base",
+        index_start.elapsed().as_secs_f64(),
+        target_mangled_index.len(),
+        base_symbol_index.len(),
+    );
+
+    // Read symbols from stdin
+    let stdin = std::io::stdin();
+    let symbols: Vec<String> = stdin
+        .lock()
+        .lines()
+        .filter_map(|line| {
+            let line = line.ok()?;
+            let trimmed = line.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        })
+        .collect();
+
+    if symbols.is_empty() {
+        bail!("No symbols provided on stdin");
+    }
+    eprintln!("Batch mode: {} symbols to process", symbols.len());
+
+    // Resolve each symbol to its unit via O(1) HashMap lookups
+    let mut by_unit: HashMap<String, Vec<String>> = HashMap::new();
+    let mut not_found: Vec<String> = Vec::new();
+
+    for symbol in &symbols {
+        if let Some(unit) = target_mangled_index.get(symbol.as_str()) {
+            by_unit.entry(unit.clone()).or_default().push(symbol.clone());
+        } else {
+            // Demangled fallback: scan target .obj files for demangled match
+            let mut found = false;
+            for (unit_name, (obj_config, _)) in &object_configs {
+                if let Some(target_path) = obj_config.target_path.as_deref() {
+                    let matches = obj::read::match_symbol_by_query(
+                        target_path.as_ref(), symbol, &lookup_config,
+                    ).unwrap_or_default();
+                    if matches.len() == 1 {
+                        by_unit.entry(unit_name.clone()).or_default().push(symbol.clone());
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                not_found.push(symbol.clone());
+            }
+        }
+    }
+
+    eprintln!(
+        "Resolved: {} symbols across {} units ({} not found)",
+        symbols.len() - not_found.len(),
+        by_unit.len(),
+        not_found.len(),
+    );
+
+    // Output not-found symbols as error entries
+    let mut not_found_lines: Vec<String> = Vec::new();
+    for symbol in &not_found {
+        let output = serde_json::json!({
+            "symbol": symbol,
+            "error": "not_found",
+        });
+        not_found_lines.push(serde_json::to_string(&output)?);
+    }
+
+    // Process units in parallel with rayon
+    use rayon::prelude::*;
+    use std::sync::atomic::AtomicUsize;
+
+    let units_total = by_unit.len();
+    let units_processed = AtomicUsize::new(0);
+
+    let unit_results: Vec<Result<Vec<String>>> = by_unit
+        .par_iter()
+        .map(|(unit_name, unit_symbols)| -> Result<Vec<String>> {
+            let mut lines: Vec<String> = Vec::new();
+
+            let Some((object_config, unit_idx)) = object_configs.get(unit_name) else {
+                for symbol in unit_symbols {
+                    let output = serde_json::json!({
+                        "symbol": symbol,
+                        "error": "unit_not_found",
+                    });
+                    lines.push(serde_json::to_string(&output)?);
+                }
+                return Ok(lines);
+            };
+
+            // Build diff config with unit options
+            let unit_options = units.get(*unit_idx).and_then(|u| u.options());
+            let diff_config = build_unit_diff_config(
+                &lookup_config,
+                project_config.options.as_ref(),
+                unit_options,
+                &args.config,
+            )?;
+
+            // Load objects ONCE per unit
+            let target_obj = object_config
+                .target_path
+                .as_ref()
+                .map(|p| obj::read::read(p.as_ref(), &diff_config, DiffSide::Target))
+                .transpose()?;
+            let base_obj = object_config
+                .base_path
+                .as_ref()
+                .map(|p| obj::read::read(p.as_ref(), &diff_config, DiffSide::Base))
+                .transpose()?;
+
+            // Build symbol filter: only diff the symbols we actually need
+            let mut symbol_filter = std::collections::BTreeSet::new();
+            for symbol_name in unit_symbols {
+                if let Some(idx) = target_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name)) {
+                    symbol_filter.insert(idx);
+                } else if let Some(idx) = base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name)) {
+                    symbol_filter.insert(idx);
+                }
+            }
+
+            // Diff only the filtered symbols for this unit
+            let diff_result = diff::diff_objs_filtered(
+                target_obj.as_ref(),
+                base_obj.as_ref(),
+                None,
+                &diff_config,
+                &mapping_config,
+                Some(&symbol_filter),
+            )?;
+
+            // Compute alt diff for normalized/raw match percentages.
+            // Skip when functionRelocDiffs=None since normalized == primary in that case.
+            let needs_alt = diff_config.function_reloc_diffs != diff::FunctionRelocDiffs::None;
+            let alt_diff_result = if needs_alt {
+                let alt_config = {
+                    let mut c = diff_config.clone();
+                    match diff_config.function_reloc_diffs {
+                        diff::FunctionRelocDiffs::NameAddress => {
+                            c.function_reloc_diffs = diff::FunctionRelocDiffs::DataValue;
+                        }
+                        _ => {
+                            c.function_reloc_diffs = diff::FunctionRelocDiffs::NameAddress;
+                        }
+                    }
+                    c
+                };
+                Some(diff::diff_objs_filtered(
+                    target_obj.as_ref(),
+                    base_obj.as_ref(),
+                    None,
+                    &alt_config,
+                    &mapping_config,
+                    Some(&symbol_filter),
+                )?)
+            } else {
+                None
+            };
+
+            // Process each symbol from this unit
+            for symbol_name in unit_symbols {
+                let name_target_idx =
+                    target_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+                let name_base_idx =
+                    base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+
+                let (symbol_idx, symbol, _obj, obj_diff) =
+                    if let Some(idx) = name_target_idx {
+                        let obj = target_obj.as_ref().unwrap();
+                        let diff = diff_result.left.as_ref().unwrap();
+                        (idx, &obj.symbols[idx], obj, diff)
+                    } else if let Some(idx) = name_base_idx {
+                        let obj = base_obj.as_ref().unwrap();
+                        let diff = diff_result.right.as_ref().unwrap();
+                        (idx, &obj.symbols[idx], obj, diff)
+                    } else {
+                        let output = serde_json::json!({
+                            "symbol": symbol_name,
+                            "error": "symbol_not_in_objects",
+                        });
+                        lines.push(serde_json::to_string(&output)?);
+                        continue;
+                    };
+
+                let symbol_diff = &obj_diff.symbols[symbol_idx];
+
+                let (target_symbol_idx, base_symbol_idx, target_size, base_size) =
+                    if name_target_idx.is_some() {
+                        let ts = target_obj.as_ref()
+                            .map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+                        let bsi = symbol_diff.target_symbol;
+                        let bs = bsi
+                            .and_then(|idx| base_obj.as_ref().map(|o| o.symbols[idx].size))
+                            .unwrap_or(0);
+                        (Some(symbol_idx), bsi, ts, bs)
+                    } else {
+                        let bs = base_obj.as_ref()
+                            .map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+                        let tsi = symbol_diff.target_symbol;
+                        let ts = tsi
+                            .and_then(|idx| target_obj.as_ref().map(|o| o.symbols[idx].size))
+                            .unwrap_or(0);
+                        (tsi, Some(symbol_idx), ts, bs)
+                    };
+
+                // Cross-unit COMDAT fallback
+                if base_size == 0 && name_target_idx.is_some() {
+                    let fallback = base_symbol_index.get(symbol_name.as_str());
+                    if let Some(fallback_unit) = fallback {
+                        if fallback_unit != unit_name {
+                            if let Some((fallback_config, _)) = object_configs.get(fallback_unit) {
+                                if let Some(fallback_base_path) = fallback_config.base_path.as_deref() {
+                                    if let Ok(fb_obj) = obj::read::read(fallback_base_path.as_ref(), &diff_config, DiffSide::Base) {
+                                        let fb_diff = diff_objs(
+                                            target_obj.as_ref(), Some(&fb_obj),
+                                            None, &diff_config, &mapping_config,
+                                        )?;
+                                        let fb_sd = &fb_diff.left.as_ref().unwrap().symbols[symbol_idx];
+                                        let fb_bsi = fb_sd.target_symbol;
+                                        let fb_bs = fb_bsi.map(|i| fb_obj.symbols[i].size).unwrap_or(0);
+
+                                        if fb_bs > 0 {
+                                            let fb_alt_cfg = {
+                                                let mut c = diff_config.clone();
+                                                match c.function_reloc_diffs {
+                                                    diff::FunctionRelocDiffs::NameAddress =>
+                                                        c.function_reloc_diffs = diff::FunctionRelocDiffs::DataValue,
+                                                    _ =>
+                                                        c.function_reloc_diffs = diff::FunctionRelocDiffs::NameAddress,
+                                                }
+                                                c
+                                            };
+                                            let fb_alt = diff_objs(
+                                                target_obj.as_ref(), Some(&fb_obj),
+                                                None, &fb_alt_cfg, &mapping_config,
+                                            )?;
+                                            let fb_instrs = build_instruction_diffs(
+                                                target_obj.as_ref(), Some(&fb_obj),
+                                                fb_diff.left.as_ref(), fb_diff.right.as_ref(),
+                                                Some(symbol_idx), fb_bsi, &diff_config,
+                                            )?;
+                                            let fb_summary = InstructionSummary::from_instructions(&fb_instrs);
+                                            let fb_analysis = super::analysis::analyze_instructions(&fb_instrs);
+                                            let fb_verdict = super::analysis::compute_verdict(
+                                                &fb_summary, &fb_analysis, fb_sd.match_percent, fb_bs, target_size,
+                                            );
+                                            let (fb_norm, fb_raw) = match diff_config.function_reloc_diffs {
+                                                diff::FunctionRelocDiffs::NameAddress => (
+                                                    fb_alt.left.as_ref().and_then(|d| d.symbols.get(symbol_idx)).and_then(|s| s.match_percent),
+                                                    fb_sd.match_percent,
+                                                ),
+                                                _ => (
+                                                    fb_sd.match_percent,
+                                                    fb_alt.left.as_ref().and_then(|d| d.symbols.get(symbol_idx)).and_then(|s| s.match_percent),
+                                                ),
+                                            };
+                                            let output = DiffOutput {
+                                                symbol: symbol_name.clone(),
+                                                demangled: symbol.demangled_name.clone(),
+                                                unit: Some(unit_name.clone()),
+                                                target_size,
+                                                base_size: fb_bs,
+                                                fuzzy_match_percent: fb_norm,
+                                                normalized_match_percent: fb_norm,
+                                                raw_match_percent: fb_raw,
+                                                diff_score: fb_sd.diff_score.map(|(s, m)| DiffScoreOutput { score: s, max_score: m }),
+                                                build_status: None,
+                                                instruction_summary: Some(fb_summary),
+                                                analysis: Some(fb_analysis),
+                                                verdict: Some(fb_verdict),
+                                                call_diff: None,
+                                                insert_delete_clusters: None,
+                                                diff_regions: None,
+                                                instructions: None,
+                                            };
+                                            lines.push(serde_json::to_string(&output)?);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Normal path
+                let instructions = build_instruction_diffs(
+                    target_obj.as_ref(),
+                    base_obj.as_ref(),
+                    diff_result.left.as_ref(),
+                    diff_result.right.as_ref(),
+                    target_symbol_idx,
+                    base_symbol_idx,
+                    &diff_config,
+                )?;
+
+                let instruction_summary = InstructionSummary::from_instructions(&instructions);
+                let analysis = super::analysis::analyze_instructions(&instructions);
+                let verdict = super::analysis::compute_verdict(
+                    &instruction_summary,
+                    &analysis,
+                    symbol_diff.match_percent,
+                    base_size,
+                    target_size,
+                );
+
+                let primary_match_percent = symbol_diff.match_percent;
+                let (normalized_match_percent, raw_match_percent) = if let Some(ref alt_result) = alt_diff_result {
+                    let alt_match = if target_obj.is_some() {
+                        alt_result
+                            .left
+                            .as_ref()
+                            .and_then(|d| d.symbols.get(symbol_idx))
+                            .and_then(|s| s.match_percent)
+                    } else {
+                        alt_result
+                            .right
+                            .as_ref()
+                            .and_then(|d| d.symbols.get(symbol_idx))
+                            .and_then(|s| s.match_percent)
+                    };
+                    match diff_config.function_reloc_diffs {
+                        diff::FunctionRelocDiffs::NameAddress => (alt_match, primary_match_percent),
+                        _ => (primary_match_percent, alt_match),
+                    }
+                } else {
+                    // No alt diff (reloc diffs = None): normalized == primary
+                    (primary_match_percent, primary_match_percent)
+                };
+
+                let output = DiffOutput {
+                    symbol: symbol_name.clone(),
+                    demangled: symbol.demangled_name.clone(),
+                    unit: Some(unit_name.clone()),
+                    target_size,
+                    base_size,
+                    fuzzy_match_percent: normalized_match_percent,
+                    normalized_match_percent,
+                    raw_match_percent,
+                    diff_score: symbol_diff
+                        .diff_score
+                        .map(|(score, max)| DiffScoreOutput { score, max_score: max }),
+                    build_status: None,
+                    instruction_summary: Some(instruction_summary),
+                    analysis: Some(analysis),
+                    verdict: Some(verdict),
+                    call_diff: None,
+                    insert_delete_clusters: None,
+                    diff_regions: None,
+                    instructions: None,
+                };
+
+                lines.push(serde_json::to_string(&output)?);
+            }
+
+            let done = units_processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 100 == 0 {
+                eprintln!("  [{}/{}] units processed", done, units_total);
+            }
+
+            Ok(lines)
+        })
+        .collect();
+
+    // Write all results to stdout
+    let mut stdout = stdout();
+    for line in &not_found_lines {
+        writeln!(stdout, "{}", line)?;
+    }
+    for unit_result in unit_results {
+        for line in unit_result? {
+            writeln!(stdout, "{}", line)?;
+        }
+    }
+
+    eprintln!(
+        "Batch complete: {} symbols, {} units",
+        symbols.len() - not_found.len(),
+        by_unit.len(),
+    );
+    Ok(())
+}
+
+fn build_unit_diff_config(
+    base: &DiffObjConfig,
+    project_options: Option<&ProjectOptions>,
+    unit_options: Option<&ProjectOptions>,
+    cli_args: &[String],
+) -> Result<DiffObjConfig> {
+    let mut diff_config = base.clone();
+    if let Some(options) = project_options {
+        apply_project_options(&mut diff_config, options)?;
+    }
+    if let Some(options) = unit_options {
+        apply_project_options(&mut diff_config, options)?;
+    }
+    apply_config_args(&mut diff_config, cli_args)?;
+    Ok(diff_config)
+}
+
 fn build_instruction_diffs(
     target_obj: Option<&Object>,
     base_obj: Option<&Object>,
@@ -1010,11 +1537,31 @@ fn build_instruction_diffs(
                 None
             };
 
-        // Use the diff kind from whichever side is available
-        let kind = left_row
-            .map(|r| r.kind)
-            .or_else(|| right_row.map(|r| r.kind))
-            .unwrap_or(InstructionDiffKind::None);
+        // Use the diff kind from whichever side is available.
+        // When only one side has a row (one-sided diff), mark as insert/delete
+        // rather than falling through to None (which maps to "equal").
+        let kind = match (left_row, right_row) {
+            (Some(l), Some(_)) => l.kind,
+            (Some(l), None) => {
+                // Target-only instruction: use the diff kind if the core assigned one,
+                // otherwise mark as insert (target has code, base doesn't)
+                if l.kind == InstructionDiffKind::None {
+                    InstructionDiffKind::Insert
+                } else {
+                    l.kind
+                }
+            }
+            (None, Some(r)) => {
+                // Base-only instruction: use the diff kind if the core assigned one,
+                // otherwise mark as delete (base has code, target doesn't)
+                if r.kind == InstructionDiffKind::None {
+                    InstructionDiffKind::Delete
+                } else {
+                    r.kind
+                }
+            }
+            (None, None) => InstructionDiffKind::None,
+        };
 
         // Compute diff breakdown if this is an argument mismatch
         let diff_breakdown = if kind == InstructionDiffKind::ArgMismatch {
@@ -1230,15 +1777,15 @@ pub fn analyze_symbol(
     diff_config: &DiffObjConfig,
 ) -> Result<Option<SymbolAnalysisResult>> {
     // Find symbol index in target, falling back to base
-    let target_symbol_idx = target_obj.and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
-    let base_symbol_idx = base_obj.and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+    let name_target_idx = target_obj.and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
+    let name_base_idx = base_obj.and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
 
     // Get the symbol index from whichever side has it
-    let (symbol_idx, obj, obj_diff) = if let Some(idx) = target_symbol_idx {
+    let (symbol_idx, obj, obj_diff) = if let Some(idx) = name_target_idx {
         let obj = target_obj.unwrap();
         let diff = diff_result.left.as_ref().ok_or_else(|| anyhow!("Missing left diff result"))?;
         (idx, obj, diff)
-    } else if let Some(idx) = base_symbol_idx {
+    } else if let Some(idx) = name_base_idx {
         let obj = base_obj.unwrap();
         let diff =
             diff_result.right.as_ref().ok_or_else(|| anyhow!("Missing right diff result"))?;
@@ -1250,6 +1797,24 @@ pub fn analyze_symbol(
 
     let symbol = &obj.symbols[symbol_idx];
     let symbol_diff = &obj_diff.symbols[symbol_idx];
+
+    // Use diff result's matched symbol for the "other" side
+    let (target_symbol_idx, base_symbol_idx, target_size, base_size) =
+        if name_target_idx.is_some() {
+            let ts = target_obj.map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+            let bsi = symbol_diff.target_symbol;
+            let bs = bsi
+                .and_then(|idx| base_obj.map(|o| o.symbols[idx].size))
+                .unwrap_or(0);
+            (Some(symbol_idx), bsi, ts, bs)
+        } else {
+            let bs = base_obj.map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+            let tsi = symbol_diff.target_symbol;
+            let ts = tsi
+                .and_then(|idx| target_obj.map(|o| o.symbols[idx].size))
+                .unwrap_or(0);
+            (tsi, Some(symbol_idx), ts, bs)
+        };
 
     // Get both sides of the diff
     let left_diff = diff_result.left.as_ref();
@@ -1273,6 +1838,8 @@ pub fn analyze_symbol(
         &instruction_summary,
         &analysis,
         symbol_diff.match_percent,
+        base_size,
+        target_size,
     );
 
     Ok(Some(SymbolAnalysisResult {

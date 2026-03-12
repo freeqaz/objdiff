@@ -97,6 +97,93 @@ pub fn diff_code(
 
     let left_section_idx = left_symbol.section.unwrap();
     let right_section_idx = right_symbol.section.unwrap();
+
+    // Fast path: if raw bytes are identical, check if relocations also match.
+    // This avoids the expensive scan_instructions + Patience/Myers diff pipeline
+    // for the ~90% of functions that are already 100% matches.
+    if left_data == right_data {
+        let left_relocs: Vec<_> = left_section
+            .relocations
+            .iter()
+            .filter(|r| {
+                r.address >= left_symbol.address
+                    && r.address < left_symbol.address + left_symbol.size
+            })
+            .collect();
+        let right_relocs: Vec<_> = right_section
+            .relocations
+            .iter()
+            .filter(|r| {
+                r.address >= right_symbol.address
+                    && r.address < right_symbol.address + right_symbol.size
+            })
+            .collect();
+
+        let relocs_match = left_relocs.len() == right_relocs.len()
+            && left_relocs.iter().zip(right_relocs.iter()).all(|(l, r)| {
+                l.flags == r.flags
+                    && (l.address - left_symbol.address) == (r.address - right_symbol.address)
+                    && l.addend == r.addend
+                    && left_obj.symbols[l.target_symbol].name
+                        == right_obj.symbols[r.target_symbol].name
+            });
+
+        if relocs_match {
+            // Perfect match — build minimal instruction rows without diffing
+            let left_ops = left_obj.arch.scan_instructions(
+                ResolvedSymbol {
+                    obj: left_obj,
+                    symbol_index: left_symbol_idx,
+                    symbol: left_symbol,
+                    section_index: left_section_idx,
+                    section: left_section,
+                    data: left_data,
+                },
+                diff_config,
+            )?;
+            let right_ops = right_obj.arch.scan_instructions(
+                ResolvedSymbol {
+                    obj: right_obj,
+                    symbol_index: right_symbol_idx,
+                    symbol: right_symbol,
+                    section_index: right_section_idx,
+                    section: right_section,
+                    data: right_data,
+                },
+                diff_config,
+            )?;
+            let num_ops = left_ops.len();
+            let mut left_rows: Vec<InstructionDiffRow> = left_ops
+                .iter()
+                .map(|i| InstructionDiffRow { ins_ref: Some(*i), ..Default::default() })
+                .collect();
+            let mut right_rows: Vec<InstructionDiffRow> = right_ops
+                .iter()
+                .map(|i| InstructionDiffRow { ins_ref: Some(*i), ..Default::default() })
+                .collect();
+            resolve_branches(&left_ops, &mut left_rows);
+            resolve_branches(&right_ops, &mut right_rows);
+
+            let max_score = num_ops as u64 * PENALTY_INSERT_DELETE;
+            return Ok((
+                SymbolDiff {
+                    target_symbol: Some(right_symbol_idx),
+                    match_percent: Some(100.0),
+                    diff_score: Some((0, max_score)),
+                    instruction_rows: left_rows,
+                    ..Default::default()
+                },
+                SymbolDiff {
+                    target_symbol: Some(left_symbol_idx),
+                    match_percent: Some(100.0),
+                    diff_score: Some((0, max_score)),
+                    instruction_rows: right_rows,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+
     let left_ops = left_obj.arch.scan_instructions(
         ResolvedSymbol {
             obj: left_obj,
@@ -148,15 +235,25 @@ pub fn diff_code(
     let max_score = left_ops.len() as u64 * PENALTY_INSERT_DELETE;
     let diff_score = diff_state.diff_score.min(max_score);
     let match_percent = if max_score == 0 {
-        100.0
+        0.0
     } else {
         ((1.0 - (diff_score as f64 / max_score as f64)) * 100.0) as f32
+    };
+    // Normalized match percent: excludes arg-only penalties (register swaps,
+    // offset swaps) that don't represent real structural mismatches.
+    let normalized_diff_score =
+        diff_score.saturating_sub(diff_state.arg_diff_score).min(max_score);
+    let match_percent_normalized = if max_score == 0 {
+        0.0
+    } else {
+        ((1.0 - (normalized_diff_score as f64 / max_score as f64)) * 100.0) as f32
     };
 
     Ok((
         SymbolDiff {
             target_symbol: Some(right_symbol_idx),
             match_percent: Some(match_percent),
+            match_percent_normalized: Some(match_percent_normalized),
             diff_score: Some((diff_score, max_score)),
             instruction_rows: left_rows,
             ..Default::default()
@@ -164,6 +261,7 @@ pub fn diff_code(
         SymbolDiff {
             target_symbol: Some(left_symbol_idx),
             match_percent: Some(match_percent),
+            match_percent_normalized: Some(match_percent_normalized),
             diff_score: Some((diff_score, max_score)),
             instruction_rows: right_rows,
             ..Default::default()
@@ -175,6 +273,20 @@ fn diff_instructions(
     left_insts: &[InstructionRef],
     right_insts: &[InstructionRef],
 ) -> Result<(Vec<InstructionDiffRow>, Vec<InstructionDiffRow>)> {
+    // Fast path: if same length, pair instructions 1:1 without running the diff algorithm.
+    // This is valid because same-length sequences have no insertions/deletions, and
+    // instruction order is preserved in decomp output, so 1:1 alignment is optimal.
+    if left_insts.len() == right_insts.len() {
+        let left_diff = left_insts
+            .iter()
+            .map(|i| InstructionDiffRow { ins_ref: Some(*i), ..Default::default() })
+            .collect();
+        let right_diff = right_insts
+            .iter()
+            .map(|i| InstructionDiffRow { ins_ref: Some(*i), ..Default::default() })
+            .collect();
+        return Ok((left_diff, right_diff));
+    }
     let left_ops = left_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
     let right_ops = right_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
     let ops = similar::capture_diff_slices(similar::Algorithm::Patience, &left_ops, &right_ops);
@@ -302,6 +414,56 @@ pub(crate) fn section_name_eq(
     })
 }
 
+/// Normalize a mangled symbol by stripping array dimension sizes.
+/// Template instantiations differing only in array sizes produce identical code
+/// (arrays decay to pointers), making them ICF-equivalent.
+///
+/// Handles both template array args (`$$BY0<size>`) and function parameter
+/// arrays (`AAY0<size>`, etc.). `Y<digit>` always indicates an array type
+/// (`Y0`=1D, `Y1`=2D, etc.), distinct from calling convention (`YA`, `YE`)
+/// which uses letters.
+fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
+    if !name.starts_with("??$") {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut had_array = false;
+    while i < bytes.len() {
+        if bytes[i] == b'Y'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] >= b'0'
+            && bytes[i + 1] <= b'9'
+        {
+            let dims = (bytes[i + 1] - b'0') as usize + 1;
+            result.push(b'Y');
+            result.push(bytes[i + 1]);
+            i += 2;
+            had_array = true;
+            // Skip encoded size for each dimension
+            for _ in 0..dims {
+                if i < bytes.len() && bytes[i] >= b'0' && bytes[i] <= b'9' {
+                    // Single digit encoding (values 1-10)
+                    i += 1;
+                } else {
+                    // Multi-char hex encoding (A-P)+ terminated by @
+                    while i < bytes.len() && bytes[i] >= b'A' && bytes[i] <= b'P' {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == b'@' {
+                        i += 1;
+                    }
+                }
+            }
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+    if had_array { String::from_utf8(result).ok() } else { None }
+}
+
 fn reloc_eq(
     left_obj: &Object,
     right_obj: &Object,
@@ -340,6 +502,12 @@ fn reloc_eq(
         }
         #[cfg(not(feature = "std"))]
         false
+    } || {
+        // Template array-size equivalence: instantiations differing only in
+        // array sizes produce identical code (arrays decay to pointers).
+        normalize_mangled_array_sizes(&left_reloc.symbol.name)
+            .zip(normalize_mangled_array_sizes(&right_reloc.symbol.name))
+            .is_some_and(|(l, r)| l == r)
     };
     let symbol_name_addend_matches =
         names_match && left_reloc.relocation.addend == right_reloc.relocation.addend;
@@ -412,6 +580,10 @@ fn arg_eq(
 #[derive(Default)]
 struct InstructionDiffState {
     diff_score: u64,
+    /// Diff score from argument-only mismatches (same opcode, different args).
+    /// Subtracting this from diff_score gives the "normalized" score that
+    /// ignores register swaps, offset swaps, and other arg-level noise.
+    arg_diff_score: u64,
     left_arg_idx: u32,
     right_arg_idx: u32,
     left_args_idx: BTreeMap<String, u32>,
@@ -514,7 +686,7 @@ fn diff_instruction(
                 result.left_args_diff.push(InstructionArgDiffIndex::NONE);
                 result.right_args_diff.push(InstructionArgDiffIndex::NONE);
             } else {
-                state.diff_score += if let InstructionArg::Value(
+                let penalty = if let InstructionArg::Value(
                     InstructionArgValue::Signed(_) | InstructionArgValue::Unsigned(_),
                 ) = a
                 {
@@ -522,6 +694,8 @@ fn diff_instruction(
                 } else {
                     PENALTY_REG_DIFF
                 };
+                state.diff_score += penalty;
+                state.arg_diff_score += penalty;
                 if result.kind == InstructionDiffKind::None {
                     result.kind = InstructionDiffKind::ArgMismatch;
                 }
@@ -561,4 +735,50 @@ fn diff_instruction(
     }
 
     Ok(InstructionDiffResult::new(InstructionDiffKind::None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_makestring_equivalence() {
+        let a = "??$MakeString@$$BY07$$CBDH$$BY0CD@$$CBD@@YAPBDPBDAAY07$$CBDABHAAY0CD@$$CBD@Z";
+        let b = "??$MakeString@$$BY0N@$$CBDH$$BY0CG@$$CBD@@YAPBDPBDAAY0N@$$CBDABHAAY0CG@$$CBD@Z";
+        let na = normalize_mangled_array_sizes(a);
+        let nb = normalize_mangled_array_sizes(b);
+        assert!(na.is_some());
+        assert!(nb.is_some());
+        assert_eq!(na, nb);
+    }
+
+    #[test]
+    fn test_normalize_non_template() {
+        assert!(normalize_mangled_array_sizes("?Foo@@YAXXZ").is_none());
+    }
+
+    #[test]
+    fn test_normalize_different_types() {
+        // char[8],int,char[35] vs char*,float,char[35] — different non-array types
+        let a = "??$MakeString@$$BY07$$CBDH$$BY0CD@$$CBD@@YA";
+        let b = "??$MakeString@PBDM$$BY0CD@$$CBD@@YA";
+        let na = normalize_mangled_array_sizes(a);
+        let nb = normalize_mangled_array_sizes(b);
+        // b has no $$BY0 for the first param, so different skeleton
+        assert_ne!(na, nb);
+    }
+
+    #[test]
+    fn test_normalize_same_sizes_unchanged() {
+        let a = "??$MakeString@$$BY07$$CBDH$$BY0CD@$$CBD@@YAPBDZ";
+        let na = normalize_mangled_array_sizes(a).unwrap();
+        let nb = normalize_mangled_array_sizes(a).unwrap();
+        assert_eq!(na, nb);
+    }
+
+    #[test]
+    fn test_normalize_no_array_in_template() {
+        // Template but no array params
+        assert!(normalize_mangled_array_sizes("??$Foo@HH@@YAXXZ").is_none());
+    }
 }
