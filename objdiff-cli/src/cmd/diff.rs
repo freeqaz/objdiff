@@ -32,7 +32,10 @@ use objdiff_core::{
         build_globset,
         path::{check_path_buf, platform_path, platform_path_serde_option},
     },
-    diff::{self, DiffObjConfig, DiffSide, InstructionDiffKind, MappingConfig, ObjectDiff},
+    diff::{
+        self, DiffObjConfig, DiffSide, InstructionDiffKind, InstructionDiffRow, MappingConfig,
+        ObjectDiff,
+    },
     jobs::{
         Job, JobQueue, JobResult,
         objdiff::{ObjDiffConfig, start_build},
@@ -203,6 +206,26 @@ pub struct InstructionDiffBreakdown {
     pub arguments: Vec<ArgumentDiff>,
 }
 
+/// Control-flow edge: the instruction rows that branch TO this row.
+/// Populated from objdiff-core's per-symbol branch graph; `source_indices`
+/// are `index` values within the same diff's instruction list.
+#[derive(Serialize, Clone)]
+pub struct BranchFrom {
+    /// Row indices of instructions that branch to this row.
+    pub source_indices: Vec<u32>,
+    /// Color/group index objdiff assigns this branch for visualization.
+    pub branch_idx: u32,
+}
+
+/// Control-flow edge: the instruction row this row branches TO.
+#[derive(Serialize, Clone)]
+pub struct BranchTo {
+    /// Row index of the branch target.
+    pub target_index: u32,
+    /// Color/group index objdiff assigns this branch for visualization.
+    pub branch_idx: u32,
+}
+
 #[derive(Serialize)]
 pub struct InstructionDiffOutput {
     pub index: usize,
@@ -214,6 +237,18 @@ pub struct InstructionDiffOutput {
     /// Detailed breakdown of which arguments differ (only for diff_arg type).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_breakdown: Option<InstructionDiffBreakdown>,
+    /// Control-flow: rows that branch to this one on the target (reference) side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_branch_from: Option<BranchFrom>,
+    /// Control-flow: the row this one branches to on the target (reference) side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_branch_to: Option<BranchTo>,
+    /// Control-flow: rows that branch to this one on the base (decompiled) side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch_from: Option<BranchFrom>,
+    /// Control-flow: the row this one branches to on the base (decompiled) side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch_to: Option<BranchTo>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1570,12 +1605,28 @@ fn build_instruction_diffs(
             None
         };
 
+        // Surface the control-flow (branch) graph from each side's diff row.
+        let branch_from = |row: Option<&InstructionDiffRow>| {
+            row.and_then(|r| r.branch_from.as_ref()).map(|b| BranchFrom {
+                source_indices: b.ins_idx.clone(),
+                branch_idx: b.branch_idx,
+            })
+        };
+        let branch_to = |row: Option<&InstructionDiffRow>| {
+            row.and_then(|r| r.branch_to.as_ref())
+                .map(|b| BranchTo { target_index: b.ins_idx, branch_idx: b.branch_idx })
+        };
+
         instructions.push(InstructionDiffOutput {
             index: idx,
             target: target_info,
             base: base_info,
             match_type: match_type_str(kind).to_string(),
             diff_breakdown,
+            target_branch_from: branch_from(left_row),
+            target_branch_to: branch_to(left_row),
+            base_branch_from: branch_from(right_row),
+            base_branch_to: branch_to(right_row),
         });
     }
 
@@ -2692,6 +2743,10 @@ mod tests {
             }),
             match_type: match_type.to_string(),
             diff_breakdown: None,
+            target_branch_from: None,
+            target_branch_to: None,
+            base_branch_from: None,
+            base_branch_to: None,
         }
     }
 

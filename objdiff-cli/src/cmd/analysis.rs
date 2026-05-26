@@ -3620,6 +3620,10 @@ mod tests {
             }),
             match_type: match_type.to_string(),
             diff_breakdown: None,
+            target_branch_from: None,
+            target_branch_to: None,
+            base_branch_from: None,
+            base_branch_to: None,
         }
     }
 
@@ -3656,6 +3660,10 @@ mod tests {
             }),
             match_type: match_type.to_string(),
             diff_breakdown: None,
+            target_branch_from: None,
+            target_branch_to: None,
+            base_branch_from: None,
+            base_branch_to: None,
         }
     }
 
