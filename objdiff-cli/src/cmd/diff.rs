@@ -34,13 +34,13 @@ use objdiff_core::{
     },
     diff::{
         self, DiffObjConfig, DiffSide, InstructionDiffKind, InstructionDiffRow, MappingConfig,
-        ObjectDiff,
+        ObjectDiff, SymbolDiff,
     },
     jobs::{
         Job, JobQueue, JobResult,
         objdiff::{ObjDiffConfig, start_build},
     },
-    obj::{self, Object},
+    obj::{self, Object, Symbol},
 };
 use ratatui::prelude::*;
 use serde::Serialize;
@@ -169,12 +169,77 @@ pub struct DiffOutput {
     pub diff_regions: Option<Vec<super::analysis::DiffRegion>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Vec<InstructionDiffOutput>>,
+    /// Byte/relocation diff for data symbols (populated with --include-data).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_diff: Option<DataDiffOutput>,
 }
 
 #[derive(Serialize)]
 pub struct DiffScoreOutput {
     pub score: u64,
     pub max_score: u64,
+}
+
+/// Byte- and relocation-level diff for a data symbol, from the perspective of
+/// the resolved side. Diff kinds ("replace"/"insert"/"delete") are relative to
+/// the matched symbol on the other side.
+#[derive(Serialize)]
+pub struct DataDiffOutput {
+    /// Byte-and-relocation-weighted match percent for the symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_percent: Option<f32>,
+    /// Number of differing bytes (replace/insert/delete) on this side.
+    pub mismatch_byte_count: usize,
+    /// Total bytes in the symbol on this side.
+    pub total_byte_count: usize,
+    /// Contiguous byte runs, in order, each tagged with a diff kind. Equal runs
+    /// are included (without `bytes`) so offsets stay unambiguous; differing
+    /// runs carry their hex bytes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<DataSegmentOutput>,
+    /// Relocations within the symbol and whether each matches the other side.
+    /// The most actionable signal for data symbols (vtables, pointer tables).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relocations: Vec<DataRelocationOutput>,
+}
+
+#[derive(Serialize)]
+pub struct DataSegmentOutput {
+    /// Byte offset from the start of the symbol.
+    pub offset: usize,
+    pub size: usize,
+    /// "equal", "replace", "insert", or "delete".
+    pub kind: String,
+    /// Hex of the bytes on this side (omitted for equal runs and for inserts,
+    /// which have no bytes on this side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DataRelocationOutput {
+    /// Byte offset from the start of the symbol.
+    pub offset: u64,
+    pub size: u64,
+    /// "equal", "replace", "insert", or "delete".
+    pub kind: String,
+    /// Name of the symbol this relocation points to.
+    pub target_symbol: String,
+    /// Relocation addend (omitted when zero).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub addend: i64,
+}
+
+fn is_zero(v: &i64) -> bool { *v == 0 }
+
+fn data_diff_kind_str(kind: objdiff_core::diff::DataDiffKind) -> &'static str {
+    use objdiff_core::diff::DataDiffKind;
+    match kind {
+        DataDiffKind::None => "equal",
+        DataDiffKind::Replace => "replace",
+        DataDiffKind::Insert => "insert",
+        DataDiffKind::Delete => "delete",
+    }
 }
 
 #[derive(Serialize)]
@@ -775,7 +840,7 @@ fn run_json(
         diff_objs(target_obj.as_ref(), base_obj.as_ref(), None, &diff_config, &mapping_config)?;
 
     // Find the symbol in the target or base object (supports both mangled and demangled names)
-    let (symbol_idx, symbol, _obj, obj_diff) = if let Some(ref target) = target_obj {
+    let (symbol_idx, symbol, resolved_obj, obj_diff) = if let Some(ref target) = target_obj {
         let idx = target
             .symbol_by_name_or_demangled(symbol_name)
             .ok_or_else(|| anyhow!("Symbol not found in target: {}", symbol_name))?;
@@ -849,6 +914,10 @@ fn run_json(
     } else {
         None
     };
+
+    // Build data-symbol diff if requested (no-op for code symbols).
+    let data_diff =
+        if args.include_data { build_data_diff(&resolved_obj.symbols, symbol_diff) } else { None };
 
     // Build instruction summary if requested
     let instruction_summary = if wants_summary {
@@ -993,6 +1062,7 @@ fn run_json(
         diff_regions,
         // Only include instructions in output if explicitly requested (not just for summary)
         instructions: if wants_instructions { instructions } else { None },
+        data_diff,
     };
 
     // Create markdown options
@@ -1390,6 +1460,7 @@ fn run_batch(args: Args) -> Result<()> {
                                                 insert_delete_clusters: None,
                                                 diff_regions: None,
                                                 instructions: None,
+                                                data_diff: None,
                                             };
                                             lines.push(serde_json::to_string(&output)?);
                                             continue;
@@ -1466,6 +1537,7 @@ fn run_batch(args: Args) -> Result<()> {
                     insert_delete_clusters: None,
                     diff_regions: None,
                     instructions: None,
+                    data_diff: None,
                 };
 
                 lines.push(serde_json::to_string(&output)?);
@@ -1514,6 +1586,94 @@ fn build_unit_diff_config(
     }
     apply_config_args(&mut diff_config, cli_args)?;
     Ok(diff_config)
+}
+
+/// Build a structured byte/relocation diff for a data symbol from the resolved
+/// side's `data_rows`. Returns `None` for code symbols (which have no data rows).
+/// Diff kinds are relative to the matched symbol on the other side.
+fn build_data_diff(symbols: &[Symbol], symbol_diff: &SymbolDiff) -> Option<DataDiffOutput> {
+    use objdiff_core::diff::DataDiffKind;
+    if symbol_diff.data_rows.is_empty() {
+        return None;
+    }
+
+    // Row 0's address is the symbol's start; reloc ranges are absolute.
+    let base_addr = symbol_diff.data_rows.first().map(|r| r.address).unwrap_or(0);
+
+    // objdiff chunks data into 16-byte rows; flatten them back into contiguous
+    // runs, merging adjacent segments that share a diff kind.
+    let mut segments: Vec<DataSegmentOutput> = Vec::new();
+    let mut seg_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut offset = 0usize;
+    let mut total_byte_count = 0usize;
+    let mut mismatch_byte_count = 0usize;
+
+    for row in &symbol_diff.data_rows {
+        for seg in &row.segments {
+            if seg.kind != DataDiffKind::Insert {
+                total_byte_count += seg.size;
+            }
+            if seg.kind != DataDiffKind::None {
+                mismatch_byte_count += seg.size;
+            }
+            let kind = data_diff_kind_str(seg.kind);
+            if let Some(last) = segments.last_mut() {
+                if last.kind == kind {
+                    last.size += seg.size;
+                    seg_bytes.last_mut().unwrap().extend_from_slice(&seg.data);
+                    offset += seg.size;
+                    continue;
+                }
+            }
+            segments.push(DataSegmentOutput {
+                offset,
+                size: seg.size,
+                kind: kind.to_string(),
+                bytes: None,
+            });
+            seg_bytes.push(seg.data.clone());
+            offset += seg.size;
+        }
+    }
+
+    // Attach hex bytes for differing runs that carry data on this side
+    // (replace/delete; inserts and equal runs are left without bytes).
+    for (seg, raw) in segments.iter_mut().zip(seg_bytes.iter()) {
+        if seg.kind != "equal" && seg.kind != "insert" && !raw.is_empty() {
+            seg.bytes = Some(raw.iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
+
+    // Collect relocations, de-duplicating those that span a row boundary.
+    let mut relocations: Vec<DataRelocationOutput> = Vec::new();
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    for row in &symbol_diff.data_rows {
+        for rd in &row.relocations {
+            let key = (rd.range.start, rd.range.end);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let target_symbol =
+                symbols.get(rd.reloc.target_symbol).map(|s| s.name.clone()).unwrap_or_default();
+            relocations.push(DataRelocationOutput {
+                offset: rd.range.start.saturating_sub(base_addr),
+                size: rd.range.end - rd.range.start,
+                kind: data_diff_kind_str(rd.kind).to_string(),
+                target_symbol,
+                addend: rd.reloc.addend,
+            });
+        }
+    }
+    relocations.sort_by_key(|r| r.offset);
+
+    Some(DataDiffOutput {
+        match_percent: symbol_diff.match_percent,
+        mismatch_byte_count,
+        total_byte_count,
+        segments,
+        relocations,
+    })
 }
 
 fn build_instruction_diffs(
@@ -2751,6 +2911,97 @@ mod tests {
     }
 
     // =========================================================================
+    // build_data_diff() tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_data_diff_segments_relocs() {
+        use objdiff_core::diff::{
+            DataDiff, DataDiffKind, DataDiffRow, DataRelocationDiff, SymbolDiff,
+        };
+        use objdiff_core::obj::{Relocation, RelocationFlags, Symbol};
+
+        // Symbols table for relocation target-name resolution.
+        let symbols = vec![
+            Symbol { name: "_self".to_string(), ..Default::default() },
+            Symbol { name: "SomeVtableEntry".to_string(), ..Default::default() },
+        ];
+
+        // A 4-byte relocation at offset 4 (absolute 0x1004) that mismatches.
+        let reloc = DataRelocationDiff {
+            reloc: Relocation {
+                flags: RelocationFlags::Elf(1),
+                address: 0x1004,
+                target_symbol: 1,
+                addend: 0,
+            },
+            range: 0x1004..0x1008,
+            kind: DataDiffKind::Replace,
+        };
+
+        let symbol_diff = SymbolDiff {
+            match_percent: Some(75.0),
+            // Two rows; row 0 carries the reloc and is split into two equal
+            // segments that must merge; row 1 has a replace then an insert.
+            data_rows: vec![
+                DataDiffRow {
+                    address: 0x1000,
+                    segments: vec![
+                        DataDiff { data: vec![0; 8], size: 8, kind: DataDiffKind::None },
+                        DataDiff { data: vec![0; 8], size: 8, kind: DataDiffKind::None },
+                    ],
+                    relocations: vec![reloc.clone()],
+                },
+                DataDiffRow {
+                    address: 0x1010,
+                    segments: vec![
+                        DataDiff {
+                            data: vec![0xde, 0xad, 0xbe, 0xef],
+                            size: 4,
+                            kind: DataDiffKind::Replace,
+                        },
+                        DataDiff { data: vec![], size: 4, kind: DataDiffKind::Insert },
+                    ],
+                    // Same reloc repeated (spans into this row) — must de-dup.
+                    relocations: vec![reloc.clone()],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let out = build_data_diff(&symbols, &symbol_diff).expect("data symbol should produce output");
+
+        assert_eq!(out.match_percent, Some(75.0));
+        // total = equal(16) + replace(4); insert is not bytes-on-this-side.
+        assert_eq!(out.total_byte_count, 20);
+        // mismatch = replace(4) + insert(4).
+        assert_eq!(out.mismatch_byte_count, 8);
+
+        // Adjacent equal segments merge into one 16-byte run.
+        assert_eq!(out.segments.len(), 3);
+        assert_eq!((out.segments[0].offset, out.segments[0].size, out.segments[0].kind.as_str()), (0, 16, "equal"));
+        assert_eq!(out.segments[0].bytes, None);
+        assert_eq!((out.segments[1].offset, out.segments[1].size, out.segments[1].kind.as_str()), (16, 4, "replace"));
+        assert_eq!(out.segments[1].bytes.as_deref(), Some("deadbeef"));
+        assert_eq!((out.segments[2].offset, out.segments[2].size, out.segments[2].kind.as_str()), (20, 4, "insert"));
+        assert_eq!(out.segments[2].bytes, None); // inserts have no bytes on this side
+
+        // Relocation resolved to its target symbol name and de-duplicated.
+        assert_eq!(out.relocations.len(), 1);
+        assert_eq!(out.relocations[0].offset, 4);
+        assert_eq!(out.relocations[0].size, 4);
+        assert_eq!(out.relocations[0].kind, "replace");
+        assert_eq!(out.relocations[0].target_symbol, "SomeVtableEntry");
+    }
+
+    #[test]
+    fn test_build_data_diff_code_symbol_is_none() {
+        // A symbol with no data_rows (e.g. a function) yields no data diff.
+        let symbol_diff = objdiff_core::diff::SymbolDiff::default();
+        assert!(build_data_diff(&[], &symbol_diff).is_none());
+    }
+
+    // =========================================================================
     // match_guidance() tests
     // =========================================================================
 
@@ -2832,6 +3083,7 @@ mod tests {
             insert_delete_clusters: None,
             diff_regions: None,
             instructions: Some(instructions),
+            data_diff: None,
         }
     }
 

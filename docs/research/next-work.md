@@ -22,14 +22,31 @@ edge), conditional `bne`, and merge points (`[19, 36] → 46`) all resolve
 correctly. This supersedes the earlier `stash@{0}` draft, which predated the
 current `TypedArg`/`InstructionInfo` shape and never compiled.
 
+### Data-symbol diff in JSON (`--include-data`)
+`--include-data` was a no-op flag; it now emits a `data_diff` object on the JSON
+`DiffOutput` for data symbols (code symbols produce nothing). Built from
+objdiff-core's `DataDiffRow`/`DataDiff`/`DataRelocationDiff`:
+
+- `match_percent`, `mismatch_byte_count`, `total_byte_count` — quick assessment.
+- `segments`: contiguous byte runs (objdiff's 16-byte rows flattened + merged by
+  kind), each `{ offset, size, kind, bytes? }`. `kind` ∈ equal/replace/insert/
+  delete; `bytes` (hex) present only for differing runs that carry data on this
+  side.
+- `relocations`: `{ offset, size, kind, target_symbol, addend? }` — the most
+  actionable signal for data symbols (vtables, pointer tables). De-duplicated
+  across row boundaries; `target_symbol` resolved by name.
+
+Verified on `tests/data/ppc/m_Do_hostIO.o` (`@stringBase0`, 200-byte string pool)
+plus unit tests for merge/replace/insert/relocation resolution. See
+`data-diff.md` for the prior actionability investigation (relocations are the
+key case for dc3/rb3).
+
 ## Next up
 
-### Data-symbol diff in JSON (`--include-data`)
-The `--include-data` flag is currently a **no-op** (declared, never read). Wire
-it to emit structured data-section diffs from objdiff-core's existing
-`DataDiffRow` / `DataDiff` / `DataRelocationDiff` (objdiff-core/src/diff/mod.rs).
-See `data-diff.md` for the prior investigation. Useful for matching data symbols
-(vtables, jump tables, string pools) in dc3/rb3.
+### Data diff: base-side bytes for `replace` runs
+The current `data_diff` shows one side's bytes (the resolved symbol's). For a
+`replace` run, showing the *other* side's bytes too would make string/init-value
+typos directly diffable. Requires aligning both symbols' `data_rows`.
 
 ## Branches evaluated and dropped (cleaned from the fork)
 
