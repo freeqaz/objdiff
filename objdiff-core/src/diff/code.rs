@@ -686,16 +686,31 @@ fn diff_instruction(
                 result.left_args_diff.push(InstructionArgDiffIndex::NONE);
                 result.right_args_diff.push(InstructionArgDiffIndex::NONE);
             } else {
-                let penalty = if let InstructionArg::Value(
-                    InstructionArgValue::Signed(_) | InstructionArgValue::Unsigned(_),
-                ) = a
-                {
-                    PENALTY_IMM_DIFF
-                } else {
-                    PENALTY_REG_DIFF
-                };
+                let is_immediate = matches!(
+                    a,
+                    InstructionArg::Value(
+                        InstructionArgValue::Signed(_) | InstructionArgValue::Unsigned(_),
+                    )
+                );
+                let penalty =
+                    if is_immediate { PENALTY_IMM_DIFF } else { PENALTY_REG_DIFF };
                 state.diff_score += penalty;
-                state.arg_diff_score += penalty;
+                // Immediates (constants, memory offsets, vtable slots) represent
+                // real semantic differences — they survive into a native port,
+                // so they must count toward the normalized score. Only register
+                // permutation, branch destinations, and relocations are folded
+                // into `arg_diff_score` and thus normalized away: the host
+                // compiler reallocates registers, branch offsets are relative
+                // layout, and reloc diffs are dominated by benign noise (pool
+                // addend, `_savegpr_N`, outline helpers, `__vt__` literal vs
+                // reloc construction). The audit at
+                // scripts/analysis/audit_normalized_masking.py (rb3-decomp)
+                // showed every in-scope masked bug — wrong vtable slot, wrong
+                // struct size, wrong member offset, wrong constant — was an
+                // immediate diff; reloc diffs were dominated by benign cases.
+                if !is_immediate {
+                    state.arg_diff_score += penalty;
+                }
                 if result.kind == InstructionDiffKind::None {
                     result.kind = InstructionDiffKind::ArgMismatch;
                 }
