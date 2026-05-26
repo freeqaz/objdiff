@@ -32,9 +32,13 @@ objdiff-core's `DataDiffRow`/`DataDiff`/`DataRelocationDiff`:
   kind), each `{ offset, size, kind, bytes? }`. `kind` ∈ equal/replace/insert/
   delete; `bytes` (hex) present only for differing runs that carry data on this
   side.
-- `relocations`: `{ offset, size, kind, target_symbol, addend? }` — the most
-  actionable signal for data symbols (vtables, pointer tables). De-duplicated
-  across row boundaries; `target_symbol` resolved by name.
+- `relocations`: `{ offset, size, kind, target_symbol, addend?, base_target_symbol?,
+  base_addend? }` — the most actionable signal for data symbols (vtables, pointer
+  tables). De-duplicated across row boundaries; `target_symbol` resolved by name.
+  When the base side points at a *different* symbol (a `replace` — e.g. a vtable
+  slot resolving to the wrong function), `base_target_symbol`/`base_addend` name
+  it; base-only relocations surface as `insert` entries. Paired by symbol-relative
+  offset (reloc lists aren't positionally aligned).
 - `segments` carry both sides: `bytes` (resolved side) and `base_bytes` (matched
   other side), the latter emitted only when present and different — so `replace`
   runs show target vs base byte values directly, and `insert` runs surface the
@@ -49,14 +53,8 @@ tests for merge/replace/insert/`base_bytes`/relocation resolution. See
 `data-diff.md` for the prior actionability investigation (relocations + vtables
 are the key case for dc3/rb3).
 
-## Next up
-
-### Data diff: base-side relocation target names
-`relocations` currently report the resolved side's `target_symbol`. For a
-mismatched (`replace`) reloc, the base side may point at a *different* symbol;
-surfacing both target names would pinpoint "this vtable slot points to the wrong
-function." Left/right reloc lists are not structurally aligned (unlike byte
-segments), so this needs pairing by offset rather than position.
+The `data_diff` feature is now complete (bytes both sides, relocations both
+sides). No outstanding data-diff work.
 
 ## Branches evaluated and dropped (cleaned from the fork)
 

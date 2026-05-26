@@ -229,11 +229,20 @@ pub struct DataRelocationOutput {
     pub size: u64,
     /// "equal", "replace", "insert", or "delete".
     pub kind: String,
-    /// Name of the symbol this relocation points to.
+    /// Name of the symbol this relocation points to on the resolved side.
+    /// Empty for base-only ("insert") relocations.
     pub target_symbol: String,
     /// Relocation addend (omitted when zero).
     #[serde(skip_serializing_if = "is_zero")]
     pub addend: i64,
+    /// Symbol the matched base-side relocation points to, when it differs from
+    /// `target_symbol` (a "replace" — e.g. a vtable slot resolving to a
+    /// different function) or the relocation exists only on the base side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_target_symbol: Option<String>,
+    /// Base-side addend, when a matched base relocation has a different addend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_addend: Option<i64>,
 }
 
 fn is_zero(v: &i64) -> bool { *v == 0 }
@@ -926,10 +935,16 @@ fn run_json(
     // comparison; `target_symbol` indexes into the other object's diff, which is
     // whichever of left/right we did NOT resolve by name.
     let data_diff = if args.include_data {
-        let other_obj_diff = if target_obj.is_some() { right_diff } else { left_diff };
-        let other_symbol_diff =
-            symbol_diff.target_symbol.and_then(|idx| other_obj_diff.map(|d| &d.symbols[idx]));
-        build_data_diff(&resolved_obj.symbols, symbol_diff, other_symbol_diff)
+        let (other_obj, other_obj_diff) = if target_obj.is_some() {
+            (base_obj.as_ref(), right_diff)
+        } else {
+            (target_obj.as_ref(), left_diff)
+        };
+        let other = symbol_diff.target_symbol.and_then(|idx| match (other_obj, other_obj_diff) {
+            (Some(o), Some(d)) => Some((o.symbols.as_slice(), &d.symbols[idx])),
+            _ => None,
+        });
+        build_data_diff(&resolved_obj.symbols, symbol_diff, other)
     } else {
         None
     };
@@ -1609,7 +1624,7 @@ fn build_unit_diff_config(
 fn build_data_diff(
     symbols: &[Symbol],
     symbol_diff: &SymbolDiff,
-    other_symbol_diff: Option<&SymbolDiff>,
+    other: Option<(&[Symbol], &SymbolDiff)>,
 ) -> Option<DataDiffOutput> {
     use objdiff_core::diff::DataDiffKind;
     if symbol_diff.data_rows.is_empty() {
@@ -1623,9 +1638,9 @@ fn build_data_diff(
     // (objdiff-core builds both sides in lockstep), differing only in segment
     // bytes — so we can pair them positionally for side-by-side byte output.
     // Guard defensively: if the shapes don't match, drop the pairing entirely.
-    let other_rows = other_symbol_diff.map(|d| &d.data_rows).filter(|other| {
-        other.len() == symbol_diff.data_rows.len()
-            && other.iter().zip(&symbol_diff.data_rows).all(|(o, t)| {
+    let other_rows = other.map(|(_, d)| &d.data_rows).filter(|rows| {
+        rows.len() == symbol_diff.data_rows.len()
+            && rows.iter().zip(&symbol_diff.data_rows).all(|(o, t)| {
                 o.segments.len() == t.segments.len()
                     && o.segments
                         .iter()
@@ -1699,9 +1714,45 @@ fn build_data_diff(
         }
     }
 
-    // Collect relocations, de-duplicating those that span a row boundary.
+    // Index the matched (base) side's relocations by symbol-relative offset, so
+    // we can show where a relocation points on the other side (e.g. a vtable
+    // slot that resolves to a different function in the base build). Left/right
+    // reloc lists are NOT positionally aligned, so we pair by offset.
+    struct BaseReloc {
+        offset: u64,
+        size: u64,
+        target_symbol: String,
+        addend: i64,
+    }
+    let mut base_relocs: Vec<BaseReloc> = Vec::new();
+    if let Some((other_symbols, other_diff)) = other {
+        let other_base = other_diff.data_rows.first().map(|r| r.address).unwrap_or(0);
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        for row in &other_diff.data_rows {
+            for rd in &row.relocations {
+                let key = (rd.range.start, rd.range.end);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                base_relocs.push(BaseReloc {
+                    offset: rd.range.start.saturating_sub(other_base),
+                    size: rd.range.end - rd.range.start,
+                    target_symbol: other_symbols
+                        .get(rd.reloc.target_symbol)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default(),
+                    addend: rd.reloc.addend,
+                });
+            }
+        }
+    }
+
+    // Collect this side's relocations (de-duplicating row-boundary spans) and
+    // pair each with the base side by offset.
     let mut relocations: Vec<DataRelocationOutput> = Vec::new();
     let mut seen: Vec<(u64, u64)> = Vec::new();
+    let mut matched_base: Vec<u64> = Vec::new();
     for row in &symbol_diff.data_rows {
         for rd in &row.relocations {
             let key = (rd.range.start, rd.range.end);
@@ -1709,16 +1760,46 @@ fn build_data_diff(
                 continue;
             }
             seen.push(key);
+            let offset = rd.range.start.saturating_sub(base_addr);
             let target_symbol =
                 symbols.get(rd.reloc.target_symbol).map(|s| s.name.clone()).unwrap_or_default();
+            let mut base_target_symbol = None;
+            let mut base_addend = None;
+            if let Some(b) = base_relocs.iter().find(|b| b.offset == offset) {
+                matched_base.push(offset);
+                if !b.target_symbol.is_empty() && b.target_symbol != target_symbol {
+                    base_target_symbol = Some(b.target_symbol.clone());
+                }
+                if b.addend != rd.reloc.addend {
+                    base_addend = Some(b.addend);
+                }
+            }
             relocations.push(DataRelocationOutput {
-                offset: rd.range.start.saturating_sub(base_addr),
+                offset,
                 size: rd.range.end - rd.range.start,
                 kind: data_diff_kind_str(rd.kind).to_string(),
                 target_symbol,
                 addend: rd.reloc.addend,
+                base_target_symbol,
+                base_addend,
             });
         }
+    }
+
+    // Surface base-only relocations (present on the base side, absent here).
+    for b in &base_relocs {
+        if matched_base.contains(&b.offset) {
+            continue;
+        }
+        relocations.push(DataRelocationOutput {
+            offset: b.offset,
+            size: b.size,
+            kind: "insert".to_string(),
+            target_symbol: String::new(),
+            addend: 0,
+            base_target_symbol: Some(b.target_symbol.clone()),
+            base_addend: if b.addend != 0 { Some(b.addend) } else { None },
+        });
     }
     relocations.sort_by_key(|r| r.offset);
 
@@ -3051,9 +3132,16 @@ mod tests {
         assert_eq!(out.relocations[0].size, 4);
         assert_eq!(out.relocations[0].kind, "replace");
         assert_eq!(out.relocations[0].target_symbol, "SomeVtableEntry");
+        // No other side => no base-side reloc naming.
+        assert_eq!(out.relocations[0].base_target_symbol, None);
 
-        // --- Both sides: structurally identical rows, different bytes. ---
+        // --- Both sides: structurally identical rows, different bytes/relocs. ---
         // (Equal-run bytes are irrelevant since equal segments emit no bytes.)
+        let other_symbols = vec![
+            Symbol { name: "_self".to_string(), ..Default::default() },
+            Symbol { name: "BaseVtableEntry".to_string(), ..Default::default() },
+            Symbol { name: "ExtraBaseEntry".to_string(), ..Default::default() },
+        ];
         let other_symbol_diff = SymbolDiff {
             match_percent: Some(75.0),
             data_rows: vec![
@@ -3063,7 +3151,17 @@ mod tests {
                         DataDiff { data: vec![0; 8], size: 8, kind: DataDiffKind::None },
                         DataDiff { data: vec![0; 8], size: 8, kind: DataDiffKind::None },
                     ],
-                    relocations: vec![],
+                    // Same offset (4) as this side's reloc, but a different target.
+                    relocations: vec![DataRelocationDiff {
+                        reloc: Relocation {
+                            flags: RelocationFlags::Elf(1),
+                            address: 0x2004,
+                            target_symbol: 1,
+                            addend: 0,
+                        },
+                        range: 0x2004..0x2008,
+                        kind: DataDiffKind::Replace,
+                    }],
                 },
                 DataDiffRow {
                     address: 0x2010,
@@ -3080,13 +3178,23 @@ mod tests {
                             kind: DataDiffKind::Insert,
                         },
                     ],
-                    relocations: vec![],
+                    // A relocation present only on the base side (offset 20).
+                    relocations: vec![DataRelocationDiff {
+                        reloc: Relocation {
+                            flags: RelocationFlags::Elf(1),
+                            address: 0x2014,
+                            target_symbol: 2,
+                            addend: 0,
+                        },
+                        range: 0x2014..0x2018,
+                        kind: DataDiffKind::Insert,
+                    }],
                 },
             ],
             ..Default::default()
         };
 
-        let out = build_data_diff(&symbols, &symbol_diff, Some(&other_symbol_diff))
+        let out = build_data_diff(&symbols, &symbol_diff, Some((&other_symbols, &other_symbol_diff)))
             .expect("data symbol should produce output");
         // equal run: still no bytes on either side.
         assert_eq!(out.segments[0].bytes, None);
@@ -3098,7 +3206,18 @@ mod tests {
         assert_eq!(out.segments[2].bytes, None);
         assert_eq!(out.segments[2].base_bytes.as_deref(), Some("aabbccdd"));
 
-        // --- Defensive: a mismatched-shape other side disables pairing. ---
+        // Relocations: the offset-4 reloc now names both sides; the base-only
+        // reloc at offset 20 surfaces as an "insert".
+        assert_eq!(out.relocations.len(), 2);
+        assert_eq!(out.relocations[0].offset, 4);
+        assert_eq!(out.relocations[0].target_symbol, "SomeVtableEntry");
+        assert_eq!(out.relocations[0].base_target_symbol.as_deref(), Some("BaseVtableEntry"));
+        assert_eq!(out.relocations[1].offset, 20);
+        assert_eq!(out.relocations[1].kind, "insert");
+        assert_eq!(out.relocations[1].target_symbol, "");
+        assert_eq!(out.relocations[1].base_target_symbol.as_deref(), Some("ExtraBaseEntry"));
+
+        // --- Defensive: a mismatched-shape other side disables byte pairing. ---
         let misshaped = SymbolDiff {
             data_rows: vec![DataDiffRow {
                 address: 0x3000,
@@ -3107,7 +3226,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = build_data_diff(&symbols, &symbol_diff, Some(&misshaped)).unwrap();
+        let out = build_data_diff(&symbols, &symbol_diff, Some((&symbols, &misshaped))).unwrap();
         assert!(out.segments.iter().all(|s| s.base_bytes.is_none()));
     }
 
