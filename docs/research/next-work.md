@@ -35,18 +35,28 @@ objdiff-core's `DataDiffRow`/`DataDiff`/`DataRelocationDiff`:
 - `relocations`: `{ offset, size, kind, target_symbol, addend? }` — the most
   actionable signal for data symbols (vtables, pointer tables). De-duplicated
   across row boundaries; `target_symbol` resolved by name.
+- `segments` carry both sides: `bytes` (resolved side) and `base_bytes` (matched
+  other side), the latter emitted only when present and different — so `replace`
+  runs show target vs base byte values directly, and `insert` runs surface the
+  base-only bytes. Built by walking both symbols' `data_rows` in lockstep
+  (objdiff-core builds them structurally identical, differing only in payload),
+  with a defensive shape guard that falls back to single-side if they diverge.
 
-Verified on `tests/data/ppc/m_Do_hostIO.o` (`@stringBase0`, 200-byte string pool)
-plus unit tests for merge/replace/insert/relocation resolution. See
-`data-diff.md` for the prior actionability investigation (relocations are the
-key case for dc3/rb3).
+Verified on `tests/data/arm/LinkStateItem.o` (`_ZTV13LinkStateItem`, a 68-byte
+vtable — all 17 relocations resolve to their target function names) and
+`tests/data/ppc/m_Do_hostIO.o` (`@stringBase0`, 200-byte string pool), plus unit
+tests for merge/replace/insert/`base_bytes`/relocation resolution. See
+`data-diff.md` for the prior actionability investigation (relocations + vtables
+are the key case for dc3/rb3).
 
 ## Next up
 
-### Data diff: base-side bytes for `replace` runs
-The current `data_diff` shows one side's bytes (the resolved symbol's). For a
-`replace` run, showing the *other* side's bytes too would make string/init-value
-typos directly diffable. Requires aligning both symbols' `data_rows`.
+### Data diff: base-side relocation target names
+`relocations` currently report the resolved side's `target_symbol`. For a
+mismatched (`replace`) reloc, the base side may point at a *different* symbol;
+surfacing both target names would pinpoint "this vtable slot points to the wrong
+function." Left/right reloc lists are not structurally aligned (unlike byte
+segments), so this needs pairing by offset rather than position.
 
 ## Branches evaluated and dropped (cleaned from the fork)
 

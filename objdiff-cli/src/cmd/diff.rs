@@ -210,10 +210,16 @@ pub struct DataSegmentOutput {
     pub size: usize,
     /// "equal", "replace", "insert", or "delete".
     pub kind: String,
-    /// Hex of the bytes on this side (omitted for equal runs and for inserts,
-    /// which have no bytes on this side).
+    /// Hex of the bytes on the resolved side (omitted for equal runs and for
+    /// inserts, which have no bytes on this side).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<String>,
+    /// Hex of the bytes on the matched (base/other) side, when a match exists
+    /// and they differ from this side — lets string/init-value diffs be
+    /// compared directly. Omitted for equal runs, one-sided diffs, and deletes
+    /// (which have no bytes on the other side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_bytes: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -915,9 +921,18 @@ fn run_json(
         None
     };
 
-    // Build data-symbol diff if requested (no-op for code symbols).
-    let data_diff =
-        if args.include_data { build_data_diff(&resolved_obj.symbols, symbol_diff) } else { None };
+    // Build data-symbol diff if requested (no-op for code symbols). The matched
+    // symbol on the other side (if any) supplies the base bytes for side-by-side
+    // comparison; `target_symbol` indexes into the other object's diff, which is
+    // whichever of left/right we did NOT resolve by name.
+    let data_diff = if args.include_data {
+        let other_obj_diff = if target_obj.is_some() { right_diff } else { left_diff };
+        let other_symbol_diff =
+            symbol_diff.target_symbol.and_then(|idx| other_obj_diff.map(|d| &d.symbols[idx]));
+        build_data_diff(&resolved_obj.symbols, symbol_diff, other_symbol_diff)
+    } else {
+        None
+    };
 
     // Build instruction summary if requested
     let instruction_summary = if wants_summary {
@@ -1591,7 +1606,11 @@ fn build_unit_diff_config(
 /// Build a structured byte/relocation diff for a data symbol from the resolved
 /// side's `data_rows`. Returns `None` for code symbols (which have no data rows).
 /// Diff kinds are relative to the matched symbol on the other side.
-fn build_data_diff(symbols: &[Symbol], symbol_diff: &SymbolDiff) -> Option<DataDiffOutput> {
+fn build_data_diff(
+    symbols: &[Symbol],
+    symbol_diff: &SymbolDiff,
+    other_symbol_diff: Option<&SymbolDiff>,
+) -> Option<DataDiffOutput> {
     use objdiff_core::diff::DataDiffKind;
     if symbol_diff.data_rows.is_empty() {
         return None;
@@ -1600,16 +1619,38 @@ fn build_data_diff(symbols: &[Symbol], symbol_diff: &SymbolDiff) -> Option<DataD
     // Row 0's address is the symbol's start; reloc ranges are absolute.
     let base_addr = symbol_diff.data_rows.first().map(|r| r.address).unwrap_or(0);
 
+    // The matched symbol on the other side has structurally identical data_rows
+    // (objdiff-core builds both sides in lockstep), differing only in segment
+    // bytes — so we can pair them positionally for side-by-side byte output.
+    // Guard defensively: if the shapes don't match, drop the pairing entirely.
+    let other_rows = other_symbol_diff.map(|d| &d.data_rows).filter(|other| {
+        other.len() == symbol_diff.data_rows.len()
+            && other.iter().zip(&symbol_diff.data_rows).all(|(o, t)| {
+                o.segments.len() == t.segments.len()
+                    && o.segments
+                        .iter()
+                        .zip(&t.segments)
+                        .all(|(os, ts)| os.size == ts.size && os.kind == ts.kind)
+            })
+    });
+
     // objdiff chunks data into 16-byte rows; flatten them back into contiguous
-    // runs, merging adjacent segments that share a diff kind.
+    // runs, merging adjacent segments that share a diff kind. The other side's
+    // bytes are accumulated in lockstep so merge boundaries stay aligned.
     let mut segments: Vec<DataSegmentOutput> = Vec::new();
     let mut seg_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut other_seg_bytes: Vec<Vec<u8>> = Vec::new();
     let mut offset = 0usize;
     let mut total_byte_count = 0usize;
     let mut mismatch_byte_count = 0usize;
 
-    for row in &symbol_diff.data_rows {
-        for seg in &row.segments {
+    for (row_idx, row) in symbol_diff.data_rows.iter().enumerate() {
+        for (seg_idx, seg) in row.segments.iter().enumerate() {
+            let other_data: &[u8] = other_rows
+                .and_then(|rows| rows[row_idx].segments.get(seg_idx))
+                .map(|os| os.data.as_slice())
+                .unwrap_or(&[]);
+
             if seg.kind != DataDiffKind::Insert {
                 total_byte_count += seg.size;
             }
@@ -1621,6 +1662,7 @@ fn build_data_diff(symbols: &[Symbol], symbol_diff: &SymbolDiff) -> Option<DataD
                 if last.kind == kind {
                     last.size += seg.size;
                     seg_bytes.last_mut().unwrap().extend_from_slice(&seg.data);
+                    other_seg_bytes.last_mut().unwrap().extend_from_slice(other_data);
                     offset += seg.size;
                     continue;
                 }
@@ -1630,17 +1672,30 @@ fn build_data_diff(symbols: &[Symbol], symbol_diff: &SymbolDiff) -> Option<DataD
                 size: seg.size,
                 kind: kind.to_string(),
                 bytes: None,
+                base_bytes: None,
             });
             seg_bytes.push(seg.data.clone());
+            other_seg_bytes.push(other_data.to_vec());
             offset += seg.size;
         }
     }
 
-    // Attach hex bytes for differing runs that carry data on this side
-    // (replace/delete; inserts and equal runs are left without bytes).
-    for (seg, raw) in segments.iter_mut().zip(seg_bytes.iter()) {
-        if seg.kind != "equal" && seg.kind != "insert" && !raw.is_empty() {
+    // Attach hex bytes for differing runs. `bytes` is the resolved side
+    // (replace/delete carry data here); `base_bytes` is the matched other side,
+    // emitted only when present and actually different (so matched runs and
+    // inserts/deletes stay clean on the side that has no bytes).
+    let have_other = other_rows.is_some();
+    for ((seg, raw), other_raw) in
+        segments.iter_mut().zip(seg_bytes.iter()).zip(other_seg_bytes.iter())
+    {
+        if seg.kind == "equal" {
+            continue;
+        }
+        if !raw.is_empty() {
             seg.bytes = Some(raw.iter().map(|b| format!("{b:02x}")).collect());
+        }
+        if have_other && !other_raw.is_empty() && other_raw != raw {
+            seg.base_bytes = Some(other_raw.iter().map(|b| format!("{b:02x}")).collect());
         }
     }
 
@@ -2969,7 +3024,9 @@ mod tests {
             ..Default::default()
         };
 
-        let out = build_data_diff(&symbols, &symbol_diff).expect("data symbol should produce output");
+        // --- Single-side (no matched other side): back-compatible behavior. ---
+        let out = build_data_diff(&symbols, &symbol_diff, None)
+            .expect("data symbol should produce output");
 
         assert_eq!(out.match_percent, Some(75.0));
         // total = equal(16) + replace(4); insert is not bytes-on-this-side.
@@ -2985,6 +3042,8 @@ mod tests {
         assert_eq!(out.segments[1].bytes.as_deref(), Some("deadbeef"));
         assert_eq!((out.segments[2].offset, out.segments[2].size, out.segments[2].kind.as_str()), (20, 4, "insert"));
         assert_eq!(out.segments[2].bytes, None); // inserts have no bytes on this side
+        // With no other side, base_bytes is never populated.
+        assert!(out.segments.iter().all(|s| s.base_bytes.is_none()));
 
         // Relocation resolved to its target symbol name and de-duplicated.
         assert_eq!(out.relocations.len(), 1);
@@ -2992,13 +3051,71 @@ mod tests {
         assert_eq!(out.relocations[0].size, 4);
         assert_eq!(out.relocations[0].kind, "replace");
         assert_eq!(out.relocations[0].target_symbol, "SomeVtableEntry");
+
+        // --- Both sides: structurally identical rows, different bytes. ---
+        // (Equal-run bytes are irrelevant since equal segments emit no bytes.)
+        let other_symbol_diff = SymbolDiff {
+            match_percent: Some(75.0),
+            data_rows: vec![
+                DataDiffRow {
+                    address: 0x2000,
+                    segments: vec![
+                        DataDiff { data: vec![0; 8], size: 8, kind: DataDiffKind::None },
+                        DataDiff { data: vec![0; 8], size: 8, kind: DataDiffKind::None },
+                    ],
+                    relocations: vec![],
+                },
+                DataDiffRow {
+                    address: 0x2010,
+                    segments: vec![
+                        DataDiff {
+                            data: vec![0x12, 0x34, 0x56, 0x78],
+                            size: 4,
+                            kind: DataDiffKind::Replace,
+                        },
+                        // The inserted bytes live on the OTHER (base) side.
+                        DataDiff {
+                            data: vec![0xaa, 0xbb, 0xcc, 0xdd],
+                            size: 4,
+                            kind: DataDiffKind::Insert,
+                        },
+                    ],
+                    relocations: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let out = build_data_diff(&symbols, &symbol_diff, Some(&other_symbol_diff))
+            .expect("data symbol should produce output");
+        // equal run: still no bytes on either side.
+        assert_eq!(out.segments[0].bytes, None);
+        assert_eq!(out.segments[0].base_bytes, None);
+        // replace: this side unchanged, other side now visible side-by-side.
+        assert_eq!(out.segments[1].bytes.as_deref(), Some("deadbeef"));
+        assert_eq!(out.segments[1].base_bytes.as_deref(), Some("12345678"));
+        // insert: no bytes on this side, but the inserted base bytes show up.
+        assert_eq!(out.segments[2].bytes, None);
+        assert_eq!(out.segments[2].base_bytes.as_deref(), Some("aabbccdd"));
+
+        // --- Defensive: a mismatched-shape other side disables pairing. ---
+        let misshaped = SymbolDiff {
+            data_rows: vec![DataDiffRow {
+                address: 0x3000,
+                segments: vec![DataDiff { data: vec![0; 4], size: 4, kind: DataDiffKind::None }],
+                relocations: vec![],
+            }],
+            ..Default::default()
+        };
+        let out = build_data_diff(&symbols, &symbol_diff, Some(&misshaped)).unwrap();
+        assert!(out.segments.iter().all(|s| s.base_bytes.is_none()));
     }
 
     #[test]
     fn test_build_data_diff_code_symbol_is_none() {
         // A symbol with no data_rows (e.g. a function) yields no data diff.
         let symbol_diff = objdiff_core::diff::SymbolDiff::default();
-        assert!(build_data_diff(&[], &symbol_diff).is_none());
+        assert!(build_data_diff(&[], &symbol_diff, None).is_none());
     }
 
     // =========================================================================
