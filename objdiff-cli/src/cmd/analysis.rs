@@ -69,11 +69,12 @@ static REGISTER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([rf]\d+)\
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PatternType {
-    /// Calls to linker-merged functions (unfixable)
+    /// Calls to linker-merged functions (ICF — source-immune at the call site)
     LinkerMerged,
-    /// Bool return masking with clrlwi/rlwinm (usually unfixable)
+    /// Bool return masking with clrlwi/rlwinm (permuter-class)
     BoolMask,
-    /// Consistent register allocation swaps (sometimes fixable)
+    /// Consistent register allocation swaps (permuter-class — tedious by hand,
+    /// mechanical via declaration reorder / scope mutation patterns)
     RegisterSwap,
     /// Comparison immediate differs by 1, suggesting > vs >= style difference
     ComparisonStyle,
@@ -83,7 +84,7 @@ pub enum PatternType {
     CommutativeOpOrder,
     /// Two offsets swapped between target and base
     OffsetSwap,
-    /// Anonymous namespace TU hash mismatch (unfixable)
+    /// Anonymous namespace TU hash mismatch (source-immune — derived from TU path)
     AnonymousNamespaceHash,
     /// Static guard counter (`$S#`) mismatch from wrong TU function order
     StaticGuardCounter,
@@ -148,12 +149,33 @@ pub enum Confidence {
 }
 
 /// How likely a pattern is to be fixable.
+///
+/// IMPORTANT: "RarelyHandFixable" does NOT mean "give up." It means a single
+/// hand-edit is unlikely to converge — these patterns are typically either
+/// (a) genuine build artifacts (anonymous-namespace hashes, address relocation
+/// noise — where source mutation cannot help), or (b) compiler-internal
+/// decisions that the source permuter usually cracks given enough rounds.
+/// Always dispatch the permuter on the function before classifying it as
+/// truly stuck.
+///
+/// `PermuterClass` is the primary handle for register-allocation cascades,
+/// FPR scheduling, bool materialization, and stack-slot inversions. These
+/// are tedious by hand but mechanical for the source permuter. The permuter
+/// has 100+ mutation patterns and is evolving constantly — let it choose
+/// which patterns to apply; do not hand-enumerate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Fixability {
-    Unfixable,
-    UsuallyUnfixable,
+    /// Hand-editing is unlikely to converge. Either a genuine artifact
+    /// (linker/path-derived) or a compiler decision typically fixed by the
+    /// permuter. Run the permuter on the function before classifying as stuck.
+    RarelyHandFixable,
+    /// Mechanical to fix via the source permuter; hand-edits usually thrash.
+    /// Dispatch the permuter on the function/unit.
+    PermuterClass,
+    /// Either hand-edit or permuter; the permuter is a low-effort first try.
     MaybeFixable,
+    /// Clear source-level edit path. Hand-edit is the primary handle.
     LikelyFixable,
 }
 
@@ -227,6 +249,12 @@ pub struct StaticGuardInfo {
 pub struct PrologueMismatchInfo {
     pub target_first_reg: u32,
     pub base_first_reg: u32,
+    /// Stack frame size from `stwu r1, -N(r1)` in target prologue, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_frame_size: Option<u32>,
+    /// Stack frame size from `stwu r1, -N(r1)` in base prologue, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_frame_size: Option<u32>,
 }
 
 /// Sub-type of MakeString template mismatch.
@@ -370,7 +398,7 @@ impl Pattern {
                 let pairs = swaps.len();
                 // Classify register types for display
                 let reg_class = match self.fixability {
-                    Fixability::Unfixable => " [volatile, unfixable]",
+                    Fixability::RarelyHandFixable => " [volatile — try permuter sweep]",
                     Fixability::MaybeFixable => {
                         let has_callee = swaps.iter().any(|s| {
                             is_callee_saved_register(&s.target_reg)
@@ -583,7 +611,10 @@ impl Pattern {
                 }
             }
             PatternDetails::AnonymousNamespaceHash { mismatches } => PatternSummary {
-                one_line: format!("{} anon namespace hash mismatch(es) (unfixable)", mismatches.len()),
+                one_line: format!(
+                    "{} anon namespace hash mismatch(es) (linker artifact — derived from TU path)",
+                    mismatches.len()
+                ),
                 top_details: mismatches
                     .iter()
                     .take(3)
@@ -616,7 +647,7 @@ impl Pattern {
             },
             PatternDetails::DeadStoreElimination { count } => PatternSummary {
                 one_line: format!(
-                    "{} dead store(s) in base eliminated by target compiler (unfixable)",
+                    "{} dead store(s) in base eliminated by target compiler — try permuter sweep",
                     count
                 ),
                 top_details: vec![],
@@ -697,7 +728,7 @@ impl Pattern {
             }
             PatternDetails::AddressRelocationNoise { info } => PatternSummary {
                 one_line: format!(
-                    "{} address relocation(s), {} lis/addi pair(s) (unfixable)",
+                    "{} address relocation(s), {} lis/addi pair(s) (linker artifact — different .text layout)",
                     info.count, info.pair_count
                 ),
                 top_details: vec![],
@@ -706,7 +737,7 @@ impl Pattern {
             },
             PatternDetails::BooleanNegation { count } => PatternSummary {
                 one_line: format!(
-                    "{} boolean negation(s) subfic↔subic (unfixable compiler choice)",
+                    "{} boolean negation(s) subfic↔subic — compiler choice, try permuter sweep",
                     count
                 ),
                 top_details: vec![],
@@ -792,6 +823,24 @@ pub struct CallCountDiff {
     pub base_count: usize,
 }
 
+/// Extract the call target name for a `bl` instruction.
+///
+/// Prefers `typed_args[0]` when it's a `Symbol`-typed arg — this resolves
+/// ICF-merged symbols (e.g. `merged_004ab12c`) to their canonical name.
+/// Falls back to `args.trim()` when `typed_args` is absent or the first arg
+/// is not a symbol (e.g. a direct branch destination).
+fn bl_target_name(info: &InstructionInfo) -> Option<String> {
+    // Prefer typed_args[0] if it carries a Symbol — these are populated by
+    // build_instruction_info from relocation data and resolve through ICF merges.
+    if let Some(typed_args) = &info.typed_args {
+        if let Some(super::diff::TypedArg::Symbol(sym)) = typed_args.first() {
+            return Some(sym.clone());
+        }
+    }
+    // Fall back to the raw rendered args string.
+    info.args.as_deref().map(|a| a.trim().to_string())
+}
+
 /// Compute the difference in function calls between target and base.
 pub fn compute_call_diff(instructions: &[InstructionDiffOutput]) -> Option<CallDiffOutput> {
     let mut target_calls: HashMap<String, usize> = HashMap::new();
@@ -801,9 +850,8 @@ pub fn compute_call_diff(instructions: &[InstructionDiffOutput]) -> Option<CallD
         // Check target side for bl calls
         if let Some(target) = &instr.target
             && target.opcode == "bl"
-            && let Some(args) = &target.args
+            && let Some(name) = bl_target_name(target)
         {
-            let name = args.trim().to_string();
             if !MERGED_FUNC_RE.is_match(&name) {
                 *target_calls.entry(name).or_insert(0) += 1;
             }
@@ -811,9 +859,8 @@ pub fn compute_call_diff(instructions: &[InstructionDiffOutput]) -> Option<CallD
         // Check base side for bl calls
         if let Some(base) = &instr.base
             && base.opcode == "bl"
-            && let Some(args) = &base.args
+            && let Some(name) = bl_target_name(base)
         {
-            let name = args.trim().to_string();
             if !MERGED_FUNC_RE.is_match(&name) {
                 *base_calls.entry(name).or_insert(0) += 1;
             }
@@ -1327,16 +1374,31 @@ pub struct Verdict {
 // Pattern Documentation URLs
 // =============================================================================
 
-/// Base URL prefix for pattern documentation (relative to DC3 decomp root).
+/// Base URL prefix for pattern documentation.
+///
+/// Relative to the consuming project root. Both RB3 and DC3 mirror this
+/// `docs/decomp/patterns/` layout; the same URLs resolve in either repo.
 const DOC_BASE: &str = "docs/decomp/patterns/";
 
 /// Return documentation URLs for a pattern type.
+///
+/// The permuter is the first-line recommendation for anything classified as
+/// `PermuterClass` — see `permuter-roi.md`. Linker/path-derived artifacts
+/// (anon-namespace hash, address-relocation noise, ICF) live in
+/// `at-limit-mwcc.md` (RB3) / `at-limit-msvc.md` (DC3) — these are genuinely
+/// source-immune and the only correct action is to accept the match.
 pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
     let paths: &[&str] = match pattern {
-        PatternType::LinkerMerged => &["verifiable-icf.md#linker-merged-icf"],
-        PatternType::BoolMask => &["fixable-bool-mask.md#step-1-detect"],
+        PatternType::LinkerMerged => &[
+            "verifiable-icf.md#linker-merged-icf",
+            "at-limit-mwcc.md#linker-merged-icf",
+        ],
+        PatternType::BoolMask => &[
+            "fixable-bool-mask.md",
+            "permuter-roi.md#bool-materialization",
+        ],
         PatternType::RegisterSwap => &[
-            "unfixable-compiler.md#register-allocation",
+            "permuter-roi.md#register-allocation-cascades",
             "fixable-declarations.md#variable-declaration-order",
         ],
         PatternType::ComparisonStyle => &["fixable-comparison.md#comparison-style"],
@@ -1345,9 +1407,12 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
             "fixable-comparison.md#unsigned-zero-comparison",
         ],
         PatternType::CommutativeOpOrder => &["fixable-operators.md#commutative-operand-order"],
-        PatternType::OffsetSwap => &["fixable-declarations.md#offset-swap"],
+        PatternType::OffsetSwap => &[
+            "fixable-declarations.md#offset-swap",
+            "permuter-roi.md#stack-slot-inversion",
+        ],
         PatternType::AnonymousNamespaceHash => {
-            &["unfixable-compiler.md#anonymous-namespace-hash-mismatch"]
+            &["at-limit-mwcc.md#anonymous-namespace-hash"]
         }
         PatternType::StaticGuardCounter => &[
             "fixable-declarations.md#function-definition-order-tu-wide-static-guard-counters",
@@ -1356,12 +1421,14 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
         PatternType::DynamicCastMismatch => {
             &["fixable-casting.md#avoid-unnecessary-dynamic_cast-getobj-vs-objt"]
         }
-        PatternType::DeadStoreElimination => {
-            &["unfixable-compiler.md#dead-store-elimination--destructor-merging"]
-        }
-        PatternType::PrologueMismatch => {
-            &["fixable-declarations.md#variable-declaration-order"]
-        }
+        PatternType::DeadStoreElimination => &[
+            "at-limit-mwcc.md#dead-store-elimination",
+            "permuter-roi.md",
+        ],
+        PatternType::PrologueMismatch => &[
+            "permuter-roi.md#register-allocation-cascades",
+            "fixable-declarations.md#variable-declaration-order",
+        ],
         PatternType::AllocaMismatch => {
             &["fixable-declarations.md#alloca-vs-_alloca-intrinsic-stack-allocation"]
         }
@@ -1372,11 +1439,12 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
             &["fixable-casting.md#makestring-template-type-mismatch-milo-macro-arguments"]
         }
         PatternType::AddressRelocationNoise => {
-            &["unfixable-compiler.md#address-relocation-noise"]
+            &["at-limit-mwcc.md#address-relocation-noise"]
         }
-        PatternType::BooleanNegation => {
-            &["unfixable-compiler.md#boolean-negation-subfic-vs-subic"]
-        }
+        PatternType::BooleanNegation => &[
+            "at-limit-mwcc.md#boolean-negation-subfic-vs-subic",
+            "permuter-roi.md",
+        ],
         PatternType::FloatPrecisionMismatch => {
             &["fixable-casting.md#cast-placement-controls-fmul-vs-fmuls"]
         }
@@ -1488,7 +1556,7 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
             Confidence::High
         },
         instruction_count: total_count,
-        fixability: Fixability::Unfixable,
+        fixability: Fixability::RarelyHandFixable,
         details: PatternDetails::MergedFunctions { merged_functions },
         doc_urls: pattern_doc_urls(PatternType::LinkerMerged),
     })
@@ -1598,7 +1666,7 @@ pub fn detect_bool_mask(instructions: &[InstructionDiffOutput]) -> Option<Patter
         pattern: PatternType::BoolMask,
         confidence: Confidence::High,
         instruction_count: mask_count,
-        fixability: Fixability::UsuallyUnfixable,
+        fixability: Fixability::PermuterClass,
         details: PatternDetails::BoolMask { bit_positions },
         doc_urls: pattern_doc_urls(PatternType::BoolMask),
     })
@@ -1669,9 +1737,13 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
     swaps.sort_by(|a, b| b.count.cmp(&a.count));
 
     // Classify fixability based on register types:
-    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable via declaration reorder
-    // - Pure volatile swaps (r0-r12, f0-f13): Unfixable (compiler-internal allocation)
-    // - Mixed: MaybeFixable (callee-saved part might still be worth fixing)
+    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable — primarily via
+    //   declaration reorder; permuter sweeps crack these mechanically.
+    // - Pure volatile swaps (r0-r12, f0-f13): RarelyHandFixable — driven by
+    //   instruction scheduling and live-range pressure; not directly
+    //   controllable from declarations, but the permuter's body-restructuring
+    //   patterns still help in many cases. Try a sweep before accepting.
+    // - Mixed: MaybeFixable (callee-saved part is the main lever)
     let has_callee_saved_swap = swaps
         .iter()
         .any(|s| is_callee_saved_register(&s.target_reg) && is_callee_saved_register(&s.base_reg));
@@ -1680,9 +1752,13 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
         .any(|s| !is_callee_saved_register(&s.target_reg) || !is_callee_saved_register(&s.base_reg));
 
     let fixability = if has_volatile_swap && !has_callee_saved_swap {
-        Fixability::Unfixable // Pure volatile: compiler quirk, no source-level fix
+        // Pure volatile: scheduling-driven, not declaration-driven. The
+        // permuter still has a shot via body restructurings; flag it so the
+        // verdict text recommends a sweep instead of "accept".
+        Fixability::RarelyHandFixable
     } else {
-        Fixability::MaybeFixable // Pure callee-saved or mixed: might fix via decl reorder
+        // Pure callee-saved or mixed: declaration reorder is the lever.
+        Fixability::MaybeFixable
     };
 
     Some(Pattern {
@@ -2094,12 +2170,19 @@ static STATIC_GUARD_RE: LazyLock<Regex> =
 static SAVE_REG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"__(savegprlr|savefpr)_(\d+)").unwrap());
 
+/// Regex for `stwu r1, -N(r1)` — extracts the positive frame size N.
+/// The displacement is negative in the instruction (e.g. `-0x60`) so we
+/// capture the absolute value.
+static STWU_FRAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^r1, -(\d+)\(r1\)$").unwrap());
+
 /// Detect anonymous namespace TU hash mismatches.
 ///
 /// These appear when static functions inside anonymous namespaces have different
 /// TU-hash suffixes between the target and decomp build (e.g., `?A0x7ea4e606@@` vs
 /// `?A0x00000000@@`). The machine code is identical; only the relocation symbol name
-/// differs. This is unfixable — the hash is derived from the TU path.
+/// differs. This is source-immune — the hash is derived from the TU path
+/// (renaming the TU would change it, but that is rarely the right trade).
 pub fn detect_anonymous_namespace_hash(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut mismatches: Vec<AnonNamespaceInfo> = Vec::new();
 
@@ -2154,7 +2237,7 @@ pub fn detect_anonymous_namespace_hash(instructions: &[InstructionDiffOutput]) -
         pattern: PatternType::AnonymousNamespaceHash,
         confidence: Confidence::High,
         instruction_count: count,
-        fixability: Fixability::Unfixable,
+        fixability: Fixability::RarelyHandFixable,
         details: PatternDetails::AnonymousNamespaceHash { mismatches },
         doc_urls: pattern_doc_urls(PatternType::AnonymousNamespaceHash),
     })
@@ -2226,7 +2309,7 @@ pub fn detect_static_guard_counter(instructions: &[InstructionDiffOutput]) -> Op
         pattern: PatternType::StaticGuardCounter,
         confidence: Confidence::Medium,
         instruction_count: count,
-        fixability: Fixability::UsuallyUnfixable,
+        fixability: Fixability::PermuterClass,
         details: PatternDetails::StaticGuardCounter { guards },
         doc_urls: pattern_doc_urls(PatternType::StaticGuardCounter),
     })
@@ -2319,7 +2402,7 @@ pub fn detect_dead_store_elimination(instructions: &[InstructionDiffOutput]) -> 
         pattern: PatternType::DeadStoreElimination,
         confidence: Confidence::Medium,
         instruction_count: count,
-        fixability: Fixability::Unfixable,
+        fixability: Fixability::RarelyHandFixable,
         details: PatternDetails::DeadStoreElimination { count },
         doc_urls: pattern_doc_urls(PatternType::DeadStoreElimination),
     })
@@ -2331,8 +2414,55 @@ pub fn detect_dead_store_elimination(instructions: &[InstructionDiffOutput]) -> 
 /// (`__savegprlr_29`), the target has one extra local variable forcing use
 /// of an extra callee-saved register.
 pub fn detect_prologue_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
-    // Check only the first 10 instructions (prologue)
-    for instr in instructions.iter().take(10) {
+    // Scan up to the first 10 instructions to collect frame sizes and find a
+    // __savegprlr/__savefpr register mismatch.
+    let prologue = instructions.iter().take(10).collect::<Vec<_>>();
+
+    // Extract `stwu r1, -N(r1)` frame size from one side's instructions.
+    // We prefer typed_args[1] (the signed displacement) if available, otherwise
+    // fall back to parsing the raw args string.
+    let extract_frame_size = |side: &InstructionInfo| -> Option<u32> {
+        if side.opcode != "stwu" {
+            return None;
+        }
+        // Try typed_args first: stwu has args [reg, displacement, base_reg]
+        // The displacement is args[1] and is a negative Signed value.
+        if let Some(typed_args) = &side.typed_args {
+            if typed_args.len() >= 2 {
+                if let Some(v) = typed_args[1].as_i64() {
+                    if v < 0 {
+                        return Some((-v) as u32);
+                    }
+                }
+            }
+        }
+        // Fallback: parse the raw args string "r1, -N(r1)"
+        if let Some(args) = &side.args {
+            if let Some(cap) = STWU_FRAME_RE.captures(args.trim()) {
+                return cap.get(1).and_then(|m| m.as_str().parse().ok());
+            }
+        }
+        None
+    };
+
+    // Collect frame sizes from both sides of every prologue instruction.
+    let mut target_frame_size: Option<u32> = None;
+    let mut base_frame_size: Option<u32> = None;
+    for instr in &prologue {
+        if let Some(t) = &instr.target {
+            if target_frame_size.is_none() {
+                target_frame_size = extract_frame_size(t);
+            }
+        }
+        if let Some(b) = &instr.base {
+            if base_frame_size.is_none() {
+                base_frame_size = extract_frame_size(b);
+            }
+        }
+    }
+
+    // Now find the __savegprlr/__savefpr register mismatch.
+    for instr in &prologue {
         if instr.match_type != "diff_arg" {
             continue;
         }
@@ -2355,11 +2485,13 @@ pub fn detect_prologue_mismatch(instructions: &[InstructionDiffOutput]) -> Optio
                     pattern: PatternType::PrologueMismatch,
                     confidence: Confidence::High,
                     instruction_count: 1,
-                    fixability: Fixability::Unfixable,
+                    fixability: Fixability::RarelyHandFixable,
                     details: PatternDetails::PrologueMismatch {
                         info: PrologueMismatchInfo {
                             target_first_reg: t_reg,
                             base_first_reg: b_reg,
+                            target_frame_size,
+                            base_frame_size,
                         },
                     },
                     doc_urls: pattern_doc_urls(PatternType::PrologueMismatch),
@@ -2492,7 +2624,7 @@ static CHAR_ARRAY_RE: LazyLock<Regex> =
 ///
 /// Sub-classifies as:
 /// - Type: different parameter types (LIKELY_FIXABLE: add .Str())
-/// - FileLength: only char[N] dimension differs (UNFIXABLE: __FILE__ build env)
+/// - FileLength: only char[N] dimension differs (SOURCE-IMMUNE: __FILE__ build env)
 /// - Mixed: both differ
 pub fn detect_makestring_template_mismatch(
     instructions: &[InstructionDiffOutput],
@@ -2561,7 +2693,7 @@ pub fn detect_makestring_template_mismatch(
         .iter()
         .all(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength));
     let fixability = if all_file_length {
-        Fixability::Unfixable
+        Fixability::RarelyHandFixable
     } else if has_type {
         Fixability::LikelyFixable
     } else {
@@ -2586,7 +2718,9 @@ pub fn detect_makestring_template_mismatch(
 /// suffixes depending on how many callee-saved registers are used. E.g.,
 /// `__savegprlr_14` vs `__savegprlr_18`. These fall-through CRT functions
 /// are functionally equivalent — the difference is just which entry point
-/// in the save/restore chain is used. This is unfixable noise.
+/// in the save/restore chain is used. This is a prologue/epilogue convention
+/// shift — the source-permuter's `prologue_pressure` family (and equivalents)
+/// can adjust callee-saved usage; otherwise treat as cosmetic.
 fn is_crt_save_restore_diff(target: &InstructionInfo, base: &InstructionInfo) -> bool {
     static CRT_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^__(save|rest)(gpr|fpr|vmx)(lr)?(_\d+)?$").unwrap()
@@ -2801,7 +2935,7 @@ pub fn detect_address_relocation_noise(
         pattern: PatternType::AddressRelocationNoise,
         confidence: Confidence::High,
         instruction_count: count,
-        fixability: Fixability::Unfixable,
+        fixability: Fixability::RarelyHandFixable,
         details: PatternDetails::AddressRelocationNoise {
             info: AddressRelocationInfo { count, pair_count },
         },
@@ -2812,7 +2946,8 @@ pub fn detect_address_relocation_noise(
 /// Detect boolean negation pattern (subfic vs subic).
 ///
 /// The compiler may choose `subfic rD, rA, 0` or `subic rD, rA, 0` for
-/// boolean negation depending on context. This is an unfixable compiler choice.
+/// boolean negation depending on context. This is permuter-class — the
+/// emission flips with small body restructurings.
 pub fn detect_boolean_negation(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut count = 0usize;
 
@@ -2843,7 +2978,7 @@ pub fn detect_boolean_negation(instructions: &[InstructionDiffOutput]) -> Option
         pattern: PatternType::BooleanNegation,
         confidence: Confidence::High,
         instruction_count: count,
-        fixability: Fixability::Unfixable,
+        fixability: Fixability::RarelyHandFixable,
         details: PatternDetails::BooleanNegation { count },
         doc_urls: pattern_doc_urls(PatternType::BooleanNegation),
     })
@@ -3161,43 +3296,78 @@ pub fn compute_verdict(
         };
     }
 
-    // Check if ALL mismatches are attributed to unfixable patterns.
-    // If so, this function is at its limit regardless of mismatch count.
+    // Check if ALL mismatches are attributed to rarely-hand-fixable patterns.
+    // If so, this function's hand-edit path is exhausted, but the source
+    // permuter may still close the gap — recommend a permuter sweep before
+    // marking at_limit.
     if analysis.unattributed_mismatches == 0 && !analysis.patterns.is_empty() {
         let has_linker_merged = analysis.has_pattern(PatternType::LinkerMerged);
-        let all_unfixable = analysis.patterns.iter().all(|p| {
-            p.fixability == Fixability::Unfixable
-            // MakeString type mismatches become unfixable when co-detected with
-            // LinkerMerged ICF — the different template is just the linker's
-            // ICF address choice, not a real source-level type difference
+        let all_rarely_hand_fixable = analysis.patterns.iter().all(|p| {
+            p.fixability == Fixability::RarelyHandFixable
+            // MakeString type mismatches become artifact-driven when co-detected
+            // with LinkerMerged ICF — the different template is just the
+            // linker's ICF address choice, not a real source-level type diff
             || (p.pattern == PatternType::MakeStringTemplateMismatch && has_linker_merged)
         });
-        if all_unfixable {
+        // Truly source-immune patterns: linker-derived only (path hash, address
+        // reloc, ICF). Even the permuter cannot help here.
+        let all_source_immune = analysis.patterns.iter().all(|p| {
+            matches!(
+                p.pattern,
+                PatternType::AnonymousNamespaceHash
+                    | PatternType::AddressRelocationNoise
+                    | PatternType::LinkerMerged
+            )
+        });
+        if all_rarely_hand_fixable {
             let pattern_names: Vec<&str> =
                 analysis.patterns.iter().map(|p| p.pattern.as_str()).collect();
             factors.push(VerdictFactor {
-                name: "all_unfixable_patterns",
+                name: "all_rarely_hand_fixable",
                 value: serde_json::json!(true),
                 threshold: None,
-                result: "at_limit",
+                result: if all_source_immune { "at_limit_source_immune" } else { "at_limit_hand_edit" },
             });
+            if all_source_immune {
+                return Verdict {
+                    classification: VerdictClassification::AtLimit,
+                    confidence: Confidence::High,
+                    explanation: format!(
+                        "All {} mismatch(es) are source-immune build artifacts: {}.",
+                        total_mismatches,
+                        pattern_names.join(", ")
+                    ),
+                    factors,
+                    recommendation: format!(
+                        "Accept current match ({:.1}%). These are linker/path-derived; \
+                         no source mutation can close them.",
+                        match_percent.unwrap_or(0.0)
+                    ),
+                    suggestions: vec![Suggestion {
+                        action: "Accept current match — remaining differences are linker/build-environment artifacts.".to_string(),
+                        doc_url: None,
+                    }],
+                    doc_urls: verdict_doc_urls.clone(),
+                };
+            }
             return Verdict {
-                classification: VerdictClassification::AtLimit,
-                confidence: Confidence::High,
+                classification: VerdictClassification::MaybeFixable,
+                confidence: Confidence::Medium,
                 explanation: format!(
-                    "All {} mismatch(es) attributed to unfixable pattern(s): {}.",
+                    "All {} mismatch(es) attributed to rarely-hand-fixable pattern(s): {}. \
+                     A source-permuter sweep is the recommended next step.",
                     total_mismatches,
                     pattern_names.join(", ")
                 ),
                 factors,
                 recommendation: format!(
-                    "Accept current match ({:.1}%). Remaining differences are build artifacts.",
-                    match_percent.unwrap_or(0.0)
+                    "Run the source permuter on this function (~250 builds). \
+                     If no improvement after a full sweep, mark at_limit. Do NOT accept \
+                     before running the permuter — these patterns are typically permuter-class."
                 ),
                 suggestions: vec![Suggestion {
-                    action: "Accept current match — remaining differences are unfixable."
-                        .to_string(),
-                    doc_url: None,
+                    action: "Run the source permuter on this function/unit before accepting.".to_string(),
+                    doc_url: Some(format!("{}permuter-roi.md", DOC_BASE)),
                 }],
                 doc_urls: verdict_doc_urls.clone(),
             };
@@ -3242,24 +3412,24 @@ pub fn compute_verdict(
     if has_bool_mask {
         let bool_count = analysis.pattern_instruction_count(PatternType::BoolMask);
         return Verdict {
-            classification: VerdictClassification::AtLimit,
-            confidence: Confidence::High,
+            classification: VerdictClassification::MaybeFixable,
+            confidence: Confidence::Medium,
             explanation: format!(
-                "{} bool mask instruction(s) detected -- compiler bool return handling cannot be matched.",
+                "{} bool mask instruction(s) detected. Bool-return masking differences \
+                 are typically permuter-class — the source permuter can usually flip the \
+                 emission via small body restructurings.",
                 bool_count
             ),
             factors,
             recommendation: format!(
-                "Accept current match ({:.1}%). This is a compiler optimization difference.",
+                "Try a source-permuter sweep on this function. If the gap is small (1-3%) \
+                 and a full sweep yields nothing, then accept ({:.1}%) and mark at_limit. \
+                 See fixable-bool-mask.md for the bool↔byte mask shapes that can be hand-edited.",
                 match_percent.unwrap_or(0.0)
             ),
             suggestions: vec![Suggestion {
-                action: "Accept current match — bool return masking is a compiler artifact."
-                    .to_string(),
-                doc_url: Some(format!(
-                    "{}fixable-bool-mask.md#step-4-when-its-actually-unfixable",
-                    DOC_BASE
-                )),
+                action: "Run the source permuter on this function before accepting.".to_string(),
+                doc_url: Some(format!("{}fixable-bool-mask.md", DOC_BASE)),
             }],
             doc_urls: verdict_doc_urls.clone(),
         };
@@ -3283,8 +3453,12 @@ pub fn compute_verdict(
         },
     });
 
-    // High merged ratio = at limit
-    if merged_ratio >= MERGED_RATIO_AT_LIMIT {
+    // High merged ratio = at limit. ICF (identical-code-folding) is genuinely
+    // source-immune: the linker folded the target's identical function bodies
+    // and our build did not. Only accept here when match% is ALSO high — a
+    // low-match function dominated by merged calls usually means the
+    // surrounding code is still wrong; don't accept based on merged ratio alone.
+    if merged_ratio >= MERGED_RATIO_AT_LIMIT && match_percent.unwrap_or(0.0) >= 95.0 {
         let merged_summary = analysis
             .patterns
             .iter()
@@ -3296,13 +3470,15 @@ pub fn compute_verdict(
             classification: VerdictClassification::AtLimit,
             confidence: Confidence::High,
             explanation: format!(
-                "{:.1}% of mismatches are calls to linker-merged functions{}.",
+                "{:.1}% of mismatches are calls to linker-merged functions{}. \
+                 ICF is source-immune at the call site.",
                 merged_ratio * 100.0,
                 detail
             ),
             factors,
             recommendation: format!(
-                "Accept current match ({:.1}%). Effort better spent elsewhere.",
+                "Accept current match ({:.1}%). The merged-call targets are a linker \
+                 folding artifact — no source mutation will change the call target.",
                 match_percent.unwrap_or(0.0)
             ),
             suggestions: vec![Suggestion {
@@ -3312,8 +3488,38 @@ pub fn compute_verdict(
             doc_urls: verdict_doc_urls.clone(),
         };
     }
+    // High merged ratio but low overall match — surrounding code is still off.
+    if merged_ratio >= MERGED_RATIO_AT_LIMIT {
+        let merged_summary = analysis
+            .patterns
+            .iter()
+            .find(|p| p.pattern == PatternType::LinkerMerged)
+            .map(|p| p.summarize());
+        let detail =
+            merged_summary.as_ref().map(|s| format!(" ({})", s.one_line)).unwrap_or_default();
+        return Verdict {
+            classification: VerdictClassification::MaybeFixable,
+            confidence: Confidence::Medium,
+            explanation: format!(
+                "{:.1}% of mismatches are merged-call targets{}, but overall match is \
+                 only {:.1}% — surrounding code likely still has fixable differences.",
+                merged_ratio * 100.0,
+                detail,
+                match_percent.unwrap_or(0.0)
+            ),
+            factors,
+            recommendation: "Look past the merged-call noise: inspect the non-merged \
+                mismatches (control flow, regalloc) and consider a permuter sweep."
+                .to_string(),
+            suggestions: vec![Suggestion {
+                action: "Filter out merged-call diffs and inspect remaining mismatches.".to_string(),
+                doc_url: Some(format!("{}verifiable-icf.md#linker-merged-icf", DOC_BASE)),
+            }],
+            doc_urls: verdict_doc_urls.clone(),
+        };
+    }
 
-    // Check for address relocation noise (unfixable, similar to merged)
+    // Check for address relocation noise (linker-layout artifact, similar to merged)
     let addr_reloc_count = analysis.pattern_instruction_count(PatternType::AddressRelocationNoise);
     let addr_reloc_ratio =
         if total_mismatches > 0 { addr_reloc_count as f32 / total_mismatches as f32 } else { 0.0 };
@@ -3328,19 +3534,22 @@ pub fn compute_verdict(
             classification: VerdictClassification::AtLimit,
             confidence: Confidence::High,
             explanation: format!(
-                "{:.1}% of mismatches are address relocation noise (different symbol addresses).",
+                "{:.1}% of mismatches are address-relocation noise (lis/addi pairs loading \
+                 the same logical symbol at a different absolute address). This is \
+                 source-immune — it reflects .text layout, not code.",
                 addr_reloc_ratio * 100.0
             ),
             factors,
             recommendation: format!(
-                "Accept current match ({:.1}%). Address relocation is a linker artifact.",
+                "Accept current match ({:.1}%). Address relocation is a link-time \
+                 layout artifact; no source mutation can shift it.",
                 match_percent.unwrap_or(0.0)
             ),
             suggestions: vec![Suggestion {
-                action: "Accept current match — address relocation differences are unfixable."
+                action: "Accept current match — address-relocation noise is a linker artifact."
                     .to_string(),
                 doc_url: Some(format!(
-                    "{}unfixable-compiler.md#address-relocation-noise",
+                    "{}at-limit-mwcc.md#address-relocation-noise",
                     DOC_BASE
                 )),
             }],
@@ -3479,67 +3688,85 @@ pub fn compute_verdict(
             });
         }
 
+        // PRIMARY recommendation for register-swap mismatches: dispatch the
+        // source permuter. Register-allocation cascades are tedious by hand
+        // but mechanical for the permuter — declaration reorder, member-ref
+        // binding, scope widening, and slot padding all routinely crack them.
+        // Empirical: unit-wide sweeps produce ~6% conversion rate per pass,
+        // with some functions going 0% → 100% in a single round.
         suggestions.push(Suggestion {
-            action: "Reorder local variable declarations".to_string(),
+            action: "Run the source permuter on this function/unit (regswaps are permuter-class)."
+                .to_string(),
+            doc_url: Some(format!("{}permuter-roi.md", DOC_BASE)),
+        });
+        suggestions.push(Suggestion {
+            action: "Hand-edit fallback: reorder local variable declarations, move init closer to first use, hoist member-cache locals."
+                .to_string(),
             doc_url: Some(format!(
                 "{}fixable-declarations.md#variable-declaration-order",
                 DOC_BASE
             )),
         });
-        suggestions.push(Suggestion {
-            action: "Move variable initialization closer to first use".to_string(),
-            doc_url: Some(format!("{}fixable-declarations.md#variable-extraction", DOC_BASE)),
-        });
 
-        // High match% with only register swaps (and possibly other unfixable
-        // patterns) → at_limit. These are practically unfixable: callee-saved
-        // register allocation is not controllable from source.
-        let all_practically_unfixable = analysis.unattributed_mismatches == 0
-            && analysis.patterns.iter().all(|p| {
-                p.fixability == Fixability::Unfixable
-                    || p.fixability == Fixability::UsuallyUnfixable
-                    || p.pattern == PatternType::RegisterSwap
-                    || p.pattern == PatternType::PrologueMismatch
-            });
-        let high_match = match_percent.unwrap_or(0.0) >= 95.0;
+        // Register swaps are NEVER "unfixable". They are tedious by hand but
+        // routinely cracked by the permuter. Even high-match functions deserve
+        // a permuter sweep before being marked at_limit.
+        let high_match = match_percent.unwrap_or(0.0) >= 99.0;
 
-        if all_practically_unfixable && high_match {
-            let explanation = format!(
-                "{} register swap instruction(s) at {:.1}% match -- practically unfixable.",
-                register_swap_count,
-                match_percent.unwrap_or(0.0)
-            );
-            return Verdict {
-                classification: VerdictClassification::AtLimit,
-                confidence: Confidence::High,
-                explanation,
-                factors,
-                recommendation: "Accept current match — register swaps are not source-controllable."
+        let (classification, explanation, recommendation) = if high_match && register_swap_count <= 4 {
+            // Very high match (≥99%) with a tiny regswap count — likely a
+            // single FPR f0↔f1 swap or similar. Permuter still worth trying,
+            // but accepting after a sweep is reasonable.
+            (
+                VerdictClassification::MaybeFixable,
+                format!(
+                    "{} register swap instruction(s) at {:.1}% match. Small regswap counts \
+                     at very high match are often single-FPR/single-callee-saved cascades — \
+                     a permuter sweep frequently closes them; if not, accepting is reasonable.",
+                    register_swap_count,
+                    match_percent.unwrap_or(0.0)
+                ),
+                format!(
+                    "Run the source permuter on this function (~250 builds). \
+                     If no improvement, accept ({:.1}%) and mark at_limit.",
+                    match_percent.unwrap_or(0.0)
+                ),
+            )
+        } else if register_swap_count > 20 {
+            (
+                VerdictClassification::MaybeFixable,
+                format!(
+                    "{} register swap instructions — large regswap cascade, typically \
+                     driven by a single declaration-order or live-range decision. \
+                     This is permuter-class; hand-editing rarely converges.",
+                    register_swap_count
+                ),
+                "Run the source permuter on this function/unit. \
+                 Hand-edit cascades larger than ~10 instructions rarely converge from a \
+                 single edit; the permuter explores the declaration/scope-ordering space \
+                 mechanically. Only mark at_limit after a full sweep yields nothing."
                     .to_string(),
-                suggestions,
-                doc_urls: verdict_doc_urls.clone(),
-            };
-        }
-
-        let explanation = if register_swap_count > 20 {
-            format!(
-                "{} register swap instructions -- usually unfixable. Consider marking at_limit.",
-                register_swap_count
             )
         } else {
-            format!(
-                "{} register swap instruction(s) detected. May be fixable by reordering variable declarations.",
-                register_swap_count
+            (
+                VerdictClassification::MaybeFixable,
+                format!(
+                    "{} register swap instruction(s) detected. Permuter-class — \
+                     mechanical to fix via declaration/scope mutation but tedious by hand.",
+                    register_swap_count
+                ),
+                "Run the source permuter first. Hand-edit fallback: reorder variable \
+                 declarations, delay assignments, or hoist member caches into earlier scope."
+                    .to_string(),
             )
         };
 
         return Verdict {
-            classification: VerdictClassification::MaybeFixable,
+            classification,
             confidence: Confidence::Medium,
             explanation,
             factors,
-            recommendation: "Try reordering variable declarations or delaying assignments."
-                .to_string(),
+            recommendation,
             suggestions,
             doc_urls: verdict_doc_urls.clone(),
         };
@@ -3700,7 +3927,7 @@ mod tests {
         let pattern = detect_linker_merged(&instructions).expect("Should detect merged");
         assert_eq!(pattern.pattern, PatternType::LinkerMerged);
         assert_eq!(pattern.instruction_count, 3);
-        assert_eq!(pattern.fixability, Fixability::Unfixable);
+        assert_eq!(pattern.fixability, Fixability::RarelyHandFixable);
 
         if let PatternDetails::MergedFunctions { merged_functions } = &pattern.details {
             assert_eq!(merged_functions.len(), 2);
@@ -3779,7 +4006,7 @@ mod tests {
                 pattern: PatternType::LinkerMerged,
                 confidence: Confidence::High,
                 instruction_count: 4, // 4/5 = 80%
-                fixability: Fixability::Unfixable,
+                fixability: Fixability::RarelyHandFixable,
                 details: PatternDetails::MergedFunctions {
                     merged_functions: vec![MergedFunctionCount {
                         name: "merged_test".to_string(),
@@ -4419,7 +4646,7 @@ mod tests {
             pattern: PatternType::LinkerMerged,
             confidence: Confidence::High,
             instruction_count: 5,
-            fixability: Fixability::Unfixable,
+            fixability: Fixability::RarelyHandFixable,
             details: PatternDetails::MergedFunctions {
                 merged_functions: vec![
                     MergedFunctionCount { name: "merged_Read4FloatStruct".to_string(), count: 3 },
@@ -4441,7 +4668,7 @@ mod tests {
             pattern: PatternType::BoolMask,
             confidence: Confidence::High,
             instruction_count: 2,
-            fixability: Fixability::UsuallyUnfixable,
+            fixability: Fixability::PermuterClass,
             details: PatternDetails::BoolMask { bit_positions: vec![24, 31] },
             doc_urls: vec![],
         };
@@ -4835,7 +5062,7 @@ mod tests {
                 pattern: PatternType::LinkerMerged,
                 confidence: Confidence::High,
                 instruction_count: 4,
-                fixability: Fixability::Unfixable,
+                fixability: Fixability::RarelyHandFixable,
                 details: PatternDetails::MergedFunctions {
                     merged_functions: vec![
                         MergedFunctionCount { name: "merged_test".to_string(), count: 3 },
@@ -4933,7 +5160,7 @@ mod tests {
         let pattern = detect_makestring_template_mismatch(&instructions)
             .expect("Should detect MakeString __FILE__ mismatch");
         assert_eq!(pattern.pattern, PatternType::MakeStringTemplateMismatch);
-        assert_eq!(pattern.fixability, Fixability::Unfixable);
+        assert_eq!(pattern.fixability, Fixability::RarelyHandFixable);
 
         if let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pattern.details {
             assert!(matches!(mismatches[0].sub_type, MakeStringMismatchSubType::FileLength));
@@ -4986,7 +5213,7 @@ mod tests {
             .expect("Should detect address relocation noise");
         assert_eq!(pattern.pattern, PatternType::AddressRelocationNoise);
         assert_eq!(pattern.instruction_count, 2);
-        assert_eq!(pattern.fixability, Fixability::Unfixable);
+        assert_eq!(pattern.fixability, Fixability::RarelyHandFixable);
 
         if let PatternDetails::AddressRelocationNoise { info } = &pattern.details {
             assert_eq!(info.count, 2);
@@ -5054,7 +5281,7 @@ mod tests {
             detect_boolean_negation(&instructions).expect("Should detect boolean negation");
         assert_eq!(pattern.pattern, PatternType::BooleanNegation);
         assert_eq!(pattern.instruction_count, 1);
-        assert_eq!(pattern.fixability, Fixability::Unfixable);
+        assert_eq!(pattern.fixability, Fixability::RarelyHandFixable);
 
         if let PatternDetails::BooleanNegation { count } = &pattern.details {
             assert_eq!(*count, 1);
@@ -5230,7 +5457,7 @@ mod tests {
                 pattern: PatternType::AddressRelocationNoise,
                 confidence: Confidence::High,
                 instruction_count: 4, // 4/5 = 80%
-                fixability: Fixability::Unfixable,
+                fixability: Fixability::RarelyHandFixable,
                 details: PatternDetails::AddressRelocationNoise {
                     info: AddressRelocationInfo { count: 4, pair_count: 2 },
                 },
@@ -5242,7 +5469,7 @@ mod tests {
 
         let verdict = compute_verdict(&summary, &analysis, Some(95.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::AtLimit);
-        assert!(verdict.explanation.contains("address relocation"));
+        assert!(verdict.explanation.contains("address-relocation"));
     }
 
     #[test]
@@ -5288,8 +5515,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verdict_at_limit_register_swap_high_match() {
-        // 99%+ match with only register swaps → should be AtLimit
+    fn test_verdict_high_match_register_swap_recommends_permuter() {
+        // 99%+ match with only register swaps used to be classified AtLimit,
+        // but regswaps are permuter-class — the verdict should now nudge the
+        // user toward a permuter sweep before accepting.
         let summary = InstructionSummary {
             total: 100,
             equal: 95,
@@ -5316,7 +5545,9 @@ mod tests {
         };
 
         let verdict = compute_verdict(&summary, &analysis, Some(99.0), 100, 100);
-        assert_eq!(verdict.classification, VerdictClassification::AtLimit);
+        // High-match register swaps are MaybeFixable (permuter can crack them)
+        // rather than AtLimit — the permuter should be given a chance first.
+        assert_eq!(verdict.classification, VerdictClassification::MaybeFixable);
     }
 
     #[test]
