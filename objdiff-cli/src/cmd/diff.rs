@@ -547,11 +547,89 @@ pub fn run(args: Args) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let (object, unit_idx) = if let Some(u) = u {
-                objects
-                    .iter()
-                    .find(|(obj, _)| obj.name == *u)
-                    .map(|(obj, idx)| (obj, *idx))
-                    .ok_or_else(|| anyhow!("Unit not found: {}", u))?
+                // Try exact match first (fast path, preserves any agent that
+                // passes the canonical name).
+                let exact = objects.iter().find(|(obj, _)| obj.name == *u);
+                if let Some((obj, idx)) = exact {
+                    (obj, *idx)
+                } else {
+                    // Suffix/contains match: accept "system/synth/MidiSynth"
+                    // or just "MidiSynth" when the canonical name is
+                    // "main/system/synth/MidiSynth". Match priority:
+                    //   1. Path-component suffix: name == u OR name ends with "/" + u
+                    //   2. Basename-only match: final path segment == u
+                    //   3. Substring fallback (only if previous yields nothing)
+                    let needle = u.as_str();
+                    let suffix_pattern = format!("/{}", needle);
+                    let mut suffix_hits: Vec<_> = objects
+                        .iter()
+                        .filter(|(obj, _)| obj.name.ends_with(&suffix_pattern))
+                        .collect();
+                    if suffix_hits.is_empty() {
+                        // Basename match: final segment equals needle (handles
+                        // single-token names like "MidiSynth")
+                        suffix_hits = objects
+                            .iter()
+                            .filter(|(obj, _)| {
+                                obj.name.rsplit('/').next() == Some(needle)
+                            })
+                            .collect();
+                    }
+                    if suffix_hits.is_empty() {
+                        // Last resort: substring anywhere in the name.
+                        suffix_hits = objects
+                            .iter()
+                            .filter(|(obj, _)| obj.name.contains(needle))
+                            .collect();
+                    }
+                    match suffix_hits.len() {
+                        0 => {
+                            return Err(anyhow!(
+                                "Unit not found: {}\n\
+                                 Hint: pass a path-suffix (e.g. `system/synth/MidiSynth`) \
+                                 or basename (e.g. `MidiSynth`) — these resolve against \
+                                 the project's full unit names (e.g. `main/system/synth/MidiSynth`).",
+                                u
+                            ));
+                        }
+                        1 => {
+                            let (obj, idx) = suffix_hits[0];
+                            // Tell the user what we resolved to so they can
+                            // copy the canonical name into scripts if needed.
+                            // Skip the hint when input already equals the canonical name.
+                            if obj.name != *u {
+                                eprintln!(
+                                    "objdiff: resolved unit `{}` -> `{}`",
+                                    u, obj.name
+                                );
+                            }
+                            (obj, *idx)
+                        }
+                        n => {
+                            let mut names: Vec<&str> =
+                                suffix_hits.iter().map(|(obj, _)| obj.name.as_str()).collect();
+                            names.sort();
+                            let preview: Vec<&&str> = names.iter().take(8).collect();
+                            let trailer = if n > 8 {
+                                format!("\n  ... and {} more", n - 8)
+                            } else {
+                                String::new()
+                            };
+                            return Err(anyhow!(
+                                "Ambiguous unit `{}`: {} matches.\n  {}{}\n\
+                                 Use a longer suffix or the canonical name.",
+                                u,
+                                n,
+                                preview
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n  "),
+                                trailer
+                            ));
+                        }
+                    }
+                }
             } else if let Some(symbol_name) = &args.symbol {
                 // Build a minimal diff config for demangling during symbol lookup
                 let mut lookup_config = DiffObjConfig::default();
@@ -2201,17 +2279,41 @@ pub fn analyze_symbol(
 }
 
 /// Get guidance text based on match percentage.
+///
+/// IMPORTANT: Do not tell agents to "accept" or "give up" here. Match%
+/// alone is not enough information to declare a function at-limit. The
+/// verdict (`compute_verdict`) does that classification using detected
+/// patterns; this tier-text only suggests where to start looking.
+///
+/// The source permuter is the first-line next step for anything in the
+/// 95-99.5% band — register-allocation, FPR scheduling, bool materialization,
+/// and stack-slot inversions are all permuter-class even when patterns
+/// suggest otherwise.
 fn match_guidance(percent: f32) -> &'static str {
     match percent {
-        p if p >= 99.0 => {
-            "Often unfixable (linker-merged, register allocation) - verify patterns first"
+        p if p >= 99.5 => {
+            "Verdict-driven: check `verdict.classification` — likely at_limit only \
+             if a source-immune pattern (anon-namespace-hash, address-relocation, \
+             ICF) is detected. Otherwise run the source permuter on this function."
         }
         p if p >= 95.0 => {
-            "Check for unfixable patterns; if none, try variable reorder/inline assignment"
+            "High-match band. Run the source permuter as the first action (regswaps, \
+             FPR scheduling, and bool materialization cascade here). Hand-edit \
+             fallbacks: variable reorder, inline assignment, member-cache hoists."
         }
-        p if p >= 80.0 => "Fine-tuning: check comparison patterns, casting, operator selection",
-        p if p >= 50.0 => "Structural issues: try control flow, variable declarations",
-        _ => "Likely missing implementation - check RB3 reference, Ghidra decompilation",
+        p if p >= 80.0 => {
+            "Fine-tuning band. Check comparison patterns (>= vs >, signed vs \
+             unsigned), casting, commutative-operand ordering, then run the \
+             permuter on any residual cascade."
+        }
+        p if p >= 50.0 => {
+            "Structural band. Inspect control flow, variable declarations, \
+             and missing branches before reaching for the permuter."
+        }
+        _ => {
+            "Likely missing implementation or wrong skeleton — start from \
+             m2c output + Ghidra decompilation; do not run the permuter yet."
+        }
     }
 }
 
@@ -3244,10 +3346,12 @@ mod tests {
     #[test]
     fn test_match_guidance_thresholds() {
         let g99 = match_guidance(99.5);
-        assert!(g99.contains("unfixable"));
+        assert!(g99.contains("Verdict-driven"));
+        assert!(g99.contains("permuter"));
 
         let g95 = match_guidance(96.0);
-        assert!(g95.contains("unfixable patterns"));
+        assert!(g95.contains("High-match"));
+        assert!(g95.contains("permuter"));
 
         let g80 = match_guidance(85.0);
         assert!(g80.contains("Fine-tuning"));
