@@ -707,6 +707,16 @@ fn matching_symbols(
             }
         }
     }
+    // MSVC EH funclet fallback: pair `__unwind$NNN`/`__catch$NNN`/`fn_<addr>` symbols
+    // by byte-equality when name-based pairing fails. The two sides number funclets
+    // per-translation-unit, so the integers never agree, and the target side sometimes
+    // loses the funclet name entirely (becomes `fn_<addr>`) when dtk's splitter sees a
+    // COMDAT name collision across object files. See
+    // docs/sessions/2026-05-26-msvc-funclet-pairing.md for the full investigation.
+    if let (Some(left), Some(right)) = (left, right) {
+        pair_funclets_by_bytes(left, right, &mut left_used, &mut right_used, &mut matches);
+    }
+
     if let Some(right) = right {
         // Do two passes for nameless literals. The first only pairs up perfect matches to ensure
         // those are correct first, while the second pass catches near matches.
@@ -736,6 +746,195 @@ fn matching_symbols(
         }
     }
     Ok(matches)
+}
+
+/// True for MSVC EH funclet symbols that should participate in byte-fallback pairing:
+/// `__unwind$NNN`, `__catch$NNN`, `__unwind__merged_<addr>`, `fn_<8 hex digits>`.
+fn is_funclet_like(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("__unwind$") {
+        return rest.chars().all(|c| c.is_ascii_digit());
+    }
+    if let Some(rest) = name.strip_prefix("__catch$") {
+        return rest.chars().all(|c| c.is_ascii_digit());
+    }
+    if name.starts_with("__unwind__merged_") {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix("fn_") {
+        return rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    false
+}
+
+/// Extract a symbol's byte payload with all relocation-targeted bytes zeroed.
+/// Both sides emit COFF with zero immediates at every relocation site, so
+/// after masking we can compare the pure instruction encoding.
+fn funclet_signature(obj: &Object, sym_idx: usize) -> Option<alloc::vec::Vec<u8>> {
+    let symbol = obj.symbols.get(sym_idx)?;
+    if symbol.size == 0 {
+        return None;
+    }
+    let section = obj.sections.get(symbol.section?)?;
+    let start = symbol.address.checked_sub(section.address)? as usize;
+    let end = start.checked_add(symbol.size as usize)?;
+    let raw = section.data.get(start..end)?;
+    let mut bytes = raw.to_vec();
+    // Mask reloc-affected bytes. PowerPC ELF/COFF relocs cover 4 bytes; mask the
+    // low 2 bytes (for @h/@l/@ha 16-bit halves) and rel24 displacement bits. Simplest
+    // robust approach: zero the whole 4-byte instruction word at each reloc address.
+    let sym_start_abs = symbol.address;
+    let sym_end_abs = sym_start_abs + symbol.size;
+    for reloc in &section.relocations {
+        if reloc.address < sym_start_abs || reloc.address >= sym_end_abs {
+            continue;
+        }
+        let off = (reloc.address - sym_start_abs) as usize;
+        // zero a 4-byte window starting at the reloc address (PowerPC instruction-sized).
+        let end_off = (off + 4).min(bytes.len());
+        for b in &mut bytes[off..end_off] {
+            *b = 0;
+        }
+    }
+    Some(bytes)
+}
+
+fn pair_funclets_by_bytes(
+    left: &Object,
+    right: &Object,
+    left_used: &mut BTreeSet<usize>,
+    right_used: &mut BTreeSet<usize>,
+    matches: &mut Vec<SymbolMatch>,
+) {
+    // Collect unmatched funclet symbols on each side with their masked byte signature.
+    let mut left_candidates: Vec<(usize, alloc::vec::Vec<u8>)> = Vec::new();
+    for (idx, sym) in left.symbols.iter().enumerate() {
+        if left_used.contains(&idx) || sym.size == 0 || sym.flags.contains(SymbolFlag::Ignored) {
+            continue;
+        }
+        if !is_funclet_like(&sym.name) {
+            continue;
+        }
+        if symbol_section_kind(left, sym) != SectionKind::Code {
+            continue;
+        }
+        if let Some(sig) = funclet_signature(left, idx) {
+            left_candidates.push((idx, sig));
+        }
+    }
+    let mut right_candidates: Vec<(usize, alloc::vec::Vec<u8>)> = Vec::new();
+    for (idx, sym) in right.symbols.iter().enumerate() {
+        if right_used.contains(&idx) || sym.size == 0 || sym.flags.contains(SymbolFlag::Ignored) {
+            continue;
+        }
+        if !is_funclet_like(&sym.name) {
+            continue;
+        }
+        if symbol_section_kind(right, sym) != SectionKind::Code {
+            continue;
+        }
+        if let Some(sig) = funclet_signature(right, idx) {
+            right_candidates.push((idx, sig));
+        }
+    }
+
+    // Pass 1: exact byte-equality pairings, only when uniquely determined on both sides.
+    // (If multiple left candidates share the same signature, defer them to pass 2; we
+    // can't pick a winner without parent-association data.)
+    use alloc::collections::BTreeMap;
+    let mut left_by_sig: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
+    for (idx, sig) in &left_candidates {
+        left_by_sig.entry(sig.as_slice()).or_default().push(*idx);
+    }
+    let mut right_by_sig: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
+    for (idx, sig) in &right_candidates {
+        right_by_sig.entry(sig.as_slice()).or_default().push(*idx);
+    }
+    for (sig, left_indices) in &left_by_sig {
+        if left_indices.len() != 1 {
+            continue;
+        }
+        let Some(right_indices) = right_by_sig.get(sig) else { continue };
+        if right_indices.len() != 1 {
+            continue;
+        }
+        let l_idx = left_indices[0];
+        let r_idx = right_indices[0];
+        if left_used.contains(&l_idx) || right_used.contains(&r_idx) {
+            continue;
+        }
+        matches.push(SymbolMatch {
+            left: Some(l_idx),
+            right: Some(r_idx),
+            prev: None,
+            section_kind: SectionKind::Code,
+        });
+        left_used.insert(l_idx);
+        right_used.insert(r_idx);
+    }
+
+    // Pass 2: ambiguous exact-match groups. Greedily pair within each group.
+    let mut pass2_pairs: Vec<(usize, usize)> = Vec::new();
+    for (sig, left_indices) in &left_by_sig {
+        let Some(right_indices) = right_by_sig.get(sig) else { continue };
+        let l_remaining: Vec<usize> = left_indices.iter().copied().filter(|i| !left_used.contains(i)).collect();
+        let r_remaining: Vec<usize> = right_indices.iter().copied().filter(|i| !right_used.contains(i)).collect();
+        for (l_idx, r_idx) in l_remaining.iter().zip(r_remaining.iter()) {
+            pass2_pairs.push((*l_idx, *r_idx));
+        }
+    }
+    for (l_idx, r_idx) in pass2_pairs {
+        if left_used.contains(&l_idx) || right_used.contains(&r_idx) {
+            continue;
+        }
+        matches.push(SymbolMatch {
+            left: Some(l_idx),
+            right: Some(r_idx),
+            prev: None,
+            section_kind: SectionKind::Code,
+        });
+        left_used.insert(l_idx);
+        right_used.insert(r_idx);
+    }
+
+    // Pass 3: same-size fuzzy match. For each remaining left funclet, find the best
+    // unmatched right funclet of the same size by Hamming-equality of bytes.
+    let mut remaining_left: Vec<(usize, &alloc::vec::Vec<u8>)> =
+        left_candidates.iter().filter(|(i, _)| !left_used.contains(i)).map(|(i, s)| (*i, s)).collect();
+    let mut remaining_right: Vec<(usize, &alloc::vec::Vec<u8>)> =
+        right_candidates.iter().filter(|(i, _)| !right_used.contains(i)).map(|(i, s)| (*i, s)).collect();
+    // Pair greedily: highest similarity first.
+    let mut scored: Vec<(usize, usize, usize)> = Vec::new(); // (matching_bytes, l, r)
+    for (l_idx, l_sig) in &remaining_left {
+        for (r_idx, r_sig) in &remaining_right {
+            if l_sig.len() != r_sig.len() {
+                continue;
+            }
+            let matching = l_sig.iter().zip(r_sig.iter()).filter(|(a, b)| a == b).count();
+            // Require at least 50% byte equality after masking — purely a tunable
+            // threshold; in practice the funclets either match cleanly (95%+) or
+            // they're truly different code.
+            if matching * 2 >= l_sig.len() {
+                scored.push((matching, *l_idx, *r_idx));
+            }
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, l_idx, r_idx) in scored {
+        if left_used.contains(&l_idx) || right_used.contains(&r_idx) {
+            continue;
+        }
+        matches.push(SymbolMatch {
+            left: Some(l_idx),
+            right: Some(r_idx),
+            prev: None,
+            section_kind: SectionKind::Code,
+        });
+        left_used.insert(l_idx);
+        right_used.insert(r_idx);
+    }
+    let _ = (remaining_left.len(), remaining_right.len()); // suppress warning on no-op shrink
+    remaining_left.clear();
+    remaining_right.clear();
 }
 
 fn unmatched_symbols<'obj, 'used>(

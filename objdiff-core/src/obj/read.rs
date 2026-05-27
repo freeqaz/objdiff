@@ -52,6 +52,13 @@ fn get_normalized_symbol_name(name: &str) -> Option<String> {
         Some(format!("{prefix}@class${DUMMY_UNIQUE_ID}{suffix}"))
     } else if let Some((prefix, suffix)) = name.split_once('$')
         && suffix.chars().all(char::is_numeric)
+        // MSVC EH funclets (__unwind$NNN, __catch$NNN) are per-TU numbered and
+        // share no common namespace between target and base objects. Collapsing
+        // them all to __unwind$0000 makes objdiff greedily pair the first
+        // target funclet with the first base funclet, producing wildly wrong
+        // diffs. Leave them un-normalized so the byte-equality fallback in
+        // diff::matching_symbols can pair them properly.
+        && !matches!(prefix, "__unwind" | "__catch")
     {
         // Match Metrowerks symbol$1234 against symbol$2345
         Some(format!("{prefix}${DUMMY_UNIQUE_ID}"))
