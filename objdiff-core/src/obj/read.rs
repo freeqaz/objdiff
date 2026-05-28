@@ -1355,4 +1355,33 @@ mod test {
         assert_eq!(sections[1].data.0, (1..=12).collect::<Vec<_>>());
         insta::assert_debug_snapshot!((sections, symbols));
     }
+
+    /// MSVC EH funclet names (`__unwind$NNN`, `__catch$NNN`) must NOT be normalized:
+    /// the per-translation-unit integer is unique on each side, and collapsing them
+    /// all to `__unwind$0000` makes objdiff pair the first target funclet with the
+    /// first base funclet (wildly wrong). The byte-equality fallback in
+    /// `diff::matching_symbols` pairs them properly when the names are left intact.
+    #[test]
+    fn test_normalize_preserves_msvc_eh_funclets() {
+        // __unwind$NNN: must be left alone
+        assert_eq!(get_normalized_symbol_name("__unwind$117007"), None);
+        assert_eq!(get_normalized_symbol_name("__unwind$0"), None);
+        // __catch$NNN: must be left alone
+        assert_eq!(get_normalized_symbol_name("__catch$12"), None);
+        assert_eq!(get_normalized_symbol_name("__catch$999"), None);
+    }
+
+    /// Narrowed the rule — didn't delete it. Generic Metrowerks-style `name$NNN`
+    /// symbols still collapse to `name$0000` so pairing across object files works.
+    #[test]
+    fn test_normalize_generic_dollar_suffix_still_normalizes() {
+        // Generic numeric-suffix symbol still gets the $NNN -> $0000 treatment.
+        assert_eq!(get_normalized_symbol_name("symbol$1234"), Some("symbol$0000".to_string()));
+        assert_eq!(get_normalized_symbol_name("foo$42"), Some("foo$0000".to_string()));
+        // Two different MW-style suffixes normalize to the same form (pairing works).
+        assert_eq!(
+            get_normalized_symbol_name("widget$1111"),
+            get_normalized_symbol_name("widget$2222")
+        );
+    }
 }

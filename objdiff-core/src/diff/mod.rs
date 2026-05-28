@@ -1129,3 +1129,135 @@ pub enum DiffSide {
     /// The base side of the diff.
     Base,
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::*;
+    use crate::obj::{RelocationFlags, Section, SectionData, SymbolKind};
+
+    /// `is_funclet_like` defines exactly which symbols are eligible for byte-equality
+    /// fallback pairing in `pair_funclets_by_bytes`. Lock both the positive and
+    /// negative cases so we don't accidentally widen the predicate (e.g. start
+    /// matching ordinary `fn_XXXXXXXX`-style functions outside of EH funclets).
+    #[test]
+    fn test_is_funclet_like_positives() {
+        assert!(is_funclet_like("__unwind$0"));
+        assert!(is_funclet_like("__unwind$117007"));
+        assert!(is_funclet_like("__catch$12"));
+        assert!(is_funclet_like("__catch$999"));
+        assert!(is_funclet_like("__unwind__merged_82345678"));
+        // dtk's splitter sometimes emits a target funclet as `fn_<8 hex digits>` when
+        // the original COMDAT name collides across object files.
+        assert!(is_funclet_like("fn_8239FCE0"));
+        assert!(is_funclet_like("fn_00000000"));
+    }
+
+    #[test]
+    fn test_is_funclet_like_negatives() {
+        // Mangled C++ symbol — not a funclet.
+        assert!(!is_funclet_like("?Foo@Bar@@QAEXXZ"));
+        // PowerPC compiler-emitted helper — not a funclet.
+        assert!(!is_funclet_like("__savegprlr_14"));
+        // Label-style synthetic symbol — not a funclet.
+        assert!(!is_funclet_like("lbl_82F64970"));
+        // Ordinary MSVC mangled name — not a funclet.
+        assert!(!is_funclet_like("?ClassName@@QAEXXZ"));
+        // Empty / wrong-length / non-hex `fn_` candidates.
+        assert!(!is_funclet_like("fn_"));
+        assert!(!is_funclet_like("fn_123")); // too short
+        assert!(!is_funclet_like("fn_GGGGGGGG")); // not hex
+        // `__unwind$` followed by non-digits.
+        assert!(!is_funclet_like("__unwind$abc"));
+        // Plain text.
+        assert!(!is_funclet_like("main"));
+        assert!(!is_funclet_like(""));
+    }
+
+    /// Build a minimal `Object` containing a single `.text` section with the given
+    /// bytes, one symbol named `name` covering the whole section, optionally with
+    /// the given relocations attached to the section.
+    fn make_funclet_obj(name: &str, bytes: Vec<u8>, relocs: Vec<Relocation>) -> Object {
+        let size = bytes.len() as u64;
+        let section = Section {
+            id: ".text-0".to_string(),
+            name: ".text".to_string(),
+            address: 0,
+            size,
+            kind: SectionKind::Code,
+            data: SectionData(bytes),
+            relocations: relocs,
+            ..Default::default()
+        };
+        let symbol = Symbol {
+            name: name.to_string(),
+            address: 0,
+            size,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        };
+        Object { symbols: vec![symbol], sections: vec![section], ..Default::default() }
+    }
+
+    /// Pass-1 fixture: target side has `fn_82345678` (dtk's stripped-COMDAT name),
+    /// base side has `__unwind$42` (MSVC EH funclet number). The bytes are
+    /// identical *after* zeroing the 4-byte reloc window at offset 4, so the
+    /// signature-based pairing must produce a single match.
+    #[test]
+    fn test_pair_funclets_by_bytes_pass1_pairs_fn_with_unwind() {
+        // 8 bytes: a "lis" word at offset 0 and a relocated word at offset 4 that
+        // differs between the two sides. After the 4-byte reloc-window zero, the
+        // signatures are equal.
+        let target_bytes = vec![0x3C, 0x60, 0x82, 0x34, 0xAA, 0xBB, 0xCC, 0xDD];
+        let base_bytes = vec![0x3C, 0x60, 0x82, 0x34, 0x11, 0x22, 0x33, 0x44];
+        let reloc = Relocation {
+            flags: RelocationFlags::Coff(0),
+            address: 4,
+            target_symbol: 0,
+            addend: 0,
+        };
+
+        let left = make_funclet_obj("fn_82345678", target_bytes, vec![reloc.clone()]);
+        let right = make_funclet_obj("__unwind$42", base_bytes, vec![reloc]);
+
+        let mut left_used = BTreeSet::new();
+        let mut right_used = BTreeSet::new();
+        let mut matches = Vec::new();
+
+        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+
+        assert_eq!(matches.len(), 1, "expected exactly one funclet pairing, got {}", matches.len());
+        let m = &matches[0];
+        assert_eq!(m.left, Some(0));
+        assert_eq!(m.right, Some(0));
+        assert_eq!(m.section_kind, SectionKind::Code);
+        assert!(left_used.contains(&0));
+        assert!(right_used.contains(&0));
+    }
+
+    /// Sanity check: two funclets with *different* underlying bytes (even after
+    /// reloc masking) must not be paired. This guards against a buggy pass-1
+    /// that pairs any unmatched funclet-like symbol regardless of signature.
+    #[test]
+    fn test_pair_funclets_by_bytes_does_not_pair_dissimilar_bytes() {
+        let target_bytes = vec![0x3C, 0x60, 0x82, 0x34, 0x00, 0x00, 0x00, 0x00];
+        let base_bytes = vec![0x60, 0x00, 0x00, 0x00, 0x4E, 0x80, 0x00, 0x20];
+
+        let left = make_funclet_obj("fn_DEADBEEF", target_bytes, vec![]);
+        let right = make_funclet_obj("__unwind$7", base_bytes, vec![]);
+
+        let mut left_used = BTreeSet::new();
+        let mut right_used = BTreeSet::new();
+        let mut matches = Vec::new();
+
+        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+
+        // Pass 3 fuzzy requires >=50% byte equality. These two share fewer than
+        // half their bytes after masking, so nothing should pair.
+        assert!(matches.is_empty(), "expected no pairings, got {}", matches.len());
+        assert!(left_used.is_empty());
+        assert!(right_used.is_empty());
+    }
+}
