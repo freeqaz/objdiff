@@ -837,6 +837,27 @@ fn pair_funclets_by_bytes(
         }
     }
 
+    // Make the greedy assignment below deterministic w.r.t. symbol-table order.
+    //
+    // The candidate lists are collected in symbol-table iteration order. When a
+    // signature group is over-subscribed (e.g. N identical target funclets vs M<N
+    // identical base funclets, which happens for compiler-generated static-init
+    // thunks that the splitter renamed to `fn_<addr>`), passes 2 and 3 below pair
+    // greedily, so *which* of the N candidates win the M exact partners depends on
+    // their relative position in the symbol table. If an upstream change reorders
+    // the symbol table (e.g. dtk's phantom-symbol fix), a different subset wins, and
+    // the losers fall through to pass 3's fuzzy matching against a non-identical
+    // candidate — producing a spurious match-percent "regression" even though the
+    // funclet's own bytes never changed.
+    //
+    // Sorting both candidate lists by symbol name (which is stable and unique on
+    // both sides — `fn_<addr>` encodes the retail address, `__unwind$NNN` the
+    // funclet index) makes the per-signature index vectors, the pass-2 zip, and the
+    // pass-3 scored insertion order all independent of symbol-table order. The
+    // resulting pairing is then a pure function of the object contents.
+    left_candidates.sort_by(|a, b| left.symbols[a.0].name.cmp(&left.symbols[b.0].name));
+    right_candidates.sort_by(|a, b| right.symbols[a.0].name.cmp(&right.symbols[b.0].name));
+
     // Pass 1: exact byte-equality pairings, only when uniquely determined on both sides.
     // (If multiple left candidates share the same signature, defer them to pass 2; we
     // can't pick a winner without parent-association data.)
@@ -918,7 +939,14 @@ fn pair_funclets_by_bytes(
             }
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    // Sort by descending byte-similarity, breaking ties by symbol name so the greedy
+    // assignment is fully deterministic w.r.t. symbol-table order (not relying on
+    // sort stability + insertion order).
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| left.symbols[a.1].name.cmp(&left.symbols[b.1].name))
+            .then_with(|| right.symbols[a.2].name.cmp(&right.symbols[b.2].name))
+    });
     for (_, l_idx, r_idx) in scored {
         if left_used.contains(&l_idx) || right_used.contains(&r_idx) {
             continue;
