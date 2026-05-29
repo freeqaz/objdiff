@@ -917,6 +917,49 @@ fn pair_funclets_by_bytes(
         right_used.insert(r_idx);
     }
 
+    // Pass 2b: over-subscribed exact-match overflow. After pass 2, a signature group
+    // can have N target funclets but only M<N byte-identical base funclets, so N-M
+    // targets remain unmatched even though their bytes are *byte-identical* (after
+    // reloc masking) to a base symbol. This happens for compiler-generated funclets
+    // that get ICF-folded / duplicated (e.g. the BandDirector `fn_<addr>` static-init
+    // thunks: 7 identical target funclets vs 5 identical base ones). Strict 1:1 would
+    // shove these overflow targets into pass-3 fuzzy matching against a *non-identical*
+    // base symbol, dragging their match-percent below the group's true ceiling for no
+    // real reason — and *which* targets lose flips whenever the symbol table is
+    // reordered (e.g. dtk's phantom-symbol prune grew this group 6->7), producing a
+    // spurious regression.
+    //
+    // Since the overflow target's bytes genuinely match a base symbol, pair it
+    // many-to-one to one of the identical base partners. This is sound: byte-identical
+    // funclets diff to the same result regardless of which copy they pair with, so the
+    // target's reported match-percent is the honest one. We reuse an already-consumed
+    // base index *without* clearing `right_used` (it stays owned by its pass-1/2
+    // winner; the base-side display just reflects the last writer, which is identical
+    // bytes anyway). We DO mark the overflow target `left_used` so it never reaches the
+    // fuzzy pass. Crucially this fires ONLY on an exact signature-key hit in
+    // `right_by_sig`, so funclets that differ from every base symbol are untouched.
+    for (sig, left_indices) in &left_by_sig {
+        let Some(right_indices) = right_by_sig.get(sig) else { continue };
+        // A deterministic identical base partner for this signature: the name-sorted
+        // first index (right_candidates were sorted by name, so right_by_sig vectors
+        // preserve that order). Any of them is byte-identical by construction.
+        let Some(&partner) = right_indices.first() else { continue };
+        for &l_idx in left_indices.iter() {
+            if left_used.contains(&l_idx) {
+                continue;
+            }
+            matches.push(SymbolMatch {
+                left: Some(l_idx),
+                right: Some(partner),
+                prev: None,
+                section_kind: SectionKind::Code,
+            });
+            left_used.insert(l_idx);
+            // Intentionally do NOT touch `right_used`: many-to-one onto an identical
+            // base symbol is allowed for the overflow.
+        }
+    }
+
     // Pass 3: same-size fuzzy match. For each remaining left funclet, find the best
     // unmatched right funclet of the same size by Hamming-equality of bytes.
     let mut remaining_left: Vec<(usize, &alloc::vec::Vec<u8>)> =
@@ -1287,5 +1330,188 @@ mod tests {
         assert!(matches.is_empty(), "expected no pairings, got {}", matches.len());
         assert!(left_used.is_empty());
         assert!(right_used.is_empty());
+    }
+
+    /// Build an `Object` with one `.text` section holding several equal-size funclet
+    /// symbols laid out back-to-back. `funcs` is `(name, bytes)`. Relocations are
+    /// applied at absolute section offsets in `relocs`.
+    fn make_multi_funclet_obj(funcs: &[(&str, Vec<u8>)], relocs: Vec<Relocation>) -> Object {
+        let mut data = Vec::new();
+        let mut symbols = Vec::new();
+        let mut addr = 0u64;
+        for (name, bytes) in funcs {
+            let size = bytes.len() as u64;
+            symbols.push(Symbol {
+                name: name.to_string(),
+                address: addr,
+                size,
+                kind: SymbolKind::Function,
+                section: Some(0),
+                ..Default::default()
+            });
+            data.extend_from_slice(bytes);
+            addr += size;
+        }
+        let section = Section {
+            id: ".text-0".to_string(),
+            name: ".text".to_string(),
+            address: 0,
+            size: data.len() as u64,
+            kind: SectionKind::Code,
+            data: SectionData(data),
+            relocations: relocs,
+            ..Default::default()
+        };
+        Object { symbols, sections: vec![section], ..Default::default() }
+    }
+
+    /// Over-subscription regression (the BandDirector `fn_<addr>` case).
+    ///
+    /// The target side has N=3 funclets whose masked signatures are all byte-identical;
+    /// the base side has only M=2 byte-identical funclets plus one *different* funclet.
+    /// Strict 1:1 would pair 2 targets to the 2 identical base funclets and shove the
+    /// 3rd (overflow) target into pass-3 fuzzy matching against the non-identical base
+    /// funclet, dragging it below the group ceiling. With the pass-2b overflow fix, the
+    /// overflow target must instead pair many-to-one to one of the *identical* base
+    /// funclets, and the non-identical base funclet must be left unpaired.
+    #[test]
+    fn test_pair_funclets_oversubscribed_identical_group_pairs_overflow_to_identical() {
+        // 8-byte funclets. Byte 4..8 is reloc-masked, so it doesn't affect the signature.
+        // "A" signature (first 4 bytes 3C 60 82 34); "B" signature is different code.
+        let sig_a_1 = vec![0x3C, 0x60, 0x82, 0x34, 0x11, 0x11, 0x11, 0x11];
+        let sig_a_2 = vec![0x3C, 0x60, 0x82, 0x34, 0x22, 0x22, 0x22, 0x22];
+        let sig_a_3 = vec![0x3C, 0x60, 0x82, 0x34, 0x33, 0x33, 0x33, 0x33];
+        let sig_a_b1 = vec![0x3C, 0x60, 0x82, 0x34, 0x44, 0x44, 0x44, 0x44];
+        let sig_a_b2 = vec![0x3C, 0x60, 0x82, 0x34, 0x55, 0x55, 0x55, 0x55];
+        // Different code, but >=50% byte-equal to sig_a after masking (so pass-3 fuzzy
+        // *would* greedily grab it if the overflow reached pass 3): first two bytes
+        // match (0x3C 0x60), the rest differs.
+        let sig_diff = vec![0x3C, 0x60, 0x00, 0x00, 0x66, 0x66, 0x66, 0x66];
+
+        // Relocation at offset 4 of every 8-byte funclet, so bytes 4..8 are masked.
+        let mut relocs = Vec::new();
+        for i in 0..6u64 {
+            relocs.push(Relocation {
+                flags: RelocationFlags::Coff(0),
+                address: i * 8 + 4,
+                target_symbol: 0,
+                addend: 0,
+            });
+        }
+
+        // Target: 3 identical-signature funclets. Names chosen so that after the name
+        // sort, fn_82282350 is the lexicographic overflow loser (it has no exact 1:1
+        // partner left after pass 2 consumes the two base funclets).
+        let left = make_multi_funclet_obj(
+            &[
+                ("fn_82281000", sig_a_1.clone()),
+                ("fn_82282000", sig_a_2.clone()),
+                ("fn_82283000", sig_a_3.clone()),
+            ],
+            relocs.iter().take(3).cloned().collect(),
+        );
+        // Base: 2 identical-signature funclets + 1 different funclet.
+        let right = make_multi_funclet_obj(
+            &[
+                ("__unwind$100", sig_a_b1.clone()),
+                ("__unwind$200", sig_a_b2.clone()),
+                ("__unwind$300", sig_diff.clone()),
+            ],
+            relocs.iter().take(3).cloned().collect(),
+        );
+
+        let mut left_used = BTreeSet::new();
+        let mut right_used = BTreeSet::new();
+        let mut matches = Vec::new();
+        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+
+        // All three target funclets must be paired (none left for pass-3 fuzzy).
+        for l in 0..3usize {
+            assert!(left_used.contains(&l), "target funclet {l} should be paired");
+        }
+
+        // Compute the identical "A" masked signature to validate each pairing.
+        let sig_a = funclet_signature(&left, 0).unwrap();
+
+        // Every target must be paired to a base funclet whose signature is byte-identical
+        // to the "A" signature — i.e. NEVER to __unwind$300 (the non-identical funclet).
+        let diff_base_idx = 2usize; // __unwind$300
+        for m in &matches {
+            let Some(l) = m.left else { continue };
+            let r = m.right.expect("paired target must have a right");
+            assert_ne!(
+                r, diff_base_idx,
+                "target {} ({}) was fuzzy-paired to the non-identical base __unwind$300",
+                l, left.symbols[l].name
+            );
+            let r_sig = funclet_signature(&right, r).unwrap();
+            assert_eq!(
+                r_sig, sig_a,
+                "target {} ({}) paired to base {} ({}) which is NOT byte-identical",
+                l, left.symbols[l].name, r, right.symbols[r].name
+            );
+        }
+
+        // The non-identical base funclet must be left unpaired (it has no identical
+        // target and the overflow was satisfied by reuse, not fuzzy).
+        assert!(
+            !right_used.contains(&diff_base_idx),
+            "non-identical base __unwind$300 should not be consumed"
+        );
+
+        // Exactly one base partner is reused (many-to-one): 3 targets, 2 distinct
+        // identical base partners.
+        let distinct_rights: BTreeSet<usize> = matches.iter().filter_map(|m| m.right).collect();
+        assert_eq!(distinct_rights.len(), 2, "overflow should reuse an identical base partner");
+        assert_eq!(matches.len(), 3, "all three targets should be matched");
+    }
+
+    /// Negative guard for the pass-2b overflow fix: an over-subscribed target funclet
+    /// that is NOT byte-identical to any base funclet must still be handled by pass-3
+    /// fuzzy (or left unpaired) — the overflow reuse must fire ONLY on exact signature
+    /// hits, never inflating a genuinely-different funclet.
+    #[test]
+    fn test_pair_funclets_oversubscribed_does_not_reuse_for_nonidentical() {
+        // Target: 2 funclets with signature "A", base: 1 funclet with signature "A".
+        // Plus a target funclet with a totally different signature and NO base partner.
+        let sig_a_1 = vec![0x3C, 0x60, 0x82, 0x34, 0x11, 0x11, 0x11, 0x11];
+        let sig_a_2 = vec![0x3C, 0x60, 0x82, 0x34, 0x22, 0x22, 0x22, 0x22];
+        let sig_a_b1 = vec![0x3C, 0x60, 0x82, 0x34, 0x33, 0x33, 0x33, 0x33];
+        // Totally different code, <50% equal to sig_a after masking.
+        let sig_other = vec![0x7F, 0xE0, 0xFB, 0x78, 0x66, 0x66, 0x66, 0x66];
+
+        let mut relocs = Vec::new();
+        for i in 0..3u64 {
+            relocs.push(Relocation {
+                flags: RelocationFlags::Coff(0),
+                address: i * 8 + 4,
+                target_symbol: 0,
+                addend: 0,
+            });
+        }
+
+        let left = make_multi_funclet_obj(
+            &[("fn_82281000", sig_a_1), ("fn_82282000", sig_a_2), ("fn_82283000", sig_other)],
+            relocs.iter().take(3).cloned().collect(),
+        );
+        let right =
+            make_multi_funclet_obj(&[("__unwind$100", sig_a_b1)], relocs.iter().take(1).cloned().collect());
+
+        let mut left_used = BTreeSet::new();
+        let mut right_used = BTreeSet::new();
+        let mut matches = Vec::new();
+        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+
+        // The single base funclet is byte-identical to the two "A" targets: one pairs
+        // 1:1 (pass 2), the overflow reuses it (pass 2b). Both A targets are paired.
+        assert!(left_used.contains(&0));
+        assert!(left_used.contains(&1));
+        // The third target (sig_other) is NOT byte-identical to any base funclet and
+        // there is no same-size >=50% fuzzy partner, so it must remain UNPAIRED — the
+        // overflow reuse must not have grabbed the "A" base for it.
+        assert!(!left_used.contains(&2), "non-identical target must not be paired");
+        for m in &matches {
+            assert_ne!(m.left, Some(2), "non-identical target must not be in matches");
+        }
     }
 }
