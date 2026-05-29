@@ -1187,7 +1187,7 @@ fn run_json(
 }
 
 fn run_batch(args: Args) -> Result<()> {
-    use objdiff_core::diff::{DiffSide, diff_objs, diff_objs_filtered};
+    use objdiff_core::diff::{DiffSide, diff_objs};
 
     // Load project config
     let project_dir = match &args.project {

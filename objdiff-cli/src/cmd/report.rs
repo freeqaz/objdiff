@@ -44,10 +44,9 @@ impl ReportCache {
     fn load(path: PathBuf) -> Self {
         let mut entries = HashMap::new();
         if let Ok(data) = std::fs::read(&path) {
-            let mut pos = 0;
             if data.len() >= 4 {
                 let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                pos = 4;
+                let mut pos = 4;
                 for _ in 0..count {
                     if pos + 12 > data.len() {
                         break;
