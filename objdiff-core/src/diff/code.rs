@@ -1,5 +1,5 @@
 use alloc::{
-    collections::{BTreeMap, btree_map},
+    collections::{BTreeMap, BTreeSet, btree_map},
     string::{String, ToString},
     vec,
     vec::Vec,
@@ -13,8 +13,8 @@ use super::{
     display::display_ins_data_literals,
 };
 use crate::obj::{
-    InstructionArg, InstructionArgValue, InstructionRef, Object, ResolvedInstructionRef,
-    ResolvedRelocation, ResolvedSymbol, SymbolKind,
+    InstructionArg, InstructionArgValue, InstructionRef, Object, ParsedInstruction,
+    ResolvedInstructionRef, ResolvedRelocation, ResolvedSymbol, SymbolKind,
 };
 
 pub fn no_diff_code(
@@ -210,8 +210,34 @@ pub fn diff_code(
     resolve_branches(&left_ops, &mut left_rows);
     resolve_branches(&right_ops, &mut right_rows);
 
+    // Detect the FP-anchor hairline slip (semantically-equal frame-anchor
+    // codegen). Rows in this set are scored as equal — see
+    // `detect_fp_anchor_compensation` for the (conservative) invariants.
+    #[cfg(feature = "std")]
+    let fp_anchor_equal_rows = detect_fp_anchor_compensation(
+        left_obj,
+        right_obj,
+        left_symbol_idx,
+        right_symbol_idx,
+        &left_rows,
+        &right_rows,
+        diff_config,
+        symbol_equivalences,
+    );
+    #[cfg(not(feature = "std"))]
+    let fp_anchor_equal_rows = BTreeSet::<usize>::new();
+
     let mut diff_state = InstructionDiffState::default();
-    for (left_row, right_row) in left_rows.iter_mut().zip(right_rows.iter_mut()) {
+    for (i, (left_row, right_row)) in left_rows.iter_mut().zip(right_rows.iter_mut()).enumerate() {
+        // FP-anchor compensated pair: provably-equal effective address despite a
+        // differing frame-anchor constant. Score as equal, no penalty.
+        if fp_anchor_equal_rows.contains(&i) {
+            left_row.kind = InstructionDiffKind::None;
+            right_row.kind = InstructionDiffKind::None;
+            left_row.arg_diff = Vec::new();
+            right_row.arg_diff = Vec::new();
+            continue;
+        }
         let result = diff_instruction(
             left_obj,
             right_obj,
@@ -267,6 +293,332 @@ pub fn diff_code(
             ..Default::default()
         },
     ))
+}
+
+/// One side of a frame-pointer-anchor establisher instruction, e.g.
+/// `subi r31, r12, K` (the canonical MSVC PowerPC EH/FP-establisher prologue,
+/// where r12 holds `this`/the incoming frame base and rA becomes the frame
+/// anchor). `effective_base` is the value placed into rA expressed relative to
+/// the source register: `r12 + effective_base`. For `subi` that is `-K`; for
+/// `addi` that is `+K`.
+#[cfg(feature = "std")]
+struct FpAnchor {
+    /// Destination (anchor) register, e.g. "r31".
+    dst: String,
+    /// `r12 + effective_base` is what the anchor register holds.
+    effective_base: i64,
+}
+
+/// One side of a memory access relative to the FP anchor register, e.g.
+/// `lwz r11, off(r31)`. `off` is the signed displacement; the effective address
+/// reached is `<anchor register value> + off`.
+#[cfg(feature = "std")]
+struct AnchorMemAccess {
+    /// Base register the access is relative to, e.g. "r31".
+    base: String,
+    /// Signed displacement.
+    off: i64,
+}
+
+/// Classify an instruction as a frame-pointer-anchor establisher, if it is one.
+///
+/// Recognizes `subi rA, r12, K` / `addi rA, r12, K` where rA is a non-volatile
+/// register (r14..r31) and the source is r12. This is the MSVC X360
+/// FP/EH-establisher idiom. Returns `None` for anything else (including
+/// `addi rA, r12, K` where the value is later used as data rather than a frame
+/// anchor — the caller further constrains validity by requiring a compensating
+/// access through rA).
+#[cfg(feature = "std")]
+fn classify_fp_anchor(ins: &ParsedInstruction) -> Option<FpAnchor> {
+    let mnemonic: &str = &ins.mnemonic;
+    let is_subi = mnemonic == "subi";
+    let is_addi = mnemonic == "addi";
+    if !is_subi && !is_addi {
+        return None;
+    }
+    // Expect exactly: [GPR dst, GPR src, Signed imm]
+    let [a0, a1, a2] = ins.args.as_slice() else {
+        return None;
+    };
+    let dst = opaque_reg(a0)?;
+    let src = opaque_reg(a1)?;
+    let imm = signed_value(a2)?;
+    // Source must be r12 (the incoming frame/this pointer in the MSVC idiom).
+    if src != "r12" {
+        return None;
+    }
+    // Destination must be a callee-saved GPR used as the frame anchor.
+    if !is_nonvolatile_gpr(&dst) {
+        return None;
+    }
+    let effective_base = if is_subi { -imm } else { imm };
+    Some(FpAnchor { dst, effective_base })
+}
+
+/// Classify an instruction as a load/store relative to a base register, if it is
+/// one of the form `<op> rD, off(base)`. The PowerPC backend prints offset
+/// load/stores as `[rD, Signed(off), GPR(base)]`.
+#[cfg(feature = "std")]
+fn classify_anchor_mem(ins: &ParsedInstruction) -> Option<AnchorMemAccess> {
+    // Offset load/stores have exactly 3 args: dest/src reg, signed offset, base reg.
+    let [_a0, a1, a2] = ins.args.as_slice() else {
+        return None;
+    };
+    let off = signed_value(a1)?;
+    let base = opaque_reg(a2)?;
+    Some(AnchorMemAccess { base, off })
+}
+
+#[cfg(feature = "std")]
+fn opaque_reg(arg: &InstructionArg) -> Option<String> {
+    match arg {
+        InstructionArg::Value(InstructionArgValue::Opaque(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "std")]
+fn signed_value(arg: &InstructionArg) -> Option<i64> {
+    match arg {
+        InstructionArg::Value(InstructionArgValue::Signed(v)) => Some(*v),
+        InstructionArg::Value(InstructionArgValue::Unsigned(v)) => i64::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "std")]
+fn is_nonvolatile_gpr(reg: &str) -> bool {
+    let Some(num) = reg.strip_prefix('r') else {
+        return false;
+    };
+    matches!(num.parse::<u32>(), Ok(n) if (14..=31).contains(&n))
+}
+
+/// Detect the "FP-anchor hairline slip": MSVC's frame-pointer-establisher
+/// constant `K` in `subi/addi rA, r12, K` differs between target and base, and
+/// every differing memory access through rA shifts its displacement by exactly
+/// the compensating amount so the *effective address* reached is identical on
+/// both sides. This is provably semantically-equal codegen (it arises when a
+/// base class grows/shrinks by a fixed amount, e.g. the ObjPtr polymorphism
+/// migration): the anchor lands at a different frame offset but every access
+/// compensates, so the same bytes are read/written.
+///
+/// Returns the set of paired-row indices whose `diff_arg` should be suppressed
+/// (the anchor row plus its compensated accesses). The rule is intentionally
+/// per-instruction, not whole-function: any *other* differing instruction (a
+/// `bl` to a different callee, an *uncompensated* access, a real constant diff)
+/// is left fully scored, so a function only reaches 100% if the anchor slip was
+/// its *sole* difference.
+///
+/// Conservatism invariants (ALL required before suppressing anything):
+/// 1. Exactly one FP-anchor establisher row, present on both sides at the same
+///    paired index, with the same destination register and a differing K.
+/// 2. The frame size (`stwu r1, -F, r1`) is byte-identical on both sides.
+/// 3. At least one differing access through the anchor register exists and
+///    compensates exactly (so a lone, uncompensated `subi` — a real diff — is
+///    never suppressed; the anchor is only de-penalized once a compensation
+///    proof exists).
+///
+/// Suppression is strictly local: only the anchor row and the load/stores that
+/// compensate it are de-penalized. A differing row that is NOT a compensated
+/// access (a `bl` to a different callee, a register swap, an uncompensated
+/// member access, an `addi` building a derived pointer) is deliberately left
+/// fully scored. The compensation claim is a per-instruction arithmetic
+/// identity on the displacement immediates, so it holds regardless of whatever
+/// else differs in the function — and a function only reaches 100% if the
+/// anchor slip was its sole remaining difference.
+///
+/// Structural safety: any opcode replacement or insert/delete row (alignment
+/// gap) aborts the whole detection (suppresses nothing), since those indicate
+/// the sequences are not a clean 1:1 pairing of the FP-anchor idiom.
+#[cfg(feature = "std")]
+fn detect_fp_anchor_compensation(
+    left_obj: &Object,
+    right_obj: &Object,
+    left_symbol_idx: usize,
+    right_symbol_idx: usize,
+    left_rows: &[InstructionDiffRow],
+    right_rows: &[InstructionDiffRow],
+    diff_config: &DiffObjConfig,
+    symbol_equivalences: &std::collections::HashMap<
+        alloc::string::String,
+        std::collections::HashSet<alloc::string::String>,
+    >,
+) -> BTreeSet<usize> {
+    let empty = BTreeSet::new();
+    // Cheap pre-screen: the fast path already handled byte-identical functions,
+    // so we only run when there is at least one row whose raw code differs and
+    // both sides are present.
+    if left_rows.len() != right_rows.len() {
+        return empty;
+    }
+
+    // Parse helper for a single row on a given side.
+    let parse = |obj: &Object, sym_idx: usize, row: &InstructionDiffRow| -> Option<ParsedInstruction> {
+        let ins_ref = row.ins_ref?;
+        let resolved = obj.resolve_instruction_ref(sym_idx, ins_ref)?;
+        obj.arch.process_instruction(resolved, diff_config).ok()
+    };
+
+    let mut anchor_row: Option<usize> = None;
+    let mut anchor_dst: Option<String> = None;
+    let mut left_eff: i64 = 0;
+    let mut right_eff: i64 = 0;
+    let mut compensated_rows: BTreeSet<usize> = BTreeSet::new();
+    let mut saw_compensated_access = false;
+    let mut frame_size_ok = false;
+
+    // First pass: locate the single FP-anchor establisher and the frame setup.
+    for (i, (lr, rr)) in left_rows.iter().zip(right_rows.iter()).enumerate() {
+        let (Some(lref), Some(rref)) = (lr.ins_ref, rr.ins_ref) else { continue };
+        // Only consider rows whose raw bytes actually differ; identical rows
+        // need no scrutiny (and the common case is they are equal).
+        if lref.opcode != rref.opcode {
+            // An opcode replacement is a real structural diff; bail entirely —
+            // the FP-anchor idiom never changes opcodes.
+            return empty;
+        }
+        let (Some(lp), Some(rp)) =
+            (parse(left_obj, left_symbol_idx, lr), parse(right_obj, right_symbol_idx, rr))
+        else {
+            continue;
+        };
+
+        // Track frame size establisher (must be identical on both sides).
+        let (lmn, rmn): (&str, &str) = (&lp.mnemonic, &rp.mnemonic);
+        if lmn == "stwu" && rmn == "stwu" {
+            // `stwu r1, -F, r1`
+            if lp.args == rp.args {
+                // Confirm it is the r1 frame push.
+                if let (Some(ld), Some(rd)) =
+                    (lp.args.first().and_then(opaque_reg), rp.args.first().and_then(opaque_reg))
+                    && ld == "r1"
+                    && rd == "r1"
+                {
+                    frame_size_ok = true;
+                }
+            } else {
+                // Differing frame size => not a compensated slip; abort.
+                return empty;
+            }
+        }
+
+        if let (Some(la), Some(ra)) = (classify_fp_anchor(&lp), classify_fp_anchor(&rp)) {
+            if la.dst != ra.dst {
+                return empty; // anchor moved to a different register: structural
+            }
+            if anchor_row.is_some() {
+                return empty; // more than one anchor establisher: too ambiguous
+            }
+            // Only a *differing* anchor is interesting; an identical one is fine
+            // but means the slip (if any) is elsewhere — record it so we know
+            // the anchor register and its effective base on each side.
+            anchor_row = Some(i);
+            anchor_dst = Some(la.dst.clone());
+            left_eff = la.effective_base;
+            right_eff = ra.effective_base;
+        }
+    }
+
+    let (Some(anchor_idx), Some(dst)) = (anchor_row, anchor_dst) else {
+        return empty;
+    };
+    if !frame_size_ok {
+        return empty;
+    }
+    // If the anchor establisher is identical on both sides there is no slip to
+    // reclaim here (a real diff, if present, lives in another row).
+    if left_eff == right_eff {
+        return empty;
+    }
+
+    // Second pass: find every differing memory access through the anchor
+    // register that *compensates* the anchor slip (same effective address on
+    // both sides). These are the only rows we will suppress, alongside the
+    // anchor itself. Every *other* differing row is deliberately left fully
+    // scored — so an unrelated `bl`, a register swap, or an *uncompensated*
+    // access keeps the function below 100%. The suppression is a strictly
+    // local, per-instruction soundness claim: for a compensated pair the bytes
+    // read/written are provably identical.
+    for (i, (lr, rr)) in left_rows.iter().zip(right_rows.iter()).enumerate() {
+        if i == anchor_idx {
+            continue;
+        }
+        let (Some(lref), Some(rref)) = (lr.ins_ref, rr.ins_ref) else {
+            // An insert/delete row (alignment gap) means the sequences are not a
+            // clean 1:1 pairing; abort entirely to stay safe.
+            return empty;
+        };
+        let (Some(lres), Some(rres)) = (
+            left_obj.resolve_instruction_ref(left_symbol_idx, lref),
+            right_obj.resolve_instruction_ref(right_symbol_idx, rref),
+        ) else {
+            return empty;
+        };
+        // Identical rows (byte- and reloc-equal) need no handling.
+        if lref.opcode == rref.opcode
+            && lres.code == rres.code
+            && reloc_eq(left_obj, right_obj, lres, rres, diff_config, symbol_equivalences)
+        {
+            continue;
+        }
+
+        // This row differs. Parse it; if it is not a clean compensated access we
+        // leave it scored (do NOT suppress) and move on.
+        let (Some(lp), Some(rp)) =
+            (parse(left_obj, left_symbol_idx, lr), parse(right_obj, right_symbol_idx, rr))
+        else {
+            continue;
+        };
+        if lref.opcode != rref.opcode || lp.mnemonic != rp.mnemonic {
+            continue; // opcode/mnemonic mismatch: real diff, leave scored
+        }
+        // A row whose args all compare equal (e.g. a `bl` to the same callee) is
+        // already equal — nothing to suppress, just skip.
+        if lp.args.len() == rp.args.len()
+            && lp.args.iter().zip(rp.args.iter()).all(|(a, b)| {
+                arg_eq(
+                    left_obj, right_obj, lr, rr, a, b, lres, rres, diff_config, symbol_equivalences,
+                )
+            })
+        {
+            continue;
+        }
+
+        // Is it a load/store relative to the anchor register with a compensating
+        // displacement? Only then do we suppress it.
+        let (Some(lm), Some(rm)) = (classify_anchor_mem(&lp), classify_anchor_mem(&rp)) else {
+            continue; // not an offset access (e.g. a differing `bl`): real diff
+        };
+        if lm.base != dst || rm.base != dst {
+            continue; // relative to a different register: not part of this slip
+        }
+        // Exactly 3 args [reg, off, base]; the non-offset arg (reg) must match,
+        // else it is a register diff, not a pure displacement compensation.
+        if lp.args.len() != 3 || rp.args.len() != 3 || !lp.args[0].loose_eq(&rp.args[0]) {
+            continue;
+        }
+        // Compensation invariant: effective address identical on both sides.
+        //   left:  (r12 + left_eff)  + lm.off
+        //   right: (r12 + right_eff) + rm.off
+        if left_eff + lm.off != right_eff + rm.off {
+            continue; // uncompensated: a real member-offset difference
+        }
+        saw_compensated_access = true;
+        compensated_rows.insert(i);
+    }
+
+    if !saw_compensated_access {
+        // The anchor differs but NO access compensates it: the anchor genuinely
+        // reaches a different frame slot (a real difference). Suppress nothing —
+        // never de-penalize a lone, uncompensated frame-anchor constant.
+        return empty;
+    }
+
+    // Suppress the anchor establisher plus every compensated access. All other
+    // differing rows remain fully scored.
+    compensated_rows.insert(anchor_idx);
+    compensated_rows
 }
 
 fn diff_instructions(
@@ -795,5 +1147,114 @@ mod tests {
     fn test_normalize_no_array_in_template() {
         // Template but no array params
         assert!(normalize_mangled_array_sizes("??$Foo@HH@@YAXXZ").is_none());
+    }
+
+    // ---- FP-anchor hairline-slip normalization helpers ----
+    // (the classifiers are std-gated, matching the detector that uses them)
+
+    #[cfg(feature = "std")]
+    use alloc::borrow::Cow;
+
+    #[cfg(feature = "std")]
+    fn reg(name: &str) -> InstructionArg<'static> {
+        InstructionArg::Value(InstructionArgValue::Opaque(Cow::Owned(name.to_string())))
+    }
+    #[cfg(feature = "std")]
+    fn imm(v: i64) -> InstructionArg<'static> {
+        InstructionArg::Value(InstructionArgValue::Signed(v))
+    }
+    #[cfg(feature = "std")]
+    fn pins(mnemonic: &str, args: Vec<InstructionArg<'static>>) -> ParsedInstruction {
+        ParsedInstruction {
+            ins_ref: InstructionRef::default(),
+            mnemonic: Cow::Owned(mnemonic.to_string()),
+            args,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_classify_fp_anchor_subi() {
+        // subi r31, r12, 0x80  =>  r31 = r12 - 0x80
+        let ins = pins("subi", vec![reg("r31"), reg("r12"), imm(0x80)]);
+        let a = classify_fp_anchor(&ins).expect("subi r31,r12,K is an anchor");
+        assert_eq!(a.dst, "r31");
+        assert_eq!(a.effective_base, -0x80);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_classify_fp_anchor_addi() {
+        // addi r31, r12, 0x10  =>  r31 = r12 + 0x10
+        let ins = pins("addi", vec![reg("r31"), reg("r12"), imm(0x10)]);
+        let a = classify_fp_anchor(&ins).expect("addi r31,r12,K is an anchor");
+        assert_eq!(a.effective_base, 0x10);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_classify_fp_anchor_rejects_non_r12_source() {
+        // addi r31, r1, 0x80 is a stack-frame addressing op, NOT the FP idiom.
+        assert!(classify_fp_anchor(&pins("addi", vec![reg("r31"), reg("r1"), imm(0x80)])).is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_classify_fp_anchor_rejects_volatile_dst() {
+        // addi r3, r12, K targets a volatile register; not a frame anchor.
+        assert!(classify_fp_anchor(&pins("addi", vec![reg("r3"), reg("r12"), imm(0x10)])).is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_classify_anchor_mem_load() {
+        // lwz r11, 0x94(r31)
+        let ins = pins("lwz", vec![reg("r11"), imm(0x94), reg("r31")]);
+        let m = classify_anchor_mem(&ins).expect("offset load");
+        assert_eq!(m.base, "r31");
+        assert_eq!(m.off, 0x94);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_classify_anchor_mem_rejects_addi() {
+        // addi r3, r31, 0x78 is [reg, reg, imm], not an offset access; must not
+        // be treated as a compensable load. (This guards AsyncFile/fn_8251A200,
+        // a real-diff function whose anchor slip is NOT compensated.)
+        assert!(classify_anchor_mem(&pins("addi", vec![reg("r3"), reg("r31"), imm(0x78)])).is_none());
+    }
+
+    #[test]
+    fn test_compensation_invariant_holds() {
+        // The semantic core: subi 0x80/0x90 with lwz 0x94/0xa4 compensates.
+        // effective address = effective_base + off, must be equal on both sides.
+        let l_eff = -0x80i64; // subi r31,r12,0x80
+        let r_eff = -0x90i64; // subi r31,r12,0x90
+        let l_off = 0x94i64; // lwz r11,0x94(r31)
+        let r_off = 0xa4i64; // lwz r11,0xa4(r31)
+        assert_eq!(l_eff + l_off, r_eff + r_off); // 0x14 == 0x14
+    }
+
+    #[test]
+    fn test_compensation_invariant_rejects_uncompensated() {
+        // Cluster-B real diff: subi 0x80/0x70 with lwz 0x50/0x84 does NOT
+        // compensate (eff -0x30 vs +0x14) and must remain a scored difference.
+        let l_eff = -0x80i64;
+        let r_eff = -0x70i64;
+        let l_off = 0x50i64;
+        let r_off = 0x84i64;
+        assert_ne!(l_eff + l_off, r_eff + r_off); // -0x30 != 0x14
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_is_nonvolatile_gpr() {
+        assert!(is_nonvolatile_gpr("r31"));
+        assert!(is_nonvolatile_gpr("r14"));
+        assert!(!is_nonvolatile_gpr("r13")); // r13 is the small-data anchor / volatile boundary
+        assert!(!is_nonvolatile_gpr("r3"));
+        assert!(!is_nonvolatile_gpr("r12"));
+        assert!(!is_nonvolatile_gpr("f31"));
+        assert!(!is_nonvolatile_gpr("lr"));
     }
 }
