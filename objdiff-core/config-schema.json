@@ -16,6 +16,11 @@
           "name": "Name or address"
         },
         {
+          "value": "name_only",
+          "name": "Name only (ignore addend)",
+          "description": "Relocation diffs match iff the target symbol name and section match; the addend is ignored. Strict callee/data-target check without penalizing benign build-address (addend) differences."
+        },
+        {
           "value": "data_value",
           "name": "Data value"
         },

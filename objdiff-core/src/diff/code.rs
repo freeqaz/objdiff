@@ -863,8 +863,16 @@ fn reloc_eq(
     };
     let symbol_name_addend_matches =
         names_match && left_reloc.relocation.addend == right_reloc.relocation.addend;
+    // NameOnly: target symbol name (+ section) must match, but the addend is ignored.
+    // This is the strict wrong-call-target / wrong-data-symbol check WITHOUT penalizing
+    // benign build-address (addend) differences, which NameAddress couples in.
+    let name_only = diff_config.function_reloc_diffs == FunctionRelocDiffs::NameOnly;
     match (&left_reloc.symbol.section, &right_reloc.symbol.section) {
         (Some(sl), Some(sr)) => {
+            if name_only {
+                // Section must match and the symbol names must match; addend ignored.
+                return section_name_eq(left_obj, right_obj, *sl, *sr) && names_match;
+            }
             // Match if section and name or address match
             section_name_eq(left_obj, right_obj, *sl, *sr)
                 && (diff_config.function_reloc_diffs == FunctionRelocDiffs::DataValue
@@ -876,7 +884,11 @@ fn reloc_eq(
                     || display_ins_data_literals(left_obj, left_ins)
                         == display_ins_data_literals(right_obj, right_ins))
         }
-        (Some(_), None) | (None, Some(_)) | (None, None) => symbol_name_addend_matches,
+        (Some(_), None) | (None, Some(_)) | (None, None) => {
+            // No section on one/both sides (e.g. external symbols): match on name alone
+            // when NameOnly, otherwise require name + addend.
+            if name_only { names_match } else { symbol_name_addend_matches }
+        }
     }
 }
 
@@ -1256,5 +1268,132 @@ mod tests {
         assert!(!is_nonvolatile_gpr("r12"));
         assert!(!is_nonvolatile_gpr("f31"));
         assert!(!is_nonvolatile_gpr("lr"));
+    }
+
+    // ---- FunctionRelocDiffs::NameOnly semantics ----
+    // Strict callee/data-target check (name + section must match) that IGNORES the
+    // relocation addend, the one mode the lenient report pipeline lacked. These tests
+    // pin the truth table directly on reloc_eq so they cannot drift with fixtures.
+
+    #[cfg(feature = "std")]
+    use crate::obj::{
+        Relocation, RelocationFlags, Section, SectionData, SectionKind, Symbol,
+    };
+
+    /// Build a one-section object whose single instruction at `address` carries a
+    /// relocation referencing a symbol named `target_name` (in section "text") with
+    /// the given addend. The caller-symbol is index 0, the target-symbol is index 1.
+    #[cfg(feature = "std")]
+    fn obj_with_reloc(target_name: &str, addend: i64) -> Object {
+        let mut obj = Object::default();
+        // section 0: "text" holding 4 bytes of code at address 0
+        let section = Section {
+            id: "text".to_string(),
+            name: "text".to_string(),
+            address: 0,
+            size: 4,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; 4]),
+            relocations: vec![Relocation {
+                flags: RelocationFlags::Coff(1),
+                address: 0,
+                target_symbol: 1,
+                addend,
+            }],
+            ..Default::default()
+        };
+        obj.sections.push(section);
+        // symbol 0: the caller function spanning the section
+        obj.symbols.push(Symbol {
+            name: "caller".to_string(),
+            address: 0,
+            size: 4,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        });
+        // symbol 1: the relocation target (a function in section "text")
+        obj.symbols.push(Symbol {
+            name: target_name.to_string(),
+            address: 0,
+            size: 0,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        });
+        obj
+    }
+
+    #[cfg(feature = "std")]
+    fn resolved_ref(obj: &Object) -> ResolvedInstructionRef<'_> {
+        let section = &obj.sections[0];
+        let reloc = &section.relocations[0];
+        ResolvedInstructionRef {
+            ins_ref: InstructionRef { address: 0, size: 4, opcode: 0, branch_dest: None },
+            symbol_index: 0,
+            symbol: &obj.symbols[0],
+            section_index: 0,
+            section,
+            code: &section.data.0,
+            relocation: Some(ResolvedRelocation {
+                relocation: reloc,
+                symbol: &obj.symbols[reloc.target_symbol],
+            }),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn reloc_match(left: &Object, right: &Object, mode: FunctionRelocDiffs) -> bool {
+        let cfg = DiffObjConfig { function_reloc_diffs: mode, ..Default::default() };
+        reloc_eq(
+            left,
+            right,
+            resolved_ref(left),
+            resolved_ref(right),
+            &cfg,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_only_forgives_addend() {
+        // Same callee name, different addend (benign build-address noise).
+        let left = obj_with_reloc("Callee", 0x100);
+        let right = obj_with_reloc("Callee", 0x200);
+        // NameOnly: addend ignored -> MATCH (the whole point of the mode).
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+        // NameAddress: couples name+addend -> NO MATCH (over-penalizes benign addend).
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameAddress));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_only_catches_wrong_callee() {
+        // Different callee name, same addend (a genuine wrong-call-target).
+        let left = obj_with_reloc("RightCallee", 0x100);
+        let right = obj_with_reloc("WrongCallee", 0x100);
+        // NameOnly: names differ -> NO MATCH (catches the false-100%).
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+        // None (the report.json/decomp.db mode): forgives ANY same-flags reloc -> MATCH
+        // (this is exactly the uncounted false-100% surface NameOnly exists to expose).
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::None));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_only_exact_match() {
+        // Identical name + identical addend matches under every mode.
+        let left = obj_with_reloc("Callee", 0x100);
+        let right = obj_with_reloc("Callee", 0x100);
+        for mode in [
+            FunctionRelocDiffs::None,
+            FunctionRelocDiffs::NameOnly,
+            FunctionRelocDiffs::NameAddress,
+            FunctionRelocDiffs::DataValue,
+            FunctionRelocDiffs::All,
+        ] {
+            assert!(reloc_match(&left, &right, mode), "exact match should hold for {mode:?}");
+        }
     }
 }
