@@ -749,7 +749,13 @@ fn matching_symbols(
 }
 
 /// True for MSVC EH funclet symbols that should participate in byte-fallback pairing:
-/// `__unwind$NNN`, `__catch$NNN`, `__unwind__merged_<addr>`, `fn_<8 hex digits>`.
+/// `__unwind$NNN`, `__catch$NNN`, `__unwind__merged_<addr>`, `fn_<8 hex digits>`,
+/// `??__E<mangled>` (MSVC dynamic initializer), `??__F<mangled>` (MSVC dynamic destructor).
+///
+/// The `??__E` / `??__F` entries are included because dtk's splitter renames the
+/// corresponding target-side COMDAT sections to `fn_<addr>` when the original symbol
+/// name cannot be recovered from the XEX.  Both sides emit byte-identical thunks for
+/// these global-lifecycle functions, so they are safe to pair by byte signature.
 fn is_funclet_like(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("__unwind$") {
         return rest.chars().all(|c| c.is_ascii_digit());
@@ -762,6 +768,12 @@ fn is_funclet_like(name: &str) -> bool {
     }
     if let Some(rest) = name.strip_prefix("fn_") {
         return rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    // MSVC global dynamic initializer (??__E) and dynamic destructor (??__F).
+    // These appear as mangled names in the compiled base object but as fn_<addr>
+    // on the target side (the XEX split loses the original COMDAT name).
+    if name.starts_with("??__E") || name.starts_with("??__F") {
+        return true;
     }
     false
 }
@@ -1223,6 +1235,14 @@ mod tests {
         // the original COMDAT name collides across object files.
         assert!(is_funclet_like("fn_8239FCE0"));
         assert!(is_funclet_like("fn_00000000"));
+        // MSVC global dynamic initializer / destructor thunks.  These appear by their
+        // mangled names in the compiled base object, but as `fn_<addr>` on the XEX
+        // target side where dtk loses the original COMDAT name.
+        assert!(is_funclet_like("??__EgFile@@YAXXZ"));
+        assert!(is_funclet_like("??__EgConditional@@YAXXZ"));
+        assert!(is_funclet_like("??__FgDataReadCrit@@YAXXZ"));
+        assert!(is_funclet_like("??__EsLicense@@YAXXZ"));
+        assert!(is_funclet_like("??__E?sRand@CameraManager@@2VRand@@A@@YAXXZ"));
     }
 
     #[test]
@@ -1244,6 +1264,9 @@ mod tests {
         // Plain text.
         assert!(!is_funclet_like("main"));
         assert!(!is_funclet_like(""));
+        // `??__` followed by non-E/F is NOT a dynamic-init/dtor pattern.
+        assert!(!is_funclet_like("??__G"));   // scalar deleting destructor — not a lifecycle thunk
+        assert!(!is_funclet_like("??__R"));   // RTTI base-class descriptor — not a thunk
     }
 
     /// Build a minimal `Object` containing a single `.text` section with the given
