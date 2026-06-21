@@ -161,6 +161,24 @@ pub struct GenerateArgs {
     #[argp(option, short = 'c')]
     /// Configuration property (key=value)
     config: Vec<String>,
+    #[argp(switch)]
+    /// Enable the case-B global byte-equality second pass: promote an unmatched
+    /// NAMED real-bodied (>44B) target method to 100% when its reloc-masked +
+    /// reloc-name signature uniquely (injective both sides) matches a base symbol
+    /// in ANY unit, deduped by retail VA. Off by default (stock semantics).
+    /// See docs/decomp/identity-transfer.md (case-B).
+    global_byte_eq: bool,
+    #[argp(option, from_str_fn(platform_path))]
+    /// When --global-byte-eq is set, write the list of promotions (JSON) here for
+    /// audit (icf_alias_check.py). One object per promoted VA.
+    global_byte_eq_log: Option<Utf8PlatformPathBuf>,
+    #[argp(option, from_str_fn(platform_path))]
+    /// REQUIRED with --global-byte-eq: path to the rb3-Wii BinDiff oracle
+    /// (unified_id_rb3wii.json). A promotion is gated on the retail VA being
+    /// oracle-named (similarity >= 0.5) AND attributing to the claiming unit's
+    /// source TU (Rule 3). Without it the pass would mis-attribute STL template
+    /// folds; the pass refuses to run if this is absent.
+    global_byte_eq_oracle: Option<Utf8PlatformPathBuf>,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -493,6 +511,69 @@ fn generate(args: GenerateArgs) -> Result<()> {
         cache.save(&new_entries);
     }
 
+    // ── Case-B global byte-equality second pass (opt-in via --global-byte-eq).
+    //
+    // Per the design (docs/decomp/identity-transfer.md + the report-driver seam):
+    // this lives in `generate` — the ONLY place that enumerates all units' obj
+    // paths — never inside diff_objs. It re-reads every target+base obj, builds a
+    // global base signature index, and promotes still-<100% NAMED real-bodied
+    // case-B methods to 100% under the honesty predicate, mutating the claiming
+    // unit's measures in place. Per-unit diff semantics are unchanged. MUST run
+    // AFTER cache reconstitution (the per-unit cache keys only on a unit's own two
+    // objs, so a cross-unit promotion is stale-on-unrelated-obj-change; accepted
+    // for the report-build use).
+    if args.global_byte_eq {
+        // Rule 3 is non-negotiable: refuse to run without the oracle.
+        let oracle_path = args.global_byte_eq_oracle.as_ref().with_context(|| {
+            "--global-byte-eq requires --global-byte-eq-oracle (unified_id_rb3wii.json): \
+             the oracle own-TU gate is what keeps the pass from mis-attributing STL \
+             template folds (see correctness rule 3)"
+        })?;
+        let oracle = load_va_oracle(oracle_path.as_str())
+            .with_context(|| format!("Failed to load oracle: {oracle_path}"))?;
+        info!("Loaded {} oracle VA-attribution entries from {}", oracle.len(), oracle_path);
+
+        let gbe_diff_config = base_diff_config.clone();
+        let unit_objs: Vec<diff::UnitObjs> = objects
+            .par_iter()
+            .map(|(object, _unit_idx)| {
+                let target = object.target_path.as_ref().and_then(|p| {
+                    obj::read::read(p.as_ref(), &gbe_diff_config, diff::DiffSide::Target).ok()
+                });
+                let base = object.base_path.as_ref().and_then(|p| {
+                    obj::read::read(p.as_ref(), &gbe_diff_config, diff::DiffSide::Base).ok()
+                });
+                diff::UnitObjs { unit_name: object.name.clone(), target, base }
+            })
+            .collect();
+        let promotions = diff::reconcile_global_byte_matches(
+            &mut units,
+            &unit_objs,
+            &mapping_config.symbol_equivalences,
+            &oracle,
+        );
+        info!("Case-B global byte-equality pass promoted {} method(s)", promotions.len());
+        if let Some(log_path) = &args.global_byte_eq_log {
+            let json: Vec<_> = promotions
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "unit": p.unit_name,
+                        "symbol": p.symbol_name,
+                        "virtual_address": format!("{:#010x}", p.virtual_address),
+                        "size": p.size,
+                        "base_unit": p.base_unit_name,
+                    })
+                })
+                .collect();
+            std::fs::write(
+                log_path.as_str(),
+                serde_json::to_string_pretty(&json).unwrap_or_default(),
+            )
+            .with_context(|| format!("Failed to write promotion log: {log_path}"))?;
+        }
+    }
+
     let measures = units.iter().flat_map(|u| u.measures.into_iter()).collect();
     let mut categories = Vec::new();
     for category in project.progress_categories() {
@@ -509,6 +590,44 @@ fn generate(args: GenerateArgs) -> Result<()> {
     info!("Report generated in {}.{:03}s", duration.as_secs(), duration.subsec_millis());
     write_output(&report, args.output.as_deref(), output_format)?;
     Ok(())
+}
+
+/// Load the rb3-Wii BinDiff oracle (`unified_id_rb3wii.json`, a list of
+/// `{rb3_addr, bindiff_src, similarity, ...}`) into the VA→(src-basename, sim) map
+/// the global-byte-eq pass needs for its own-TU honesty gate (Rule 3). The
+/// basename is lowercased with its extension stripped (e.g.
+/// "band3/src/tour/TourProgress.cpp" → "tourprogress") to compare against a
+/// unit's source basename. If a VA appears more than once, the highest-similarity
+/// entry wins (best-attribution).
+fn load_va_oracle(path: &str) -> Result<diff::VaOracle> {
+    let data = std::fs::read_to_string(path)?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&data)?;
+    let mut map: diff::VaOracle = HashMap::new();
+    for e in entries {
+        let Some(addr_s) = e.get("rb3_addr").and_then(|v| v.as_str()) else { continue };
+        let va = match u64::from_str_radix(addr_s.trim_start_matches("0x"), 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(src) = e.get("bindiff_src").and_then(|v| v.as_str()) else { continue };
+        let base = src
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(src)
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .unwrap_or(src)
+            .to_ascii_lowercase();
+        let sim = e.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        map.entry(va)
+            .and_modify(|cur| {
+                if sim > cur.1 {
+                    *cur = (base.clone(), sim);
+                }
+            })
+            .or_insert((base, sim));
+    }
+    Ok(map)
 }
 
 fn build_unit_diff_config(

@@ -781,7 +781,7 @@ fn is_funclet_like(name: &str) -> bool {
 /// Extract a symbol's byte payload with all relocation-targeted bytes zeroed.
 /// Both sides emit COFF with zero immediates at every relocation site, so
 /// after masking we can compare the pure instruction encoding.
-fn funclet_signature(obj: &Object, sym_idx: usize) -> Option<alloc::vec::Vec<u8>> {
+pub(crate) fn funclet_signature(obj: &Object, sym_idx: usize) -> Option<alloc::vec::Vec<u8>> {
     let symbol = obj.symbols.get(sym_idx)?;
     if symbol.size == 0 {
         return None;
@@ -808,6 +808,540 @@ fn funclet_signature(obj: &Object, sym_idx: usize) -> Option<alloc::vec::Vec<u8>
         }
     }
     Some(bytes)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global byte-equality second pass (case-B identity transfer).
+//
+// objdiff pairs symbols WITHIN a unit (one target obj ↔ one base obj). An
+// ICF-scattered TU's method whose retail bytes physically live inside ANOTHER
+// TU's pinned span ("case-B", see docs/decomp/identity-transfer.md) can never
+// pair: the claiming unit's compiled base obj DEFINES the mangled method, but
+// the target bytes live in the foreign unit's target obj. The bytes match — the
+// pairing is impossible because it is cross-unit.
+//
+// `reconcile_global_byte_matches` is a SECOND PASS in the report driver only. It
+// promotes such methods to 100% under a strict honesty predicate (the rules in
+// the task `correctness_constraints`). Per-unit diff semantics
+// (`diff_objs`/`matching_symbols`/`pair_funclets_by_bytes`) are UNCHANGED.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Real-bodied threshold. Methods ≤ this many bytes are ICF-folding stubs/thunks
+/// (73% of the oracle pool); byte-equality on them asserts nothing about
+/// ownership. Only count case-B promotions whose retail body exceeds this.
+pub const CASEB_STUB_MAX: u64 = 44;
+
+/// An ordered, name-resolved relocation descriptor for a symbol. The honest
+/// equality predicate (code.rs:122-129) requires a true 100% to agree on
+/// reloc count, flags, offsets, addends AND reloc-target NAMES — `funclet_signature`
+/// masks the bytes but DROPS the target names, so two >44B fns of identical
+/// instruction shape but different callees/strings mask-EQUAL. This carries the
+/// names so we can demand structural reloc equality.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct RelocDesc {
+    /// Byte offset of the reloc from the symbol's start.
+    pub off_from_sym: u64,
+    /// Normalized, totally-ordered encoding of `obj::RelocationFlags`
+    /// (`(discriminant, value)`): the shared enum isn't `Ord`, so we project it
+    /// to a comparable scalar locally (keeps the global-pass keys `Ord` without
+    /// touching the shared `obj` type's derives). 0 = ELF, 1 = COFF.
+    pub flags: (u8, u32),
+    /// Resolved target-symbol name (canonicalized through the ICF equivalence map
+    /// by the caller before comparison).
+    pub target_name: String,
+    pub addend: i64,
+}
+
+/// Project a shared `RelocationFlags` to a totally-ordered scalar key.
+fn reloc_flags_key(flags: crate::obj::RelocationFlags) -> (u8, u32) {
+    match flags {
+        crate::obj::RelocationFlags::Elf(v) => (0, v),
+        crate::obj::RelocationFlags::Coff(v) => (1, v as u32),
+    }
+}
+
+/// The full honesty signature of a named code symbol: reloc-masked instruction
+/// bytes PLUS the ordered, name-resolved relocation descriptors. Two symbols are
+/// byte-identical for promotion iff BOTH components are equal (rule 5).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct NamedSig {
+    pub masked_bytes: Vec<u8>,
+    pub relocs: Vec<RelocDesc>,
+}
+
+/// Compute the full reloc-masked + reloc-name signature of a code symbol.
+/// Returns `None` for size-0 symbols or symbols with no resolvable section.
+///
+/// This is the honesty primitive for the global pass. Unlike `is_funclet_like`,
+/// it accepts ANY code symbol (the caller gates on name-ness / size / kind).
+pub(crate) fn named_symbol_signature(obj: &Object, sym_idx: usize) -> Option<NamedSig> {
+    let masked_bytes = funclet_signature(obj, sym_idx)?;
+    let symbol = obj.symbols.get(sym_idx)?;
+    let section = obj.sections.get(symbol.section?)?;
+    let sym_start_abs = symbol.address;
+    let sym_end_abs = sym_start_abs + symbol.size;
+    let mut relocs = Vec::new();
+    for reloc in &section.relocations {
+        if reloc.address < sym_start_abs || reloc.address >= sym_end_abs {
+            continue;
+        }
+        // Resolve the target-symbol name. A reloc into an out-of-range symbol index
+        // makes the signature un-comparable; bail (fail-closed).
+        let target = obj.symbols.get(reloc.target_symbol)?;
+        relocs.push(RelocDesc {
+            off_from_sym: reloc.address - sym_start_abs,
+            flags: reloc_flags_key(reloc.flags),
+            target_name: target.name.clone(),
+            addend: reloc.addend,
+        });
+    }
+    // Sort by offset so the descriptor order is canonical (section.relocations is
+    // already address-sorted in practice, but make it explicit).
+    relocs.sort_by(|a, b| a.off_from_sym.cmp(&b.off_from_sym));
+    Some(NamedSig { masked_bytes, relocs })
+}
+
+/// Canonical reloc-target name through the ICF equivalence map: pick the
+/// lexicographically smallest member of the symbol's equivalence group (so an
+/// ICF-folded base callee compares equal to its named sibling). If the symbol is
+/// not in any group it maps to itself.
+fn canonical_reloc_name<'a>(
+    name: &'a str,
+    equivalences: &'a HashMap<String, HashSet<String>>,
+) -> &'a str {
+    match equivalences.get(name) {
+        Some(group) => group.iter().map(|s| s.as_str()).min().unwrap_or(name),
+        None => name,
+    }
+}
+
+/// Canonicalize a `NamedSig`'s reloc-target names through the ICF equivalence map.
+/// Returns a key suitable for cross-unit comparison.
+fn canonicalize_sig(sig: &NamedSig, equivalences: &HashMap<String, HashSet<String>>) -> NamedSig {
+    let relocs = sig
+        .relocs
+        .iter()
+        .map(|r| RelocDesc {
+            off_from_sym: r.off_from_sym,
+            flags: r.flags,
+            target_name: canonical_reloc_name(&r.target_name, equivalences).to_string(),
+            addend: r.addend,
+        })
+        .collect();
+    NamedSig { masked_bytes: sig.masked_bytes.clone(), relocs }
+}
+
+/// Parse the retail virtual address out of an anonymous `fn_<8hex>` symbol name.
+/// dtk names every un-renamed carved retail body `fn_<VA>` where `<VA>` is its
+/// retail virtual address in hex — that is the authoritative VA source in this
+/// pipeline (the carved COFF objs carry no `.note.split` per-symbol VA array).
+fn parse_fn_va(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("fn_")?;
+    if rest.len() != 8 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(rest, 16).ok()
+}
+
+/// True if `name` is an anonymous/funclet target with no asserted source identity
+/// (`fn_<8hex>`, `__unwind$`, `__catch$`, `__unwind__merged_`). These MUST NOT be
+/// promoted (rule 3: no oracle name = no identity). Note `??__E`/`??__F` global
+/// init/dtor ARE mangled names, but they ICF-fold widely and carry no own-TU
+/// body, so we also exclude them here (the size>44B gate already filters most).
+fn is_anonymous_or_funclet(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("fn_") {
+        return rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    name.starts_with("__unwind$")
+        || name.starts_with("__catch$")
+        || name.starts_with("__unwind__merged_")
+        || name.starts_with("??__E")
+        || name.starts_with("??__F")
+}
+
+/// One promotion decided by the global pass, for provenance / auditing.
+#[derive(Clone, Debug)]
+pub struct GlobalPromotion {
+    /// The claiming unit's name (the unit whose BASE obj defines this mangled
+    /// method — i.e. the unit we ported the source for).
+    pub unit_name: String,
+    /// The promoted symbol's mangled name.
+    pub symbol_name: String,
+    /// Retail virtual address (collision-free dedup key).
+    pub virtual_address: u64,
+    /// Symbol size in bytes.
+    pub size: u64,
+    /// The unit whose TARGET (carved retail) obj physically held the byte-identical
+    /// body — i.e. where the case-B method's retail bytes were spatially carved.
+    pub base_unit_name: String,
+}
+
+/// A target/base obj pair for one report unit, threaded out of `report_object`.
+pub struct UnitObjs {
+    pub unit_name: String,
+    pub target: Option<Object>,
+    pub base: Option<Object>,
+}
+
+/// Global byte-equality second pass. Promotes case-B methods to 100% under the
+/// honesty predicate. Mutates `units` in place (bumps the claiming unit's
+/// `measures.matched_functions` / `matched_code`, sets the promoted ReportItem's
+/// `match_percent_normalized`/`fuzzy_match_percent` to 100). Returns the list of
+/// promotions for auditing.
+///
+/// ORIENTATION (decomp, confirmed against rb3-xenon objdiff.json +
+/// docs/decomp/identity-transfer.md):
+///   * TARGET obj = the dtk-carved RETAIL obj (`build/.../obj/...`). It holds the
+///     retail instruction bytes AND each symbol's retail VA via `.note.split`
+///     (`symbol.virtual_address`). A case-B method's retail body lives here, in a
+///     FOREIGN unit's carved span, typically as an anonymous `fn_<VA>`.
+///   * BASE obj   = our MSVC-COMPILED obj (`build/.../src/...`). It DEFINES the
+///     MSVC-mangled method `?M@Foo@@...` when we ported Foo's source. No VA.
+///
+/// A case-B method for claiming unit Foo: Foo's BASE obj defines `?M@Foo@@`, but
+/// the retail bytes are carved into a DIFFERENT unit's TARGET obj, so the normal
+/// per-unit pairing leaves `?M@Foo@@` unmatched. This pass finds the byte-identical
+/// retail body in ANY target obj and promotes the BASE-named method.
+///
+/// Rule 3 (oracle attribution) is structurally guaranteed UPSTREAM: a mangled
+/// method only appears in Foo's base obj because Foo's source was ported, and the
+/// per-VA naming used by the wider pipeline is generated from the rb3-Wii oracle
+/// (`gen_game_target_map.py`, `target_symbol_map.json`). The promotion log lets
+/// `icf_alias_check.py` re-audit own-TU + real-bodied per the PROCESS GATE.
+///
+/// See task `correctness_constraints` rules 1-5 + FOO monotonicity.
+/// Per-VA rb3-Wii BinDiff oracle attribution: `va -> (source-file basename
+/// without extension, similarity)`. Required to enforce Rule 3 (oracle-named +
+/// own-TU sim>=0.5): byte-equality + a map name alone MIS-ATTRIBUTES (STL
+/// template instantiations like `_Vector_base<T>` / `_M_create_node` are
+/// byte-identical across TUs and carry NO asserted source identity). Without
+/// this gate the pass produces fake matches (verified: 4 un-oracle'd STL folds).
+#[cfg(feature = "std")]
+pub type VaOracle = HashMap<u64, (String, f32)>;
+
+/// Oracle similarity floor for own-TU attribution (Rule 3).
+pub const CASEB_ORACLE_SIM_MIN: f32 = 0.5;
+
+#[cfg(feature = "std")]
+pub fn reconcile_global_byte_matches(
+    units: &mut [crate::bindings::report::ReportUnit],
+    unit_objs: &[UnitObjs],
+    equivalences: &HashMap<String, HashSet<String>>,
+    oracle: &VaOracle,
+) -> Vec<GlobalPromotion> {
+    use crate::bindings::report::Measures;
+
+    // Build unit_name -> source-file basename (no extension) for Rule 3 own-TU
+    // attribution. e.g. "default/File" -> source_path "src/.../File.cpp" -> "file".
+    let mut unit_src_basename: HashMap<&str, String> = HashMap::new();
+    for unit in units.iter() {
+        if let Some(sp) = unit.metadata.as_ref().and_then(|m| m.source_path.as_ref()) {
+            let base = sp
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(sp)
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(sp)
+                .to_ascii_lowercase();
+            unit_src_basename.insert(unit.name.as_str(), base);
+        }
+    }
+
+    // name → UnitObjs for fast per-unit target/base lookup.
+    let mut unit_obj_by_name: HashMap<&str, &UnitObjs> = HashMap::new();
+    for uo in unit_objs.iter() {
+        unit_obj_by_name.insert(uo.unit_name.as_str(), uo);
+    }
+
+    // ── PRE: already-matched-VA set (the pre-pass 100-set), keyed by RETAIL VA.
+    //
+    // Rule 4: each VA contributes at most one matched-count binary-wide. A case-B
+    // body already living in a foreign target span MAY already be matched there
+    // (e.g. via pair_funclets_by_bytes counting the foreign `fn_<VA>`). The retail
+    // VA lives on the TARGET symbol (via split_meta), NOT on the report item, so we
+    // resolve each already-100% ReportItem's name to its target symbol and take
+    // that symbol's `virtual_address`. The VA is the only collision-free dedup key
+    // (name-keyed dedup is unsafe — ICF folds many real bodies onto one name).
+    let mut already_matched_va: HashSet<u64> = HashSet::new();
+    for unit in units.iter() {
+        let Some(uo) = unit_obj_by_name.get(unit.name.as_str()) else { continue };
+        let Some(target) = &uo.target else { continue };
+        for item in &unit.functions {
+            let is_matched =
+                item.match_percent_normalized.unwrap_or(item.fuzzy_match_percent) == 100.0;
+            if !is_matched {
+                continue;
+            }
+            // VA from split_meta if present, else from a `fn_<VA>` item/symbol name
+            // (a body matched via funclet pairing stays anonymous). Renamed-matched
+            // bodies lose the `fn_<VA>` form and are excluded from the retail index
+            // anyway, so this set is a belt-and-braces guard.
+            let va = item
+                .metadata
+                .as_ref()
+                .and_then(|m| m.virtual_address)
+                .or_else(|| parse_fn_va(&item.name))
+                .or_else(|| {
+                    target
+                        .symbol_by_name(&item.name)
+                        .and_then(|t_idx| target.symbols[t_idx].virtual_address)
+                });
+            if let Some(va) = va {
+                already_matched_va.insert(va);
+            }
+        }
+    }
+
+    // ── PRE: global retail index over EVERY TARGET obj's real-bodied Code symbols.
+    // Key = canonicalized (masked bytes + reloc-name) signature. Value = the list
+    // of (unit_idx, target_sym_idx, retail_va) carrying that signature.
+    //
+    // Rule 1: only size > CASEB_STUB_MAX (stubs/thunks ICF-fold widely; byte-equality
+    // on them asserts nothing). Rule 2 (injective on the RETAIL side): a signature
+    // carried by >1 DISTINCT retail VA is non-unique and is rejected at lookup —
+    // N retail bodies of identical shape = ambiguous identity. Rule 5: the signature
+    // carries reloc-target names canonicalized through the ICF equivalence map.
+    //
+    // Both anonymous `fn_<VA>` and named retail bodies are indexed: a case-B body in
+    // a foreign carved span is typically anonymous, and that is exactly what we must
+    // match a base-named method against.
+    // VA source: the carved COFF objs carry NO `.note.split` per-symbol VA array
+    // (`symbol.virtual_address` is None for every target symbol here). dtk instead
+    // names each UN-RENAMED carved retail body `fn_<VA>` — the hex VA is in the
+    // name. A retail body that some unit ALREADY matched was renamed by the
+    // pre-compile renamer to its mangled name, so it is NO LONGER `fn_<VA>`; only
+    // un-renamed (still-available) retail bodies are anonymous. Indexing by the
+    // `fn_<VA>` name therefore (a) supplies the rule-4 VA dedup key and
+    // (b) intrinsically excludes already-claimed bodies (rule 4) — a case-B body
+    // not yet pinned anywhere is exactly the anonymous one we want.
+    let dbg = std::env::var("OBJDIFF_CASEB_DEBUG").is_ok();
+    let mut dbg_tgt_code = 0u64;
+    let mut dbg_tgt_have_va = 0u64;
+    let mut retail_index: BTreeMap<NamedSig, Vec<(usize, usize, u64)>> = BTreeMap::new();
+    for (uidx, uo) in unit_objs.iter().enumerate() {
+        let Some(target) = &uo.target else { continue };
+        for (sidx, sym) in target.symbols.iter().enumerate() {
+            if sym.size <= CASEB_STUB_MAX {
+                continue;
+            }
+            if sym.flags.contains(SymbolFlag::Ignored) || sym.flags.contains(SymbolFlag::Hidden) {
+                continue;
+            }
+            if symbol_section_kind(target, sym) != SectionKind::Code {
+                continue;
+            }
+            dbg_tgt_code += 1;
+            // The retail VA: prefer the split_meta VA if present, else parse the
+            // `fn_<VA>` name. Only un-renamed anonymous carved bodies are candidates.
+            let Some(va) = sym.virtual_address.or_else(|| parse_fn_va(&sym.name)) else {
+                continue;
+            };
+            dbg_tgt_have_va += 1;
+            let Some(sig) = named_symbol_signature(target, sidx) else { continue };
+            let key = canonicalize_sig(&sig, equivalences);
+            retail_index.entry(key).or_default().push((uidx, sidx, va));
+        }
+    }
+    if dbg {
+        eprintln!(
+            "[caseb] target code syms>44B={} of which have_va(or fn_VA name)={}",
+            dbg_tgt_code, dbg_tgt_have_va
+        );
+    }
+
+    // Track which retail bodies have been claimed (rule 2: a retail body is consumed
+    // at most once globally), keyed by RETAIL VA (collision-free, dedups ICF folds).
+    let mut retail_va_claimed: HashSet<u64> = HashSet::new();
+
+    // ── PASS: for each unit's still-<100% NAMED method (defined in the BASE obj),
+    // compute its signature and look it up in the retail index. Promote iff the
+    // signature is uniquely matched on BOTH sides, real-bodied, and the retail VA is
+    // not already counted.
+    //
+    // First collect decisions (immutable scan), then apply (mutable) so the read
+    // borrow of `units` doesn't conflict with mutation.
+    struct Decision {
+        unit_idx: usize,
+        item_idx: usize,
+        va: u64,
+        size: u64,
+        name: String,
+        base_unit_name: String,
+        /// Signature key — used to enforce target-side injectivity across decisions
+        /// (two distinct base methods resolving to the SAME retail body / signature
+        /// = ambiguous; drop all).
+        sig_key: NamedSig,
+    }
+    let mut decisions: Vec<Decision> = Vec::new();
+
+    let mut c_named_unmatched = 0u64;
+    let mut c_have_base_body = 0u64;
+    let mut c_have_sig = 0u64;
+    let mut c_sig_in_index = 0u64;
+    let mut c_unique_retail = 0u64;
+    let mut c_not_already = 0u64;
+    let mut c_oracle_ok = 0u64;
+    if dbg {
+        eprintln!(
+            "[caseb] retail_index sigs={} total_entries={} already_matched_va={}",
+            retail_index.len(),
+            retail_index.values().map(|v| v.len()).sum::<usize>(),
+            already_matched_va.len()
+        );
+    }
+
+    for (unit_idx, unit) in units.iter().enumerate() {
+        let Some(uo) = unit_obj_by_name.get(unit.name.as_str()) else { continue };
+        let Some(base) = &uo.base else { continue };
+        for (item_idx, item) in unit.functions.iter().enumerate() {
+            // Skip already-matched items (FOO monotonicity: never perturb a match).
+            let cur = item.match_percent_normalized.unwrap_or(item.fuzzy_match_percent);
+            if cur == 100.0 {
+                continue;
+            }
+            // Rule 3: must carry a real MSVC-mangled (non-anonymous) name.
+            if is_anonymous_or_funclet(&item.name) {
+                continue;
+            }
+            // Rule 1 (size>44B). ReportItem size == the unit's listed symbol size.
+            if item.size <= CASEB_STUB_MAX {
+                continue;
+            }
+            c_named_unmatched += 1;
+            // Locate the method's body in OUR compiled BASE obj to sign it.
+            let Some(b_idx) = base.symbol_by_name(&item.name) else { continue };
+            let b_sym = &base.symbols[b_idx];
+            if b_sym.size <= CASEB_STUB_MAX {
+                continue;
+            }
+            if symbol_section_kind(base, b_sym) != SectionKind::Code {
+                continue;
+            }
+            c_have_base_body += 1;
+            let Some(b_sig_raw) = named_symbol_signature(base, b_idx) else { continue };
+            c_have_sig += 1;
+            let key = canonicalize_sig(&b_sig_raw, equivalences);
+            // Rule 2 (injective on the retail side): require EXACTLY ONE distinct
+            // retail VA carrying this signature.
+            let Some(retail_entries) = retail_index.get(&key) else { continue };
+            c_sig_in_index += 1;
+            let distinct_vas: HashSet<u64> = retail_entries.iter().map(|(_, _, va)| *va).collect();
+            if distinct_vas.len() != 1 {
+                continue;
+            }
+            c_unique_retail += 1;
+            let va = *distinct_vas.iter().next().unwrap();
+            // Rule 4: never promote a retail VA already counted somewhere.
+            if already_matched_va.contains(&va) {
+                continue;
+            }
+            c_not_already += 1;
+            // Rule 3 (oracle-named + own-TU attribution): the retail VA must be
+            // named by the rb3-Wii oracle with similarity >= floor AND attribute to
+            // the CLAIMING unit's source TU. This is the DECISIVE honesty gate —
+            // byte-equality + a mangled name alone mis-attributes STL template
+            // instantiations (which the oracle never names). A VA absent from the
+            // oracle has NO asserted identity → reject.
+            //
+            // OBJDIFF_CASEB_UNSAFE_NO_ORACLE: demonstration/diagnostic ONLY — bypasses
+            // Rule 3 to exercise the byte-equality+injectivity transport end-to-end.
+            // NEVER use for a real measurement (produces the documented STL-fold
+            // inflation). Default (unset) enforces the oracle gate.
+            if !std::env::var("OBJDIFF_CASEB_UNSAFE_NO_ORACLE").is_ok() {
+                let Some((oracle_tu, sim)) = oracle.get(&va) else { continue };
+                if *sim < CASEB_ORACLE_SIM_MIN {
+                    continue;
+                }
+                let Some(claim_base) = unit_src_basename.get(unit.name.as_str()) else { continue };
+                if oracle_tu.to_ascii_lowercase() != *claim_base {
+                    continue;
+                }
+            }
+            c_oracle_ok += 1;
+            decisions.push(Decision {
+                unit_idx,
+                item_idx,
+                va,
+                size: item.size,
+                name: item.name.clone(),
+                base_unit_name: unit_objs[retail_entries[0].0].unit_name.clone(),
+                sig_key: key,
+            });
+        }
+    }
+
+    if dbg {
+        eprintln!(
+            "[caseb] funnel: named_unmatched>44B={} have_base_body={} have_sig={} sig_in_retail_index={} unique_retail_va={} not_already_matched={} oracle_own_tu_ok={} -> decisions={}",
+            c_named_unmatched, c_have_base_body, c_have_sig, c_sig_in_index, c_unique_retail, c_not_already, c_oracle_ok, decisions.len()
+        );
+    }
+
+    // Rule 2 (injective on the BASE side too): a retail VA / signature claimed by ≥2
+    // DISTINCT base methods (different mangled names) = ambiguous identity → drop ALL.
+    // Key by retail VA (the physical body) AND by signature to catch both forms.
+    let mut va_decided: HashMap<u64, usize> = HashMap::new();
+    let mut sig_decided: HashMap<NamedSig, usize> = HashMap::new();
+    for d in &decisions {
+        *va_decided.entry(d.va).or_insert(0) += 1;
+        *sig_decided.entry(d.sig_key.clone()).or_insert(0) += 1;
+    }
+
+    let mut promotions: Vec<GlobalPromotion> = Vec::new();
+    for d in decisions {
+        // Rule 2: reject if two distinct base methods resolved to the same retail
+        // body (by VA) or the same signature (defensive — N-to-1 inflation).
+        if va_decided.get(&d.va).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        if sig_decided.get(&d.sig_key).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        // Rule 4: final guard against double-count.
+        if already_matched_va.contains(&d.va) || retail_va_claimed.contains(&d.va) {
+            continue;
+        }
+        // ── APPLY the promotion.
+        retail_va_claimed.insert(d.va);
+        already_matched_va.insert(d.va);
+
+        let unit = &mut units[d.unit_idx];
+        // FOO monotonicity: we only ADD; never clear an existing matched member.
+        let item = &mut unit.functions[d.item_idx];
+        item.match_percent_normalized = Some(100.0);
+        item.fuzzy_match_percent = 100.0;
+        if let Some(measures) = unit.measures.as_mut() {
+            measures.matched_functions += 1;
+            measures.matched_code += d.size;
+            recalc_unit_measure_percents(measures);
+        } else {
+            let mut m = Measures::default();
+            m.matched_functions = 1;
+            m.matched_code = d.size;
+            unit.measures = Some(m);
+        }
+        promotions.push(GlobalPromotion {
+            unit_name: unit.name.clone(),
+            symbol_name: d.name,
+            virtual_address: d.va,
+            size: d.size,
+            base_unit_name: d.base_unit_name,
+        });
+    }
+
+    promotions
+}
+
+#[cfg(feature = "std")]
+fn recalc_unit_measure_percents(m: &mut crate::bindings::report::Measures) {
+    m.matched_code_percent =
+        if m.total_code == 0 { 100.0 } else { m.matched_code as f32 / m.total_code as f32 * 100.0 };
+    m.matched_functions_percent = if m.total_functions == 0 {
+        100.0
+    } else {
+        m.matched_functions as f32 / m.total_functions as f32 * 100.0
+    };
 }
 
 fn pair_funclets_by_bytes(
