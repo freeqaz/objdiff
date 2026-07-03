@@ -785,6 +785,42 @@ pub(crate) fn section_name_eq(
     })
 }
 
+/// The base of a (possibly COMDAT-grouped) section name: everything before the
+/// first `$`. MSVC groups COMDAT definitions into `$`-suffixed buckets of a
+/// logical section (`.text$mn`, `.text$dup`, `.rdata$r`, …); the linker folds
+/// and orders by these, but which bucket a given definition lands in is a
+/// build/link artifact. The base name (`.text`, `.rdata`) is the stable logical
+/// section identity, so `.text` and `.text$dup` share the base `.text` while
+/// `.text` and `.data` do not.
+fn section_base_name(name: &str) -> &str {
+    match name.split_once('$') {
+        Some((base, _)) => base,
+        None => name,
+    }
+}
+
+/// COMDAT-tolerant section-name comparison used by NameOnly reloc matching.
+///
+/// Like [`section_name_eq`] but compares the COMDAT-group base name (see
+/// [`section_base_name`]) rather than the full section name, so a DEFINED symbol
+/// that the compiler parked in `.text` in one object and `.text$dup` in another
+/// is treated as living in the same logical section. This is only ever paired
+/// with an exact-symbol-name guard (`names_match`), so it cannot credit two
+/// genuinely different callees; it only stops a benign COMDAT-bucket difference
+/// from masking a real, name-verified match.
+pub(crate) fn section_name_eq_comdat(
+    left_obj: &Object,
+    right_obj: &Object,
+    left_section_index: usize,
+    right_section_index: usize,
+) -> bool {
+    left_obj.sections.get(left_section_index).is_some_and(|left_section| {
+        right_obj.sections.get(right_section_index).is_some_and(|right_section| {
+            section_base_name(&left_section.name) == section_base_name(&right_section.name)
+        })
+    })
+}
+
 /// Normalize a mangled symbol by stripping array dimension sizes.
 /// Template instantiations differing only in array sizes produce identical code
 /// (arrays decay to pointers), making them ICF-equivalent.
@@ -889,8 +925,20 @@ fn reloc_eq(
     match (&left_reloc.symbol.section, &right_reloc.symbol.section) {
         (Some(sl), Some(sr)) => {
             if name_only {
-                // Section must match and the symbol names must match; addend ignored.
-                return section_name_eq(left_obj, right_obj, *sl, *sr) && names_match;
+                // NameOnly is address-agnostic: it keys purely on the target SYMBOL
+                // NAME (`names_match`, exact or equivalence-mapped). The section check
+                // only guards against a name coincidence across genuinely different
+                // logical sections (e.g. code vs data). It must therefore be tolerant
+                // of the COMDAT grouping suffix: MSVC parks a DEFINED COMDAT symbol
+                // (template instantiation, inline fn) into a `$`-suffixed bucket
+                // (`.text$dup`, `.text$mn`, …) chosen at compile/link time, so the
+                // very same symbol lands in `.text` in one object and `.text$dup` in
+                // another. That suffix is a build artifact, not a semantic property of
+                // the callee — see LightPreset::FillSpotPresetData, where the fixed and
+                // target objects both call `ObjRefConcrete<RndDrawable>::SetObjConcrete`
+                // but the target parked its definition in `.text$dup`. Strict name
+                // equality wrongly rejected the match and left the fix unmeasurable.
+                return section_name_eq_comdat(left_obj, right_obj, *sl, *sr) && names_match;
             }
             // Match if section and name or address match
             section_name_eq(left_obj, right_obj, *sl, *sr)
@@ -1388,6 +1436,60 @@ mod tests {
         obj
     }
 
+    /// Like `obj_with_reloc`, but the reloc TARGET symbol is a DEFINED symbol that
+    /// lives in its own section named `target_section` (e.g. `.text` vs `.text$dup`).
+    /// Models an in-object COMDAT template instantiation, whose section the compiler
+    /// may park in any COMDAT bucket of the logical section.
+    #[cfg(feature = "std")]
+    fn obj_with_reloc_in_section(target_name: &str, addend: i64, target_section: &str) -> Object {
+        let mut obj = Object::default();
+        // section 0: "text" holding the caller's 4 bytes of code + the relocation.
+        obj.sections.push(Section {
+            id: "text".to_string(),
+            name: "text".to_string(),
+            address: 0,
+            size: 4,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; 4]),
+            relocations: vec![Relocation {
+                flags: RelocationFlags::Coff(1),
+                address: 0,
+                target_symbol: 1,
+                addend,
+            }],
+            ..Default::default()
+        });
+        // section 1: the COMDAT bucket the target definition lives in.
+        obj.sections.push(Section {
+            id: format!("{target_section}-0"),
+            name: target_section.to_string(),
+            address: 0,
+            size: 4,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; 4]),
+            ..Default::default()
+        });
+        // symbol 0: the caller function in section 0.
+        obj.symbols.push(Symbol {
+            name: "caller".to_string(),
+            address: 0,
+            size: 4,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        });
+        // symbol 1: the DEFINED relocation target, in its own COMDAT section.
+        obj.symbols.push(Symbol {
+            name: target_name.to_string(),
+            address: 0,
+            size: 4,
+            kind: SymbolKind::Function,
+            section: Some(1),
+            ..Default::default()
+        });
+        obj
+    }
+
     #[cfg(feature = "std")]
     fn resolved_ref(obj: &Object) -> ResolvedInstructionRef<'_> {
         let section = &obj.sections[0];
@@ -1459,5 +1561,58 @@ mod tests {
         ] {
             assert!(reloc_match(&left, &right, mode), "exact match should hold for {mode:?}");
         }
+    }
+
+    // ---- Defined/COMDAT reloc targets (blind spot 3) ----
+    // A relocation whose target is a DEFINED in-object symbol (typically a COMDAT
+    // template instantiation) must be credited by NAME even when the compiler parked
+    // its definition in a different COMDAT bucket of the same logical section
+    // (`.text` vs `.text$dup`). The `$` suffix is a build artifact; the exact symbol
+    // name is the identity. Fixture: LightPreset::FillSpotPresetData, where the fixed
+    // and target objects both call `ObjRefConcrete<RndDrawable>::SetObjConcrete` but
+    // the target defined it in `.text$dup`.
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_only_comdat_bucket_variant_matches() {
+        // Same DEFINED callee, but parked in `.text$dup` (left) vs `.text` (right).
+        let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
+        let right = obj_with_reloc_in_section("Callee", 0x100, ".text");
+        // NameOnly: base section name (`.text`) matches AND the symbol name matches
+        // -> MATCH. Before the fix this was rejected (`.text$dup` != `.text`), which
+        // is exactly blind spot 3.
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_only_comdat_bucket_variant_wrong_name_still_diffs() {
+        // Two DIFFERENT template instantiations, each in its own COMDAT bucket.
+        // The COMDAT-bucket tolerance must NOT let a genuine wrong-callee slip past:
+        // the exact-name guard still rejects it.
+        let left = obj_with_reloc_in_section("ObjRefConcrete_RndDrawable", 0x100, ".text$dup");
+        let right = obj_with_reloc_in_section("ObjRefConcrete_RndTransformable", 0x100, ".text");
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_only_same_name_different_logical_section_diffs() {
+        // Same symbol name but genuinely different LOGICAL sections (code vs data):
+        // the base names (`.text` vs `.data`) differ, so NameOnly does NOT match.
+        // This pins that the tolerance only spans COMDAT buckets, not section kinds.
+        let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
+        let right = obj_with_reloc_in_section("Callee", 0x100, ".data");
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_section_base_name_strips_comdat_suffix() {
+        assert_eq!(section_base_name(".text"), ".text");
+        assert_eq!(section_base_name(".text$dup"), ".text");
+        assert_eq!(section_base_name(".text$mn"), ".text");
+        assert_eq!(section_base_name(".rdata$r"), ".rdata");
+        assert_ne!(section_base_name(".text$dup"), section_base_name(".data"));
     }
 }
