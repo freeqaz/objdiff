@@ -16,6 +16,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -30,6 +31,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -44,6 +46,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -58,6 +61,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -72,6 +76,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -86,6 +91,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -100,6 +106,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -121,6 +128,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -142,6 +150,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -163,6 +172,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -184,6 +194,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -205,6 +216,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -226,6 +238,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -247,6 +260,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -268,6 +282,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -289,6 +304,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -310,6 +326,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -331,6 +348,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -352,6 +370,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -373,6 +392,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -387,6 +407,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -401,6 +422,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -415,6 +437,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -429,6 +452,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -450,6 +474,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -471,6 +496,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -485,6 +511,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -506,6 +533,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -520,6 +548,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -534,6 +563,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -555,6 +585,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -576,6 +607,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -590,6 +622,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -604,6 +637,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -625,6 +659,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -646,6 +681,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -660,6 +696,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -681,6 +718,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -702,6 +740,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -716,6 +755,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -737,6 +777,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -759,6 +800,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -773,6 +815,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -787,6 +830,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -801,6 +845,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -815,6 +860,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -829,6 +875,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -850,6 +897,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -871,6 +919,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -885,6 +934,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -915,6 +965,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -929,6 +980,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -943,6 +995,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -964,6 +1017,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -978,6 +1032,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -992,6 +1047,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1006,6 +1062,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1020,6 +1077,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1034,6 +1092,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1055,6 +1114,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1069,6 +1129,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1090,6 +1151,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1111,6 +1173,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1125,6 +1188,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1146,6 +1210,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1160,6 +1225,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1174,6 +1240,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1195,6 +1262,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1209,6 +1277,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1223,6 +1292,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1244,6 +1314,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1265,6 +1336,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1286,6 +1358,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1307,6 +1380,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1328,6 +1402,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1342,6 +1417,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1363,6 +1439,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1387,6 +1464,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1401,6 +1479,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1415,6 +1494,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1429,6 +1509,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1450,6 +1531,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1464,6 +1546,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1478,6 +1561,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1492,6 +1576,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1515,6 +1600,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1529,6 +1615,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1543,6 +1630,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1557,6 +1645,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1571,6 +1660,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1592,6 +1682,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1613,6 +1704,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1627,6 +1719,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1641,6 +1734,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1655,6 +1749,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1676,6 +1771,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1697,6 +1793,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1711,6 +1808,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1725,6 +1823,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1739,6 +1838,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1760,6 +1860,7 @@ expression: diff.instruction_rows
             },
         ),
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1774,6 +1875,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1795,6 +1897,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1809,6 +1912,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1823,6 +1927,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1837,6 +1942,7 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1858,6 +1964,7 @@ expression: diff.instruction_rows
         ),
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
     InstructionDiffRow {
         ins_ref: Some(
@@ -1872,5 +1979,6 @@ expression: diff.instruction_rows
         branch_from: None,
         branch_to: None,
         arg_diff: [],
+        masked_equal: false,
     },
 ]

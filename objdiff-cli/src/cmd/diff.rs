@@ -169,6 +169,14 @@ pub struct DiffOutput {
     pub diff_regions: Option<Vec<super::analysis::DiffRegion>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Vec<InstructionDiffOutput>>,
+    /// Number of instruction rows scored `equal` only because a normalization
+    /// erased a real byte/relocation difference. Disclosure only — this does
+    /// NOT change any match percent. 0 for a clean match.
+    pub masked_equal_rows: u32,
+    /// Subset of `masked_equal_rows` attributable to relocation-mode relaxation
+    /// (`functionRelocDiffs=none` skipping a reloc, or NameOnly ignoring the
+    /// addend). The #1 masking channel — a `bl` to a different callee.
+    pub reloc_ignored_rows: u32,
     /// Byte/relocation diff for data symbols (populated with --include-data).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_diff: Option<DataDiffOutput>,
@@ -247,6 +255,8 @@ pub struct DataRelocationOutput {
 
 fn is_zero(v: &i64) -> bool { *v == 0 }
 
+fn is_false(v: &bool) -> bool { !*v }
+
 fn data_diff_kind_str(kind: objdiff_core::diff::DataDiffKind) -> &'static str {
     use objdiff_core::diff::DataDiffKind;
     match kind {
@@ -314,6 +324,11 @@ pub struct InstructionDiffOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<InstructionInfo>,
     pub match_type: String,
+    /// Disclosure: this row was scored `equal` only because a normalization
+    /// (reloc-mode relaxation, FP-anchor slip compensation) erased a real
+    /// difference. Omitted when false. Never affects the score.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub masked_equal: bool,
     /// Detailed breakdown of which arguments differ (only for diff_arg type).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_breakdown: Option<InstructionDiffBreakdown>,
@@ -1170,6 +1185,8 @@ fn run_json(
         diff_regions,
         // Only include instructions in output if explicitly requested (not just for summary)
         instructions: if wants_instructions { instructions } else { None },
+        masked_equal_rows: symbol_diff.masked_equal_rows,
+        reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
         data_diff,
     };
 
@@ -1568,6 +1585,8 @@ fn run_batch(args: Args) -> Result<()> {
                                                 insert_delete_clusters: None,
                                                 diff_regions: None,
                                                 instructions: None,
+                                                masked_equal_rows: fb_sd.masked_equal_rows,
+                                                reloc_ignored_rows: fb_sd.reloc_ignored_rows,
                                                 data_diff: None,
                                             };
                                             lines.push(serde_json::to_string(&output)?);
@@ -1645,6 +1664,8 @@ fn run_batch(args: Args) -> Result<()> {
                     insert_delete_clusters: None,
                     diff_regions: None,
                     instructions: None,
+                    masked_equal_rows: symbol_diff.masked_equal_rows,
+                    reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
                     data_diff: None,
                 };
 
@@ -1991,11 +2012,16 @@ fn build_instruction_diffs(
                 .map(|b| BranchTo { target_index: b.ins_idx, branch_idx: b.branch_idx })
         };
 
+        // Masked-equality disclosure bit, from whichever side carries the row.
+        let masked_equal = left_row.map(|r| r.masked_equal).unwrap_or(false)
+            || right_row.map(|r| r.masked_equal).unwrap_or(false);
+
         instructions.push(InstructionDiffOutput {
             index: idx,
             target: target_info,
             base: base_info,
             match_type: match_type_str(kind).to_string(),
+            masked_equal,
             diff_breakdown,
             target_branch_from: branch_from(left_row),
             target_branch_to: branch_to(left_row),
@@ -3140,6 +3166,7 @@ mod tests {
                 source_file: None,
             }),
             match_type: match_type.to_string(),
+            masked_equal: false,
             diff_breakdown: None,
             target_branch_from: None,
             target_branch_to: None,
@@ -3423,6 +3450,8 @@ mod tests {
             insert_delete_clusters: None,
             diff_regions: None,
             instructions: Some(instructions),
+            masked_equal_rows: 0,
+            reloc_ignored_rows: 0,
             data_diff: None,
         }
     }

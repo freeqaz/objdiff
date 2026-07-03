@@ -52,6 +52,17 @@ pub struct SymbolDiff {
     /// Match percent excluding arg-only penalties (register/offset swaps).
     pub match_percent_normalized: Option<f32>,
     pub diff_score: Option<(u64, u64)>,
+    /// Number of instruction rows scored `equal` only because some
+    /// normalization erased a real byte/relocation difference (reloc-mode
+    /// relaxation, FP-anchor slip compensation, …). Disclosure only: this does
+    /// NOT change `match_percent`/`diff_score`. `reloc_ignored_rows` is the
+    /// subset attributable to relocation-mode relaxation.
+    pub masked_equal_rows: u32,
+    /// Subset of `masked_equal_rows` whose masking was a relocation-target
+    /// difference smoothed over by `function_reloc_diffs` (None relaxation or
+    /// NameOnly addend-ignoring). This is the #1 masking channel (wrong callee
+    /// via `bl`).
+    pub reloc_ignored_rows: u32,
     pub instruction_rows: Vec<InstructionDiffRow>,
     pub data_rows: Vec<DataDiffRow>,
 }
@@ -74,6 +85,10 @@ pub struct InstructionDiffRow {
     pub branch_to: Option<InstructionBranchTo>,
     /// Arg diffs
     pub arg_diff: Vec<InstructionArgDiffIndex>,
+    /// True when this row was scored `equal` (kind == None) only because a
+    /// normalization erased a real byte/relocation difference. Disclosure bit:
+    /// it never changes the score. See `SymbolDiff::masked_equal_rows`.
+    pub masked_equal: bool,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]

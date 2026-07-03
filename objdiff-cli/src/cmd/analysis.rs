@@ -110,6 +110,12 @@ pub enum PatternType {
     FselTernary,
     /// Float to int to float conversion — fctiwz + stfd/fmr vs direct float use
     FloatToIntToFloat,
+    /// Signed/unsigned instruction-pair mismatch at aligned rows — one side
+    /// emits the signed opcode, the other the logical/unsigned counterpart
+    /// (lha/lhz, srawi/srwi, cmpw/cmplw, extsb/extsh). Fingerprint of a
+    /// source-level signedness/width type disagreement (e.g. `char` vs
+    /// `unsigned char`, `int` vs `unsigned`, loop-index signedness).
+    SignednessMismatch,
 }
 
 impl PatternType {
@@ -135,6 +141,7 @@ impl PatternType {
             PatternType::FloatPrecisionMismatch => "FLOAT_PRECISION_MISMATCH",
             PatternType::FselTernary => "FSEL_TERNARY",
             PatternType::FloatToIntToFloat => "FLOAT_TO_INT_TO_FLOAT",
+            PatternType::SignednessMismatch => "SIGNEDNESS_MISMATCH",
         }
     }
 }
@@ -293,6 +300,20 @@ pub struct FloatPrecisionMismatchEntry {
     pub base_op: String,
 }
 
+/// Information about a signed/unsigned instruction-pair mismatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignednessMismatchEntry {
+    pub index: usize,
+    pub target_op: String,
+    pub base_op: String,
+    /// The signed member of the matched pair (e.g. `lha`, `srawi`, `cmpw`,
+    /// `extsb`). Disambiguates which side carried the signed interpretation.
+    pub signed_op: String,
+    /// The unsigned/logical member of the matched pair (e.g. `lhz`, `srwi`,
+    /// `cmplw`, `extsh`).
+    pub unsigned_op: String,
+}
+
 /// Details specific to each pattern type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -337,6 +358,8 @@ pub enum PatternDetails {
     FselTernary { count: usize },
     /// Float to int to float conversion — fctiwz + stfd/fmr vs direct float use
     FloatToIntToFloat { count: usize },
+    /// Signed/unsigned instruction-pair mismatches at aligned rows
+    SignednessMismatch { mismatches: Vec<SignednessMismatchEntry> },
 }
 
 /// A detected pattern in the instruction diff.
@@ -789,6 +812,33 @@ impl Pattern {
                 truncated: false,
                 total_items: *count,
             },
+            PatternDetails::SignednessMismatch { mismatches } => {
+                // Group by signed↔unsigned opcode pair
+                let mut pair_counts: HashMap<String, usize> = HashMap::new();
+                for m in mismatches {
+                    let key = format!("{}↔{}", m.signed_op, m.unsigned_op);
+                    *pair_counts.entry(key).or_insert(0) += 1;
+                }
+                let mut sorted: Vec<_> = pair_counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let dominant = sorted.first().map(|(k, _)| k.as_str()).unwrap_or("?");
+                let one_line = format!(
+                    "{} signed/unsigned mismatch(es), dominated by {}",
+                    mismatches.len(),
+                    dominant
+                );
+                let top_details: Vec<String> = sorted
+                    .iter()
+                    .take(3)
+                    .map(|(pair, count)| format!("{}: {} instruction(s)", pair, count))
+                    .collect();
+                PatternSummary {
+                    one_line,
+                    top_details,
+                    truncated: sorted.len() > 3,
+                    total_items: mismatches.len(),
+                }
+            }
         }
     }
 }
@@ -1095,6 +1145,7 @@ pub fn compute_diff_regions(
                         PatternType::FloatPrecisionMismatch => "float precision",
                         PatternType::FselTernary => "fsel ternary",
                         PatternType::FloatToIntToFloat => "float-to-int-to-float",
+                        PatternType::SignednessMismatch => "signed/unsigned mismatch",
                     };
                     note_parts.push(format!("{} {}", region_instr_count, pname));
                 }
@@ -1314,6 +1365,11 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
                 .count()
                 .min(*count)
         }
+        PatternDetails::SignednessMismatch { mismatches } => {
+            let start_idx = instructions.first().map(|i| i.index).unwrap_or(0);
+            let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
+            mismatches.iter().filter(|m| m.index >= start_idx && m.index <= end_idx).count()
+        }
     }
 }
 
@@ -1454,6 +1510,10 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
         PatternType::FloatToIntToFloat => {
             &["fixable-casting.md#float-to-int-to-float-reconversion"]
         }
+        PatternType::SignednessMismatch => &[
+            "fixable-comparison.md#signed-vs-unsigned-comparison",
+            "fixable-casting.md#signedness-and-width-mismatch",
+        ],
     };
     paths.iter().map(|p| format!("{}{}", DOC_BASE, p)).collect()
 }
@@ -3121,6 +3181,75 @@ pub fn detect_float_to_int_to_float(instructions: &[InstructionDiffOutput]) -> O
     })
 }
 
+/// Known PPC signed ↔ unsigned/logical opcode pairs, ordered `(signed,
+/// unsigned)`.
+///
+/// - `lha`/`lhz`   — load halfword *algebraic* (sign-extend) vs *zero* extend.
+/// - `srawi`/`srwi` — shift right *algebraic* word imm (arithmetic, sign-fill)
+///   vs shift right *logical* word imm (zero-fill).
+/// - `cmpw`/`cmplw` — compare word (signed) vs compare *logical* word (unsigned).
+/// - `extsb`/`extsh` — extend sign byte (`char`) vs extend sign halfword
+///   (`short`); a width/type disagreement on a signed value.
+///
+/// A `replace` row whose two sides are the two members of one pair is a strong
+/// fingerprint of a source-level signedness (or, for extsb/extsh, width) type
+/// disagreement — the #2 hazard family in the validator-accuracy audit.
+const SIGNEDNESS_PAIRS: &[(&str, &str)] =
+    &[("lha", "lhz"), ("srawi", "srwi"), ("cmpw", "cmplw"), ("extsb", "extsh")];
+
+/// Detect signed/unsigned instruction-pair mismatches at aligned rows.
+///
+/// Fires when a `replace` row pairs the two members of a known signed/unsigned
+/// PPC opcode pair (in either direction). Unlike `detect_comparison_style`
+/// (which keys on immediate deltas at `diff_arg` rows for `cmpwi`/`cmplwi`),
+/// this keys purely on the opcode identity of the two aligned instructions,
+/// so it is disjoint from the existing detectors. Match-neutral by
+/// construction on equal functions: an `equal` row is never inspected.
+pub fn detect_signedness_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    let mut mismatches: Vec<SignednessMismatchEntry> = Vec::new();
+
+    for instr in instructions {
+        if instr.match_type != "replace" {
+            continue;
+        }
+        let (Some(target), Some(base)) = (&instr.target, &instr.base) else { continue };
+
+        let t_op = target.opcode.as_str();
+        let b_op = base.opcode.as_str();
+
+        // Find the pair this row matches (in either direction). Resolve which
+        // side is signed independent of which side is target vs base.
+        let matched = SIGNEDNESS_PAIRS.iter().find(|(signed, unsigned)| {
+            (t_op == *signed && b_op == *unsigned) || (t_op == *unsigned && b_op == *signed)
+        });
+
+        if let Some((signed, unsigned)) = matched {
+            mismatches.push(SignednessMismatchEntry {
+                index: instr.index,
+                target_op: t_op.to_string(),
+                base_op: b_op.to_string(),
+                signed_op: signed.to_string(),
+                unsigned_op: unsigned.to_string(),
+            });
+        }
+    }
+
+    if mismatches.is_empty() {
+        return None;
+    }
+
+    let count = mismatches.len();
+
+    Some(Pattern {
+        pattern: PatternType::SignednessMismatch,
+        confidence: Confidence::High,
+        instruction_count: count,
+        fixability: Fixability::LikelyFixable,
+        details: PatternDetails::SignednessMismatch { mismatches },
+        doc_urls: pattern_doc_urls(PatternType::SignednessMismatch),
+    })
+}
+
 // =============================================================================
 // Analysis
 // =============================================================================
@@ -3190,6 +3319,9 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
     if let Some(p) = detect_float_to_int_to_float(instructions) {
         patterns.push(p);
     }
+    if let Some(p) = detect_signedness_mismatch(instructions) {
+        patterns.push(p);
+    }
 
     // Count total mismatches
     let total_mismatches = instructions.iter().filter(|i| i.match_type != "equal").count();
@@ -3224,6 +3356,7 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
             "FLOAT_PRECISION_MISMATCH",
             "FSEL_TERNARY",
             "FLOAT_TO_INT_TO_FLOAT",
+            "SIGNEDNESS_MISMATCH",
         ],
         unattributed_mismatches: unattributed,
     }
@@ -3846,6 +3979,7 @@ mod tests {
                 source_file: None,
             }),
             match_type: match_type.to_string(),
+            masked_equal: false,
             diff_breakdown: None,
             target_branch_from: None,
             target_branch_to: None,
@@ -3886,6 +4020,7 @@ mod tests {
                 source_file: None,
             }),
             match_type: match_type.to_string(),
+            masked_equal: false,
             diff_breakdown: None,
             target_branch_from: None,
             target_branch_to: None,
@@ -5406,6 +5541,88 @@ mod tests {
 
         let pattern = detect_float_precision_mismatch(&instructions);
         assert!(pattern.is_none(), "fmul vs fadd is not a precision pair");
+    }
+
+    #[test]
+    fn test_detect_signedness_mismatch_per_pair() {
+        // Each named signed/unsigned pair, in both target/base directions,
+        // must detect at HIGH confidence with exactly one attributed row.
+        let pairs = [("lha", "lhz"), ("srawi", "srwi"), ("cmpw", "cmplw"), ("extsb", "extsh")];
+        for (signed, unsigned) in pairs {
+            for (t_op, b_op) in [(signed, unsigned), (unsigned, signed)] {
+                let instructions = vec![make_instr(
+                    0,
+                    "replace",
+                    Some(t_op),
+                    Some("r3, r4, r5"),
+                    Some(b_op),
+                    Some("r3, r4, r5"),
+                )];
+                let pattern = detect_signedness_mismatch(&instructions)
+                    .unwrap_or_else(|| panic!("should detect {t_op} vs {b_op}"));
+                assert_eq!(pattern.pattern, PatternType::SignednessMismatch);
+                assert_eq!(pattern.confidence, Confidence::High, "{t_op} vs {b_op}");
+                assert_eq!(pattern.instruction_count, 1, "{t_op} vs {b_op}");
+                if let PatternDetails::SignednessMismatch { mismatches } = &pattern.details {
+                    assert_eq!(mismatches.len(), 1);
+                    assert_eq!(mismatches[0].signed_op, signed);
+                    assert_eq!(mismatches[0].unsigned_op, unsigned);
+                    assert_eq!(mismatches[0].target_op, t_op);
+                    assert_eq!(mismatches[0].base_op, b_op);
+                } else {
+                    panic!("wrong details variant for {t_op} vs {b_op}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_signedness_mismatch_equal_function_no_detection() {
+        // An all-`equal` function — including rows carrying the signed opcodes
+        // matched on BOTH sides — must yield ZERO detections. `equal` rows are
+        // never inspected, so identical signed opcodes are not a mismatch.
+        let instructions = vec![
+            make_instr(0, "equal", Some("lha"), Some("r3, 0(r4)"), Some("lha"), Some("r3, 0(r4)")),
+            make_instr(1, "equal", Some("cmpw"), Some("cr0, r3, r4"), Some("cmpw"), Some("cr0, r3, r4")),
+            make_instr(2, "equal", Some("srawi"), Some("r3, r3, 2"), Some("srawi"), Some("r3, r3, 2")),
+            make_instr(3, "equal", Some("extsb"), Some("r3, r3"), Some("extsb"), Some("r3, r3")),
+        ];
+        assert!(
+            detect_signedness_mismatch(&instructions).is_none(),
+            "equal-function fixture must produce zero signedness detections"
+        );
+    }
+
+    #[test]
+    fn test_detect_signedness_mismatch_non_pair_no_detection() {
+        // A `replace` row whose opcodes are NOT a known signed/unsigned pair
+        // (lha vs lwz — both loads, but not a signedness counterpart) must not
+        // fire. Guards against over-broad matching.
+        let instructions = vec![
+            make_instr(0, "replace", Some("lha"), Some("r3, 0(r4)"), Some("lwz"), Some("r3, 0(r4)")),
+            make_instr(1, "replace", Some("cmpw"), Some("cr0, r3, r4"), Some("cmpwi"), Some("cr0, r3, 0")),
+        ];
+        assert!(
+            detect_signedness_mismatch(&instructions).is_none(),
+            "non-pair replace rows must not be flagged as signedness mismatches"
+        );
+    }
+
+    #[test]
+    fn test_detect_signedness_mismatch_multiple_and_analyze() {
+        // Multiple distinct pairs across a function accumulate; analyze_instructions
+        // surfaces the pattern and always lists it in patterns_checked.
+        let instructions = vec![
+            make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")),
+            make_instr(1, "replace", Some("lha"), Some("r3, 0(r4)"), Some("lhz"), Some("r3, 0(r4)")),
+            make_instr(2, "replace", Some("cmplw"), Some("cr0, r3, r4"), Some("cmpw"), Some("cr0, r3, r4")),
+        ];
+        let pattern = detect_signedness_mismatch(&instructions).expect("should detect");
+        assert_eq!(pattern.instruction_count, 2);
+
+        let analysis = analyze_instructions(&instructions);
+        assert!(analysis.patterns_checked.contains(&"SIGNEDNESS_MISMATCH"));
+        assert!(analysis.has_pattern(PatternType::SignednessMismatch));
     }
 
     #[test]

@@ -228,6 +228,12 @@ pub fn diff_code(
     let fp_anchor_equal_rows = BTreeSet::<usize>::new();
 
     let mut diff_state = InstructionDiffState::default();
+    // Masked-equality disclosure counters (do not affect the score). A row is
+    // `masked_equal` when it was scored equal (kind == None) only because a
+    // normalization erased a real difference; `reloc_ignored_rows` is the
+    // subset attributable to reloc-mode relaxation.
+    let mut masked_equal_rows: u32 = 0;
+    let mut reloc_ignored_rows: u32 = 0;
     for (i, (left_row, right_row)) in left_rows.iter_mut().zip(right_rows.iter_mut()).enumerate() {
         // FP-anchor compensated pair: provably-equal effective address despite a
         // differing frame-anchor constant. Score as equal, no penalty.
@@ -236,6 +242,9 @@ pub fn diff_code(
             right_row.kind = InstructionDiffKind::None;
             left_row.arg_diff = Vec::new();
             right_row.arg_diff = Vec::new();
+            left_row.masked_equal = true;
+            right_row.masked_equal = true;
+            masked_equal_rows += 1;
             continue;
         }
         let result = diff_instruction(
@@ -256,6 +265,12 @@ pub fn diff_code(
         right_row.kind = result.kind;
         left_row.arg_diff = result.left_args_diff;
         right_row.arg_diff = result.right_args_diff;
+        if result.masked_reloc {
+            left_row.masked_equal = true;
+            right_row.masked_equal = true;
+            masked_equal_rows += 1;
+            reloc_ignored_rows += 1;
+        }
     }
 
     let max_score = left_ops.len() as u64 * PENALTY_INSERT_DELETE;
@@ -281,6 +296,8 @@ pub fn diff_code(
             match_percent: Some(match_percent),
             match_percent_normalized: Some(match_percent_normalized),
             diff_score: Some((diff_score, max_score)),
+            masked_equal_rows,
+            reloc_ignored_rows,
             instruction_rows: left_rows,
             ..Default::default()
         },
@@ -289,6 +306,8 @@ pub fn diff_code(
             match_percent: Some(match_percent),
             match_percent_normalized: Some(match_percent_normalized),
             diff_score: Some((diff_score, max_score)),
+            masked_equal_rows,
+            reloc_ignored_rows,
             instruction_rows: right_rows,
             ..Default::default()
         },
@@ -959,12 +978,44 @@ struct InstructionDiffResult {
     kind: InstructionDiffKind,
     left_args_diff: Vec<InstructionArgDiffIndex>,
     right_args_diff: Vec<InstructionArgDiffIndex>,
+    /// This row was scored `equal` (kind == None) but a relocation-target
+    /// difference was smoothed over by `function_reloc_diffs` (None relaxation
+    /// or NameOnly addend-ignoring). Disclosure only — the score is unchanged.
+    masked_reloc: bool,
 }
 
 impl InstructionDiffResult {
     #[inline]
     const fn new(kind: InstructionDiffKind) -> Self {
-        Self { kind, left_args_diff: Vec::new(), right_args_diff: Vec::new() }
+        Self {
+            kind,
+            left_args_diff: Vec::new(),
+            right_args_diff: Vec::new(),
+            masked_reloc: false,
+        }
+    }
+}
+
+/// Byte-strict relocation identity for a paired instruction: the relocations
+/// are equal WITHOUT any normalization (same presence, flags, target-symbol
+/// name, and addend). Used only to detect masked equality — when `reloc_eq`
+/// (which applies the configured relaxations, name equivalences, template
+/// array-size normalization, pool address_eq, …) accepts a pair that is NOT
+/// strictly equal, the row's equality relied on a normalization and is
+/// disclosed as `masked`. Intentionally strict: it is an upper-bound
+/// disclosure signal, never a score input.
+fn relocs_strictly_equal(
+    left_ins: ResolvedInstructionRef,
+    right_ins: ResolvedInstructionRef,
+) -> bool {
+    match (left_ins.relocation, right_ins.relocation) {
+        (None, None) => true,
+        (Some(l), Some(r)) => {
+            l.relocation.flags == r.relocation.flags
+                && l.relocation.addend == r.relocation.addend
+                && l.symbol.name == r.symbol.name
+        }
+        _ => false,
     }
 }
 
@@ -1110,10 +1161,23 @@ fn diff_instruction(
             result.kind = InstructionDiffKind::OpMismatch;
             state.diff_score += PENALTY_REG_DIFF;
         }
+        // Disclosure: the row was scored equal (all args accepted, same
+        // mnemonic) but a relocation difference was smoothed over by the
+        // configured reloc relaxation. Flag it — the score is untouched.
+        if result.kind == InstructionDiffKind::None
+            && !relocs_strictly_equal(left_resolved, right_resolved)
+        {
+            result.masked_reloc = true;
+        }
         return Ok(result);
     }
 
-    Ok(InstructionDiffResult::new(InstructionDiffKind::None))
+    // Reached only when the raw code bytes AND `reloc_eq` both matched. If the
+    // relocations were not byte-strictly equal, equality relied on a reloc-mode
+    // normalization (e.g. `bl` to a different callee under `None`): disclose it.
+    let mut result = InstructionDiffResult::new(InstructionDiffKind::None);
+    result.masked_reloc = !relocs_strictly_equal(left_resolved, right_resolved);
+    Ok(result)
 }
 
 #[cfg(test)]
