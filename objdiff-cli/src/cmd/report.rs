@@ -724,6 +724,7 @@ fn report_object(
                 virtual_address: section.virtual_address,
             }),
             address: None,
+            masked_equal: None,
         });
 
         match section.kind {
@@ -783,6 +784,7 @@ fn report_object(
                     virtual_address: symbol.virtual_address,
                 }),
                 address: symbol.address.checked_sub(section.address),
+                masked_equal: None,
             });
             if match_percent_normalized == 100.0 {
                 measures.matched_functions += 1;

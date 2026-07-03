@@ -63,6 +63,16 @@ pub struct SymbolDiff {
     /// NameOnly addend-ignoring). This is the #1 masking channel (wrong callee
     /// via `bl`).
     pub reloc_ignored_rows: u32,
+    /// True when this symbol was *paired* only because MSVC EH funclet
+    /// byte-signature fallback matched it (`pair_funclets_by_bytes`), not because
+    /// its name matched a partner. Funclet pairing masks reloc-targeted bytes and
+    /// may pair many byte-identical target funclets many-to-one onto one base
+    /// funclet, so the identity rests on a masked byte signature rather than a
+    /// name — a symbol-level normalization the per-row `masked_equal_rows` bits
+    /// cannot express. Disclosure only: it never changes `match_percent` /
+    /// `diff_score`. Over-disclosure (flagging a clean 1:1 byte-identical funclet
+    /// pairing) is the intended safe direction.
+    pub masked_equal_symbol: bool,
     pub instruction_rows: Vec<InstructionDiffRow>,
     pub data_rows: Vec<DataDiffRow>,
 }
@@ -277,6 +287,7 @@ pub fn diff_objs_filtered(
                 right: Some(right_symbol_ref),
                 prev: prev_symbol_ref,
                 section_kind,
+                masked_pairing,
             } => {
                 let (left_obj, left_out) = left.as_mut().unwrap();
                 let (right_obj, right_out) = right.as_mut().unwrap();
@@ -293,6 +304,15 @@ pub fn diff_objs_filtered(
                         )?;
                         left_out.symbols[left_symbol_ref] = left_diff;
                         right_out.symbols[right_symbol_ref] = right_diff;
+                        // Disclosure: the pair exists only because funclet
+                        // byte-signature fallback matched it (masked reloc bytes
+                        // and/or many-to-one over-subscription). The score is
+                        // untouched; this flags that the equality/identity rests
+                        // on a symbol-level normalization.
+                        if masked_pairing {
+                            left_out.symbols[left_symbol_ref].masked_equal_symbol = true;
+                            right_out.symbols[right_symbol_ref].masked_equal_symbol = true;
+                        }
 
                         if let Some(prev_symbol_ref) = prev_symbol_ref {
                             let (_prev_obj, prev_out) = prev.as_mut().unwrap();
@@ -331,7 +351,13 @@ pub fn diff_objs_filtered(
                     SectionKind::Unknown => unreachable!(),
                 }
             }
-            SymbolMatch { left: Some(left_symbol_ref), right: None, prev: _, section_kind } => {
+            SymbolMatch {
+                left: Some(left_symbol_ref),
+                right: None,
+                prev: _,
+                section_kind,
+                masked_pairing: _,
+            } => {
                 let (left_obj, left_out) = left.as_mut().unwrap();
                 match section_kind {
                     SectionKind::Code => {
@@ -348,7 +374,13 @@ pub fn diff_objs_filtered(
                     SectionKind::Unknown => unreachable!(),
                 }
             }
-            SymbolMatch { left: None, right: Some(right_symbol_ref), prev: _, section_kind } => {
+            SymbolMatch {
+                left: None,
+                right: Some(right_symbol_ref),
+                prev: _,
+                section_kind,
+                masked_pairing: _,
+            } => {
                 let (right_obj, right_out) = right.as_mut().unwrap();
                 match section_kind {
                     SectionKind::Code => {
@@ -567,6 +599,11 @@ struct SymbolMatch {
     right: Option<usize>,
     prev: Option<usize>,
     section_kind: SectionKind,
+    /// This pair was produced by the MSVC EH funclet byte-signature fallback
+    /// (`pair_funclets_by_bytes`) rather than by name-based matching. It surfaces
+    /// on the resulting `SymbolDiff` as `masked_equal_symbol` for disclosure.
+    /// Only ever `true` for a both-sides (`left` and `right` present) Code pair.
+    masked_pairing: bool,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -650,6 +687,7 @@ fn apply_symbol_mappings(
             right: Some(right_symbol_index),
             prev: None, // TODO
             section_kind: left_section_kind,
+            masked_pairing: false,
         });
         left_used.insert(left_symbol_index);
         right_used.insert(right_symbol_index);
@@ -704,6 +742,7 @@ fn matching_symbols(
                         right: find_symbol(right, left, symbol_idx, Some(&right_used), fuzzy_literals),
                         prev: find_symbol(prev, left, symbol_idx, None, fuzzy_literals),
                         section_kind,
+                        masked_pairing: false,
                     }
                 } else {
                     // Cheap path: name-only match (skip data diffs for compiler-generated)
@@ -712,6 +751,7 @@ fn matching_symbols(
                         right: find_symbol_by_name(right, left, symbol_idx, Some(&right_used)),
                         prev: None,
                         section_kind,
+                        masked_pairing: false,
                     }
                 };
                 matches.push(symbol_match);
@@ -752,6 +792,7 @@ fn matching_symbols(
                     right: Some(symbol_idx),
                     prev: find_symbol(prev, right, symbol_idx, None, fuzzy_literals),
                     section_kind,
+                    masked_pairing: false,
                 };
                 matches.push(symbol_match);
                 if symbol_match.prev.is_some() {
@@ -1326,14 +1367,21 @@ pub fn reconcile_global_byte_matches(
         let item = &mut unit.functions[d.item_idx];
         item.match_percent_normalized = Some(100.0);
         item.fuzzy_match_percent = 100.0;
+        // Disclosure: this 100% came from the case-B byte-equality normalization,
+        // not a normal per-unit diff. Flag the item and count it on the unit's
+        // measures (aggregates up to report/category totals via `AddAssign`).
+        // Scores are untouched by this bit.
+        item.masked_equal = Some(true);
         if let Some(measures) = unit.measures.as_mut() {
             measures.matched_functions += 1;
             measures.matched_code += d.size;
+            measures.masked_equal_functions += 1;
             recalc_unit_measure_percents(measures);
         } else {
             let mut m = Measures::default();
             m.matched_functions = 1;
             m.matched_code = d.size;
+            m.masked_equal_functions = 1;
             unit.measures = Some(m);
         }
         promotions.push(GlobalPromotion {
@@ -1449,6 +1497,8 @@ fn pair_funclets_by_bytes(
             right: Some(r_idx),
             prev: None,
             section_kind: SectionKind::Code,
+            // Funclet byte-signature fallback: disclosed as `masked_equal_symbol`.
+            masked_pairing: true,
         });
         left_used.insert(l_idx);
         right_used.insert(r_idx);
@@ -1473,6 +1523,8 @@ fn pair_funclets_by_bytes(
             right: Some(r_idx),
             prev: None,
             section_kind: SectionKind::Code,
+            // Funclet byte-signature fallback: disclosed as `masked_equal_symbol`.
+            masked_pairing: true,
         });
         left_used.insert(l_idx);
         right_used.insert(r_idx);
@@ -1514,6 +1566,9 @@ fn pair_funclets_by_bytes(
                 right: Some(partner),
                 prev: None,
                 section_kind: SectionKind::Code,
+                // Over-subscribed many-to-one onto an already-consumed base
+                // funclet: disclosed as `masked_equal_symbol`.
+                masked_pairing: true,
             });
             left_used.insert(l_idx);
             // Intentionally do NOT touch `right_used`: many-to-one onto an identical
@@ -1560,6 +1615,8 @@ fn pair_funclets_by_bytes(
             right: Some(r_idx),
             prev: None,
             section_kind: SectionKind::Code,
+            // Funclet byte-signature fallback: disclosed as `masked_equal_symbol`.
+            masked_pairing: true,
         });
         left_used.insert(l_idx);
         right_used.insert(r_idx);

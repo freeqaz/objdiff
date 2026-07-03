@@ -177,6 +177,13 @@ pub struct DiffOutput {
     /// (`functionRelocDiffs=none` skipping a reloc, or NameOnly ignoring the
     /// addend). The #1 masking channel — a `bl` to a different callee.
     pub reloc_ignored_rows: u32,
+    /// Disclosure: this symbol was *paired* only by the MSVC EH funclet
+    /// byte-signature fallback (masked reloc bytes and/or many-to-one
+    /// over-subscription), not by a name match — its identity rests on a
+    /// symbol-level normalization. Does NOT change any match percent. Always
+    /// serialized (false for a name-matched symbol) so old consumers degrade
+    /// cleanly.
+    pub masked_equal_symbol: bool,
     /// Byte/relocation diff for data symbols (populated with --include-data).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_diff: Option<DataDiffOutput>,
@@ -1187,6 +1194,7 @@ fn run_json(
         instructions: if wants_instructions { instructions } else { None },
         masked_equal_rows: symbol_diff.masked_equal_rows,
         reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
+        masked_equal_symbol: symbol_diff.masked_equal_symbol,
         data_diff,
     };
 
@@ -1587,6 +1595,7 @@ fn run_batch(args: Args) -> Result<()> {
                                                 instructions: None,
                                                 masked_equal_rows: fb_sd.masked_equal_rows,
                                                 reloc_ignored_rows: fb_sd.reloc_ignored_rows,
+                                                masked_equal_symbol: fb_sd.masked_equal_symbol,
                                                 data_diff: None,
                                             };
                                             lines.push(serde_json::to_string(&output)?);
@@ -1666,6 +1675,7 @@ fn run_batch(args: Args) -> Result<()> {
                     instructions: None,
                     masked_equal_rows: symbol_diff.masked_equal_rows,
                     reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
+                    masked_equal_symbol: symbol_diff.masked_equal_symbol,
                     data_diff: None,
                 };
 
@@ -3452,6 +3462,7 @@ mod tests {
             instructions: Some(instructions),
             masked_equal_rows: 0,
             reloc_ignored_rows: 0,
+            masked_equal_symbol: false,
             data_diff: None,
         }
     }

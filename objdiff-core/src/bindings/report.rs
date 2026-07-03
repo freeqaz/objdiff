@@ -302,6 +302,7 @@ impl AddAssign for Measures {
         self.complete_data += other.complete_data;
         self.total_units += other.total_units;
         self.complete_units += other.complete_units;
+        self.masked_equal_functions += other.masked_equal_functions;
     }
 }
 
@@ -441,6 +442,7 @@ impl From<LegacyReportItem> for ReportItem {
                 virtual_address: value.address,
             }),
             address: None,
+            masked_equal: None,
         }
     }
 }

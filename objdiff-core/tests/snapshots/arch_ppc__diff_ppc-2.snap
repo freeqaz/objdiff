@@ -21,6 +21,7 @@ expression: "(target_symbol_diff, base_symbol_diff)"
         ),
         masked_equal_rows: 0,
         reloc_ignored_rows: 0,
+        masked_equal_symbol: false,
         instruction_rows: [
             InstructionDiffRow {
                 ins_ref: Some(
@@ -2809,6 +2810,7 @@ expression: "(target_symbol_diff, base_symbol_diff)"
         ),
         masked_equal_rows: 0,
         reloc_ignored_rows: 0,
+        masked_equal_symbol: false,
         instruction_rows: [
             InstructionDiffRow {
                 ins_ref: Some(
