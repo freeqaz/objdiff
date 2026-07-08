@@ -1,5 +1,18 @@
 # objdiff (MiloHax fork)
 
+## freeqaz fork
+
+This is a fork of [encounter/objdiff](https://github.com/encounter/objdiff), maintained by [freeqaz](https://github.com/freeqaz) for the [milohax](https://github.com/milohax) decompilation projects (Rock Band 3, Dance Central 3, and related titles). The canonical push target for this fork's work is **freeqaz/objdiff**; upstream is tracked read-only for merges/rebases.
+
+Since diverging from upstream, our commits add:
+
+- **A machine-readable analysis engine** for objdiff-cli: pattern detectors (linker-merged functions, bool masks, register swaps, comparison style, control flow, commutative op/offset swaps, and more), fixability verdicts, pattern summaries, call-diff analysis, insert/delete cluster detection, and per-region match breakdowns, all exportable as structured JSON or markdown via new `analysis` and `report` CLI subcommands.
+- **Diff engine refinements**: default-to-normalized-match display (with raw shown alongside), an option to stop normalizing immediate diffs so constants/offsets/vtable slots are counted, per-instruction branch-graph output, structured data-symbol diffs (`--include-data`, both-sides bytes, named relocation targets), a rewritten `match_guidance` with smarter unit resolution, and MSVC exception-handling funclet pairing by masked byte signature (with tests locking the behavior).
+- **Format/debugging support**: map file support for symbol resolution, DWARF2 line-info extraction (source file/line from debug info), and typed instruction arguments in JSON output, plus richer call-diff data (`frame_size`, `typed_args`).
+- **Housekeeping and docs**: clippy/fmt cleanup across the workspace, `no_std`/wasm/GUI compatibility fixes, version bumps, internal research notes, and a top-level README rewrite (below) describing the fork's rationale and its AI/MCP-agent integration story.
+
+See the section below ("Why this fork?") for the fuller narrative on the analysis engine and how it's used in agent-driven decompilation workflows.
+
 > **This is the [MiloHax](https://github.com/milohax) fork of [encounter/objdiff](https://github.com/encounter/objdiff).**
 > It adds automated analysis and pattern detection on top of upstream objdiff, designed to be consumed by AI agents working on decompilation at scale.
 
