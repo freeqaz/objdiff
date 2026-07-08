@@ -1,5 +1,18 @@
 # objdiff (MiloHax fork)
 
+## freeqaz fork
+
+This is a fork of [encounter/objdiff](https://github.com/encounter/objdiff), maintained by [freeqaz](https://github.com/freeqaz) for the [milohax](https://github.com/milohax) decomp work (Dance Central 3, Rock Band 3). The canonical push target for this fork's work is [freeqaz/objdiff](https://github.com/freeqaz/objdiff).
+
+Since diverging from upstream, this fork's ~39 commits add:
+
+- **Mismatch analysis engine**: 7 pattern detectors (LinkerMerged, BoolMask, RegisterSwap, ComparisonStyle, ControlFlow, CommutativeOpOrder, OffsetSwap), fixability verdicts (Complete/LikelyFixable/MaybeFixable/AtLimit/NeedsInvestigation), pattern summaries, call-diff analysis, insert/delete cluster detection, and diff-region computation, exposed via new `analysis`/`report` CLI subcommands with structured JSON and markdown output — designed to be consumed by AI agents (e.g. via MCP) as well as humans.
+- **MSVC/PowerPC (Xbox 360) diffing fidelity**: deterministic EH funclet pairing by masked byte signature, FP-anchor frame-establisher normalization, masked-equality disclosure with a SignednessMismatch pattern, case-B global byte-equality matching, a `FunctionRelocDiffs::NameOnly` reloc mode (name+section match across COMDAT buckets, ignoring addend), and `??__E`/`??__F` global init/dtor funclet pairing.
+- **Reporting/CLI improvements**: a rewritten `match_guidance` + smart unit resolution, per-instruction branch graph in CLI JSON output, structured data-symbol relocation diffs (`--include-data`), `frame_size`/typed instruction args in call-diff analysis, and a normalized-vs-raw match display toggle.
+- **Supporting infra**: map file symbol resolution, DWARF2 line info, typed instruction args in JSON output, and routine version bumps / clippy cleanups.
+
+See the "Why this fork?" section immediately below for the original fork rationale and AI/MCP integration context.
+
 > **This is the [MiloHax](https://github.com/milohax) fork of [encounter/objdiff](https://github.com/encounter/objdiff).**
 > It adds automated analysis and pattern detection on top of upstream objdiff, designed to be consumed by AI agents working on decompilation at scale.
 
