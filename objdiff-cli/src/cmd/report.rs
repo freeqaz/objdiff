@@ -98,10 +98,23 @@ impl ReportCache {
         let _ = std::fs::write(&self.path, buf);
     }
 
+    /// Bump whenever the *content* of a cached `ReportUnit` changes for reasons the
+    /// obj bytes + config args cannot express — i.e. whenever this file starts
+    /// emitting a new field or a different value for the same inputs. The cache key
+    /// is otherwise purely content-addressed, so without this a newly-installed
+    /// binary would keep serving units produced by the old one and silently report
+    /// the new fields as zero. Cost of a bump: one full re-diff of the report, no
+    /// change to any measure.
+    ///
+    /// 2 — populated `Measures.masked_equal_functions` (funclet over-subscription)
+    ///     and the per-item `ReportItem.masked_equal` bit.
+    const CACHE_LOGIC_VERSION: u32 = 2;
+
     /// Hash a unit's target and base .obj file contents together.
     fn hash_unit(object: &ObjectConfig, config_args: &[String]) -> u64 {
         use xxhash_rust::xxh3::xxh3_64;
         let mut combined = Vec::new();
+        combined.extend_from_slice(&Self::CACHE_LOGIC_VERSION.to_le_bytes());
         if let Some(p) = &object.target_path {
             if let Ok(data) = std::fs::read(p.as_str()) {
                 combined.extend_from_slice(&data);
@@ -703,6 +716,42 @@ fn report_object(
 
     let obj = target.as_ref().or(base.as_ref()).unwrap();
     let obj_diff = result.left.as_ref().or(result.right.as_ref()).unwrap();
+
+    // ── Disclosure: funclet OVER-SUBSCRIPTION (`pair_funclets_by_bytes` pass 2b) ──
+    //
+    // Pass 2b pairs a leftover anonymous target funclet many-to-one onto a base
+    // funclet that some other target symbol already owns, and the overflow is
+    // credited 100%. That credit is not backed by a symbol our compiled object
+    // actually supplies, so it inflates `matched_functions` with machine code we
+    // never generated.
+    //
+    // Detection needs no new plumbing: EVERY other pairing path (symbol mappings,
+    // name matching, funclet passes 1/2/3) inserts its base partner into
+    // `right_used` before moving on, so a base symbol can be the partner of at most
+    // one target symbol. Two or more target symbols sharing a `target_symbol` index
+    // is therefore *exactly* a pass-2b over-subscription, and a group of size N
+    // contributes exactly N-1 surplus symbols.
+    //
+    // Which member is the surplus one is genuinely arbitrary — the group is
+    // byte-identical by construction. We treat the member that did NOT come from
+    // funclet pairing as the legitimate owner when there is one (there is at most
+    // one, since a name match consumes the partner), else the lowest symbol index.
+    // The per-group count is exact either way.
+    let mut partner_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, symbol_diff) in obj_diff.symbols.iter().enumerate() {
+        if let Some(partner) = symbol_diff.target_symbol {
+            partner_groups.entry(partner).or_default().push(idx);
+        }
+    }
+    let mut oversubscribed: HashSet<usize> = HashSet::new();
+    for group in partner_groups.values().filter(|g| g.len() > 1) {
+        let owner = group
+            .iter()
+            .copied()
+            .find(|&i| !obj_diff.symbols[i].masked_equal_symbol)
+            .unwrap_or_else(|| group.iter().copied().min().expect("non-empty group"));
+        oversubscribed.extend(group.iter().copied().filter(|&i| i != owner));
+    }
     for ((section_idx, section), section_diff) in
         obj.sections.iter().enumerate().zip(&obj_diff.sections)
     {
@@ -738,7 +787,9 @@ fn report_object(
             _ => {}
         }
 
-        for (symbol, symbol_diff) in obj.symbols.iter().zip(&obj_diff.symbols) {
+        for (symbol_idx, (symbol, symbol_diff)) in
+            obj.symbols.iter().zip(&obj_diff.symbols).enumerate()
+        {
             if symbol.section != Some(section_idx)
                 || symbol.size == 0
                 || symbol.flags.contains(SymbolFlag::Hidden)
@@ -774,6 +825,7 @@ fn report_object(
             if match_percent == 100.0 {
                 measures.matched_code += symbol.size;
             }
+            let is_oversubscribed = oversubscribed.contains(&symbol_idx);
             functions.push(ReportItem {
                 name: symbol.name.clone(),
                 size: symbol.size,
@@ -784,10 +836,15 @@ fn report_object(
                     virtual_address: symbol.virtual_address,
                 }),
                 address: symbol.address.checked_sub(section.address),
-                masked_equal: None,
+                masked_equal: is_oversubscribed.then_some(true),
             });
             if match_percent_normalized == 100.0 {
                 measures.matched_functions += 1;
+                // Disclosure only: a SUBSET of the `matched_functions` just
+                // credited, never an addition to it.
+                if is_oversubscribed {
+                    measures.masked_equal_functions += 1;
+                }
             }
             measures.total_functions += 1;
         }
