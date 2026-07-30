@@ -147,6 +147,14 @@ fn diff_data_range(left_data: &[u8], right_data: &[u8]) -> (f32, Vec<DataDiff>, 
 }
 
 /// Compares relocations contained within a certain data range.
+/// Sub-slice of `relocations` whose addresses fall within `range`. Relocations are
+/// sorted by address at read time, so the window bounds are binary searches.
+fn relocs_in_range<'a>(relocations: &'a [Relocation], range: &Range<usize>) -> &'a [Relocation] {
+    let lo = relocations.partition_point(|r| (r.address as usize) < range.start);
+    let hi = lo + relocations[lo..].partition_point(|r| (r.address as usize) < range.end);
+    &relocations[lo..hi]
+}
+
 fn diff_data_relocs_for_range<'left, 'right>(
     left_obj: &'left Object,
     right_obj: &'right Object,
@@ -157,17 +165,13 @@ fn diff_data_relocs_for_range<'left, 'right>(
 ) -> Vec<(DataDiffKind, Option<ResolvedRelocation<'left>>, Option<ResolvedRelocation<'right>>)> {
     let left_section = &left_obj.sections[left_section_idx];
     let right_section = &right_obj.sections[right_section_idx];
+    let left_relocs = relocs_in_range(&left_section.relocations, &left_range);
+    let right_relocs = relocs_in_range(&right_section.relocations, &right_range);
     let mut diffs = Vec::new();
-    for left_reloc in left_section.relocations.iter() {
-        if !left_range.contains(&(left_reloc.address as usize)) {
-            continue;
-        }
+    for left_reloc in left_relocs.iter() {
         let left_offset = left_reloc.address as usize - left_range.start;
         let left_reloc = resolve_relocation(&left_obj.symbols, left_reloc);
-        let Some(right_reloc) = right_section.relocations.iter().find(|r| {
-            if !right_range.contains(&(r.address as usize)) {
-                return false;
-            }
+        let Some(right_reloc) = right_relocs.iter().find(|r| {
             let right_offset = r.address as usize - right_range.start;
             right_offset == left_offset
         }) else {
@@ -181,16 +185,10 @@ fn diff_data_relocs_for_range<'left, 'right>(
             diffs.push((DataDiffKind::Replace, Some(left_reloc), Some(right_reloc)));
         }
     }
-    for right_reloc in right_section.relocations.iter() {
-        if !right_range.contains(&(right_reloc.address as usize)) {
-            continue;
-        }
+    for right_reloc in right_relocs.iter() {
         let right_offset = right_reloc.address as usize - right_range.start;
         let right_reloc = resolve_relocation(&right_obj.symbols, right_reloc);
-        let Some(_) = left_section.relocations.iter().find(|r| {
-            if !left_range.contains(&(r.address as usize)) {
-                return false;
-            }
+        let Some(_) = left_relocs.iter().find(|r| {
             let left_offset = r.address as usize - left_range.start;
             left_offset == right_offset
         }) else {
@@ -337,10 +335,7 @@ pub fn no_diff_data_symbol(obj: &Object, symbol_index: usize) -> Result<SymbolDi
     }];
 
     let mut reloc_diffs = Vec::new();
-    for reloc in section.relocations.iter() {
-        if !range.contains(&(reloc.address as usize)) {
-            continue;
-        }
+    for reloc in relocs_in_range(&section.relocations, &range).iter() {
         let reloc_len = obj.arch.data_reloc_size(reloc.flags);
         let range = reloc.address..reloc.address + reloc_len as u64;
         reloc_diffs.push(DataRelocationDiff {
@@ -590,57 +585,6 @@ fn symbols_matching_section(
 
 pub const BYTES_PER_ROW: usize = 16;
 
-fn build_data_diff_row(
-    data_diffs: &[DataDiff],
-    reloc_diffs: &[DataRelocationDiff],
-    symbol_address: u64,
-    row_index: usize,
-) -> DataDiffRow {
-    let row_start = row_index * BYTES_PER_ROW;
-    let row_end = row_start + BYTES_PER_ROW;
-    let mut row_diff = DataDiffRow {
-        address: symbol_address + row_start as u64,
-        segments: Vec::new(),
-        relocations: Vec::new(),
-    };
-
-    // Collect all segments that overlap with this row
-    let mut current_offset = 0;
-    for diff in data_diffs {
-        let diff_end = current_offset + diff.size;
-        if current_offset < row_end && diff_end > row_start {
-            let start_in_diff = row_start.saturating_sub(current_offset);
-            let end_in_diff = row_end.min(diff_end) - current_offset;
-            if start_in_diff < end_in_diff {
-                let data_slice = if diff.data.is_empty() {
-                    Vec::new()
-                } else {
-                    diff.data[start_in_diff..end_in_diff.min(diff.data.len())].to_vec()
-                };
-                row_diff.segments.push(DataDiff {
-                    data: data_slice,
-                    kind: diff.kind,
-                    size: end_in_diff - start_in_diff,
-                });
-            }
-        }
-        current_offset = diff_end;
-        if current_offset >= row_start + BYTES_PER_ROW {
-            break;
-        }
-    }
-
-    // Collect all relocations that overlap with this row
-    let row_end_absolute = row_diff.address + BYTES_PER_ROW as u64;
-    row_diff.relocations = reloc_diffs
-        .iter()
-        .filter(|rd| rd.range.start < row_end_absolute && rd.range.end > row_diff.address)
-        .cloned()
-        .collect();
-
-    row_diff
-}
-
 fn build_data_diff_rows(
     segments: &[DataDiff],
     relocations: &[DataRelocationDiff],
@@ -648,7 +592,65 @@ fn build_data_diff_rows(
 ) -> Vec<DataDiffRow> {
     let total_len = segments.iter().map(|s| s.size as u64).sum::<u64>();
     let num_rows = total_len.div_ceil(BYTES_PER_ROW as u64) as usize;
-    (0..num_rows)
-        .map(|row_index| build_data_diff_row(segments, relocations, symbol_address, row_index))
-        .collect()
+    let mut rows: Vec<DataDiffRow> = (0..num_rows)
+        .map(|row_index| DataDiffRow {
+            address: symbol_address + (row_index * BYTES_PER_ROW) as u64,
+            segments: Vec::new(),
+            relocations: Vec::new(),
+        })
+        .collect();
+
+    // Collect the segments that overlap each row. Segment offsets are cumulative and
+    // rows advance monotonically, so a rolling cursor replaces a from-zero rescan per
+    // row; a segment entirely before the row can never overlap it or any later row.
+    let mut seg_idx = 0;
+    let mut seg_offset = 0usize;
+    for (row_index, row_diff) in rows.iter_mut().enumerate() {
+        let row_start = row_index * BYTES_PER_ROW;
+        let row_end = row_start + BYTES_PER_ROW;
+        while seg_idx < segments.len() && seg_offset + segments[seg_idx].size <= row_start {
+            seg_offset += segments[seg_idx].size;
+            seg_idx += 1;
+        }
+        let mut current_offset = seg_offset;
+        for diff in &segments[seg_idx..] {
+            let diff_end = current_offset + diff.size;
+            if current_offset < row_end && diff_end > row_start {
+                let start_in_diff = row_start.saturating_sub(current_offset);
+                let end_in_diff = row_end.min(diff_end) - current_offset;
+                if start_in_diff < end_in_diff {
+                    let data_slice = if diff.data.is_empty() {
+                        Vec::new()
+                    } else {
+                        diff.data[start_in_diff..end_in_diff.min(diff.data.len())].to_vec()
+                    };
+                    row_diff.segments.push(DataDiff {
+                        data: data_slice,
+                        kind: diff.kind,
+                        size: end_in_diff - start_in_diff,
+                    });
+                }
+            }
+            current_offset = diff_end;
+            if current_offset >= row_end {
+                break;
+            }
+        }
+    }
+
+    // Bucket each relocation into the rows it overlaps in one sweep instead of
+    // filter-scanning the full relocation list once per row. Iterating relocations
+    // in slice order preserves the per-row ordering of the filter it replaces.
+    for rd in relocations {
+        if rd.range.end <= symbol_address {
+            continue;
+        }
+        let first_row = (rd.range.start.saturating_sub(symbol_address) as usize) / BYTES_PER_ROW;
+        let last_row_excl = ((rd.range.end - symbol_address) as usize).div_ceil(BYTES_PER_ROW);
+        for row in rows[first_row.min(num_rows)..last_row_excl.min(num_rows)].iter_mut() {
+            row.relocations.push(rd.clone());
+        }
+    }
+
+    rows
 }
