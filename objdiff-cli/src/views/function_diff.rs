@@ -396,7 +396,8 @@ impl UiView for FunctionDiffUi {
                             match state.diff_obj_config.function_reloc_diffs {
                                 FunctionRelocDiffs::None => FunctionRelocDiffs::NameAddress,
                                 FunctionRelocDiffs::NameAddress => FunctionRelocDiffs::NameOnly,
-                                FunctionRelocDiffs::NameOnly => FunctionRelocDiffs::DataValue,
+                                FunctionRelocDiffs::NameOnly => FunctionRelocDiffs::NameCheck,
+                                FunctionRelocDiffs::NameCheck => FunctionRelocDiffs::DataValue,
                                 FunctionRelocDiffs::DataValue => FunctionRelocDiffs::All,
                                 FunctionRelocDiffs::All => FunctionRelocDiffs::None,
                             };

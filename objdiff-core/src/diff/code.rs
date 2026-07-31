@@ -871,6 +871,21 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
     if had_array { String::from_utf8(result).ok() } else { None }
 }
 
+/// True for the auto-generated placeholder names a splitter (dtk) assigns to
+/// symbols it could not identify: `fn_<hexaddr>`, `lbl_<hexaddr>`,
+/// `jumptable_<hexaddr>`. Used by `FunctionRelocDiffs::NameCheck` to treat
+/// relocations against unidentified symbols as unverifiable rather than as
+/// mismatches. The suffix must be non-empty hex (plus `_` separators) so a
+/// genuine source symbol that merely starts with one of these prefixes is not
+/// swallowed.
+fn is_placeholder_symbol_name(name: &str) -> bool {
+    ["fn_", "lbl_", "jumptable_"].iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_')
+        })
+    })
+}
+
 fn reloc_eq(
     left_obj: &Object,
     right_obj: &Object,
@@ -883,10 +898,14 @@ fn reloc_eq(
     >,
 ) -> bool {
     let relax_reloc_diffs = diff_config.function_reloc_diffs == FunctionRelocDiffs::None;
+    let name_check = diff_config.function_reloc_diffs == FunctionRelocDiffs::NameCheck;
     let (left_reloc, right_reloc) = match (left_ins.relocation, right_ins.relocation) {
         (Some(left_reloc), Some(right_reloc)) => (left_reloc, right_reloc),
         // If relocations are relaxed, match if left is missing a reloc
-        (None, Some(_)) => return relax_reloc_diffs,
+        // NameCheck: split/disassembled target objects add relocations on a
+        // per-site basis with no guarantee of coverage (dtk), so a MISSING
+        // left-side relocation is "unverifiable", never evidence of a diff.
+        (None, Some(_)) => return relax_reloc_diffs || name_check,
         (None, None) => return true,
         _ => return false,
     };
@@ -894,6 +913,13 @@ fn reloc_eq(
         return false;
     }
     if relax_reloc_diffs {
+        return true;
+    }
+    // NameCheck: a placeholder-named target (fn_8xxxxxxx / lbl_* / jumptable_*)
+    // is a split symbol that was never identified — there is no real name to
+    // verify our callee/data target against, so the site is unverifiable.
+    // Only a REAL left-side name that disagrees with ours is charged.
+    if name_check && is_placeholder_symbol_name(&left_reloc.symbol.name) {
         return true;
     }
 
@@ -921,7 +947,10 @@ fn reloc_eq(
     // NameOnly: target symbol name (+ section) must match, but the addend is ignored.
     // This is the strict wrong-call-target / wrong-data-symbol check WITHOUT penalizing
     // benign build-address (addend) differences, which NameAddress couples in.
-    let name_only = diff_config.function_reloc_diffs == FunctionRelocDiffs::NameOnly;
+    let name_only = matches!(
+        diff_config.function_reloc_diffs,
+        FunctionRelocDiffs::NameOnly | FunctionRelocDiffs::NameCheck
+    );
     match (&left_reloc.symbol.section, &right_reloc.symbol.section) {
         (Some(sl), Some(sr)) => {
             if name_only {
@@ -1604,6 +1633,116 @@ mod tests {
         let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
         let right = obj_with_reloc_in_section("Callee", 0x100, ".data");
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    // ---- FunctionRelocDiffs::NameCheck semantics ----
+    // NameOnly with two tolerances for split/disassembled TARGET objects (dtk):
+    // a missing left-side relocation and a placeholder-named left target are both
+    // "unverifiable" (score equal); only a REAL left name that disagrees is charged.
+
+    /// `resolved_ref` variant that strips the relocation (models a dtk split
+    /// site where no relocation was emitted for the branch).
+    #[cfg(feature = "std")]
+    fn resolved_ref_no_reloc(obj: &Object) -> ResolvedInstructionRef<'_> {
+        ResolvedInstructionRef { relocation: None, ..resolved_ref(obj) }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_missing_target_reloc() {
+        let left = obj_with_reloc("Callee", 0x100);
+        let right = obj_with_reloc("Callee", 0x100);
+        let cfg_check = DiffObjConfig {
+            function_reloc_diffs: FunctionRelocDiffs::NameCheck,
+            ..Default::default()
+        };
+        let cfg_name_only = DiffObjConfig {
+            function_reloc_diffs: FunctionRelocDiffs::NameOnly,
+            ..Default::default()
+        };
+        let eq = std::collections::HashMap::new();
+        // Left (target) side has NO relocation, right (base) does: unverifiable
+        // under NameCheck -> MATCH; NameOnly treats it as a diff (the reason
+        // NameOnly alone is not deployable against dtk-split targets).
+        assert!(reloc_eq(
+            &left,
+            &right,
+            resolved_ref_no_reloc(&left),
+            resolved_ref(&right),
+            &cfg_check,
+            &eq
+        ));
+        assert!(!reloc_eq(
+            &left,
+            &right,
+            resolved_ref_no_reloc(&left),
+            resolved_ref(&right),
+            &cfg_name_only,
+            &eq
+        ));
+        // The REVERSE (target relocated, base not) stays a mismatch under NameCheck.
+        assert!(!reloc_eq(
+            &left,
+            &right,
+            resolved_ref(&left),
+            resolved_ref_no_reloc(&right),
+            &cfg_check,
+            &eq
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_placeholder_target_name() {
+        // Target callee was never identified by the splitter: placeholder name.
+        let left = obj_with_reloc("fn_82345678", 0x100);
+        let right = obj_with_reloc("?Poll@CharServoBone@@UAAXXZ", 0x100);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // NameOnly would charge it — placeholder tolerance is NameCheck-specific.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_catches_wrong_callee() {
+        // Both sides relocated, both REAL names, names differ: the wrong-callee
+        // case the report pipeline's None mode scores as 100%.
+        let left = obj_with_reloc("RightCallee", 0x100);
+        let right = obj_with_reloc("WrongCallee", 0x100);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::None));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_addend() {
+        // Same callee, different addend: benign build-address noise, like NameOnly.
+        let left = obj_with_reloc("Callee", 0x100);
+        let right = obj_with_reloc("Callee", 0x200);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_comdat_bucket_variant_matches() {
+        // COMDAT-bucket tolerance carries over from NameOnly.
+        let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
+        let right = obj_with_reloc_in_section("Callee", 0x100, ".text");
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[test]
+    fn test_is_placeholder_symbol_name() {
+        assert!(is_placeholder_symbol_name("fn_82345678"));
+        assert!(is_placeholder_symbol_name("fn_82345678_0"));
+        assert!(is_placeholder_symbol_name("lbl_829fc4a0"));
+        assert!(is_placeholder_symbol_name("jumptable_82A477BC"));
+        // Real names that merely share a prefix are NOT placeholders.
+        assert!(!is_placeholder_symbol_name("fn_helper"));
+        assert!(!is_placeholder_symbol_name("fnord"));
+        assert!(!is_placeholder_symbol_name("fn_"));
+        assert!(!is_placeholder_symbol_name("?Poll@CharServoBone@@UAAXXZ"));
+        assert!(!is_placeholder_symbol_name("label_1234"));
     }
 
     #[cfg(feature = "std")]
