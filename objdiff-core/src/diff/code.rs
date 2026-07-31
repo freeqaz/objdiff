@@ -871,19 +871,35 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
     if had_array { String::from_utf8(result).ok() } else { None }
 }
 
-/// True for the auto-generated placeholder names a splitter (dtk) assigns to
-/// symbols it could not identify: `fn_<hexaddr>`, `lbl_<hexaddr>`,
-/// `jumptable_<hexaddr>`. Used by `FunctionRelocDiffs::NameCheck` to treat
-/// relocations against unidentified symbols as unverifiable rather than as
-/// mismatches. The suffix must be non-empty hex (plus `_` separators) so a
-/// genuine source symbol that merely starts with one of these prefixes is not
-/// swallowed.
+/// True for the auto-generated placeholder names a splitter assigns to
+/// symbols it could not identify. Used by `FunctionRelocDiffs::NameCheck` to
+/// treat relocations against unidentified symbols as unverifiable rather than
+/// as mismatches. Covers dtk (PowerPC ELF: `fn_<hexaddr>`, `lbl_<hexaddr>`,
+/// `jumptable_<hexaddr>`) and csplit (i386 PE: `code_<hexaddr>`,
+/// `data_<hexaddr>`, `bss_<hexaddr>`, `rdata_<hexaddr>`, each optionally
+/// carrying the cdecl leading underscore, e.g. `_bss_00456208`).
+/// The suffix must be non-empty hex (plus `_` separators) so a genuine source
+/// symbol that merely starts with one of these prefixes is not swallowed.
 fn is_placeholder_symbol_name(name: &str) -> bool {
-    ["fn_", "lbl_", "jumptable_"].iter().any(|prefix| {
+    // Tolerate a single leading underscore (i386 PE cdecl decoration).
+    let name = name.strip_prefix('_').unwrap_or(name);
+    ["fn_", "lbl_", "jumptable_", "code_", "data_", "bss_", "rdata_"].iter().any(|prefix| {
         name.strip_prefix(prefix).is_some_and(|rest| {
             !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_')
         })
     })
+}
+
+/// True for MSVC compiler-internal local labels: `$L18077` (block / jump-table
+/// labels), `$T18082` (SEH scope-table records), `$SG...` etc. The numeric
+/// suffix is a compilation-order counter, NOT a stable identity — the same
+/// source recompiled produces different numbers — so comparing these names
+/// across target/base is pure noise. `FunctionRelocDiffs::NameCheck` treats a
+/// target-side relocation against one as unverifiable. (Content-derived names
+/// like `__real@3f800000` / `??_C@...` string literals are deterministic and
+/// are deliberately NOT covered: a mismatch there is a real defect.)
+fn is_compiler_local_label(name: &str) -> bool {
+    name.strip_prefix('$').is_some_and(|rest| !rest.is_empty())
 }
 
 fn reloc_eq(
@@ -915,11 +931,16 @@ fn reloc_eq(
     if relax_reloc_diffs {
         return true;
     }
-    // NameCheck: a placeholder-named target (fn_8xxxxxxx / lbl_* / jumptable_*)
-    // is a split symbol that was never identified — there is no real name to
-    // verify our callee/data target against, so the site is unverifiable.
-    // Only a REAL left-side name that disagrees with ours is charged.
-    if name_check && is_placeholder_symbol_name(&left_reloc.symbol.name) {
+    // NameCheck: a placeholder-named target (fn_8xxxxxxx / lbl_* / jumptable_* /
+    // _bss_xxxxxxxx / ...) is a split symbol that was never identified — there
+    // is no real name to verify our callee/data target against, so the site is
+    // unverifiable. Likewise MSVC `$`-labels, whose numeric suffixes are
+    // nondeterministic across compilations. Only a REAL left-side name that
+    // disagrees with ours is charged.
+    if name_check
+        && (is_placeholder_symbol_name(&left_reloc.symbol.name)
+            || is_compiler_local_label(&left_reloc.symbol.name))
+    {
         return true;
     }
 
@@ -1737,12 +1758,44 @@ mod tests {
         assert!(is_placeholder_symbol_name("fn_82345678_0"));
         assert!(is_placeholder_symbol_name("lbl_829fc4a0"));
         assert!(is_placeholder_symbol_name("jumptable_82A477BC"));
+        // csplit (i386 PE) placeholders, with and without cdecl underscore.
+        assert!(is_placeholder_symbol_name("_bss_00456208"));
+        assert!(is_placeholder_symbol_name("_data_00317a84"));
+        assert!(is_placeholder_symbol_name("_code_000fab20"));
+        assert!(is_placeholder_symbol_name("_rdata_002e4c84"));
+        assert!(is_placeholder_symbol_name("code_000fab20"));
         // Real names that merely share a prefix are NOT placeholders.
         assert!(!is_placeholder_symbol_name("fn_helper"));
         assert!(!is_placeholder_symbol_name("fnord"));
         assert!(!is_placeholder_symbol_name("fn_"));
         assert!(!is_placeholder_symbol_name("?Poll@CharServoBone@@UAAXXZ"));
         assert!(!is_placeholder_symbol_name("label_1234"));
+        assert!(!is_placeholder_symbol_name("_data_ptr"));
+        assert!(!is_placeholder_symbol_name("_bss_"));
+        assert!(!is_placeholder_symbol_name("_code_gen_table"));
+    }
+
+    #[test]
+    fn test_is_compiler_local_label() {
+        assert!(is_compiler_local_label("$L18077"));
+        assert!(is_compiler_local_label("$T18082"));
+        assert!(is_compiler_local_label("$SG12345"));
+        assert!(!is_compiler_local_label("$"));
+        assert!(!is_compiler_local_label("_main"));
+        // Content-derived literal names are NOT local labels: they are stable
+        // across compilations and must still be compared.
+        assert!(!is_compiler_local_label("__real@3f800000"));
+        assert!(!is_compiler_local_label("??_C@_06PFFNFMJI@XDEMOS?$AA@"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_msvc_local_label_numbering() {
+        // SEH scope-table label: same construct, different compilation counter.
+        let left = obj_with_reloc("$T18083", 0x100);
+        let right = obj_with_reloc("$T18082", 0x100);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
     }
 
     #[cfg(feature = "std")]
