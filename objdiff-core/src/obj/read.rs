@@ -230,9 +230,12 @@ fn map_symbols(
         symbols.push(symbol);
     }
 
-    // Infer symbol sizes for 0-size symbols
-    infer_symbol_sizes(arch, &mut symbols, sections)?;
-
+    // NOTE: symbol sizes are NOT inferred here. `Arch::infer_function_size` needs
+    // `section.relocations` to recognise inline data (jump tables) inside a function, and
+    // relocations are not populated until `map_relocations`, which needs the symbol indices this
+    // function returns. Inferring here read an empty relocation list, so the inline-data branch
+    // never fired for any object in any project. The caller runs `infer_symbol_sizes` after
+    // `map_relocations` instead.
     Ok((symbols, symbol_indices))
 }
 
@@ -287,8 +290,24 @@ fn add_section_symbols(sections: &[Section], symbols: &mut Vec<Symbol>) {
 /// usually emitted as branch targets and do not represent the start of a function or object.
 fn is_local_label(symbol: &Symbol) -> bool {
     const LABEL_PREFIXES: &[&str] = &[".L", "LAB_", "switchD_"];
-    symbol.size == 0
-        && symbol.flags.contains(SymbolFlag::Local)
+    if symbol.size != 0 {
+        return false;
+    }
+    // `$L` is MSVC's spelling of GCC's `.L`: a block or jump-table label interior to a function.
+    // The Local-flag test is deliberately skipped for these, because the two sides of a diff do
+    // not agree on it. MSVC emits `$L2587` as STATIC with type 0, which reads back as a local
+    // data symbol; a splitter recovering the same label from a map file emits it as EXTERNAL
+    // with type 0x20, which reads back as a global function. Requiring Local therefore makes it
+    // a hard boundary on one side and an interior label on the other, so the two disagree about
+    // where the enclosing function ends — `_inflate_blocks` came out 2920 bytes against 2976.
+    // The `$L` name is unambiguous on its own.
+    //
+    // Deliberately NOT `$T`: on MSVC PowerPC those name real 8-byte data-section entries that
+    // must keep their inferred sizes (see tests/snapshots/arch_ppc__read_vmx128_coff.snap).
+    if symbol.name.starts_with("$L") {
+        return true;
+    }
+    symbol.flags.contains(SymbolFlag::Local)
         && LABEL_PREFIXES.iter().any(|p| symbol.name.starts_with(p))
 }
 
@@ -1103,6 +1122,9 @@ pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result
         config,
     )?;
     map_relocations(arch.as_ref(), &obj_file, &mut sections, &section_indices, &symbol_indices)?;
+    // Must follow map_relocations: infer_function_size uses the section's relocations to tell
+    // inline data (jump tables, literal pools) from code. See the note in map_symbols.
+    infer_symbol_sizes(arch.as_ref(), &mut symbols, &sections)?;
     parse_line_info(&obj_file, &mut sections, &section_indices, data)?;
     if config.combine_data_sections || config.combine_text_sections {
         combine_sections(&mut sections, &mut symbols, config)?;
