@@ -108,7 +108,14 @@ impl ReportCache {
     ///
     /// 2 — populated `Measures.masked_equal_functions` (funclet over-subscription)
     ///     and the per-item `ReportItem.masked_equal` bit.
-    const CACHE_LOGIC_VERSION: u32 = 2;
+    /// 3 — WIDENED that disclosure to every funclet byte-signature pairing
+    ///     (`SymbolDiff::masked_equal_symbol`), not just the pass-2b
+    ///     over-subscription subset; and taught `FunctionRelocDiffs::NameCheck` to
+    ///     forgive a COFF weak-external alias. Both change the emitted content for
+    ///     unchanged obj bytes, which is exactly what this counter exists for —
+    ///     WITHOUT the bump a freshly installed binary keeps serving units diffed
+    ///     by the old one and the new disclosure silently reads as the old value.
+    const CACHE_LOGIC_VERSION: u32 = 3;
 
     /// Hash a unit's target and base .obj file contents together.
     fn hash_unit(object: &ObjectConfig, config_args: &[String]) -> u64 {
@@ -717,7 +724,15 @@ fn report_object(
     let obj = target.as_ref().or(base.as_ref()).unwrap();
     let obj_diff = result.left.as_ref().or(result.right.as_ref()).unwrap();
 
-    // ── Disclosure: funclet OVER-SUBSCRIPTION (`pair_funclets_by_bytes` pass 2b) ──
+    // ── Disclosure, part 1 of 2: funclet OVER-SUBSCRIPTION (`pair_funclets_by_bytes`
+    // pass 2b) ──
+    //
+    // NOTE: this is the NARROWER of the two disclosure sources. Part 2 (below, at
+    // the per-symbol loop) adds `SymbolDiff::masked_equal_symbol`, i.e. EVERY pair
+    // that exists only because the funclet byte-signature fallback matched it.
+    // Over-subscription is a strict subset of that, so this set is kept only
+    // because it is the one case where we can also name which member of a group is
+    // the surplus one.
     //
     // Pass 2b pairs a leftover anonymous target funclet many-to-one onto a base
     // funclet that some other target symbol already owns, and the overflow is
@@ -826,6 +841,28 @@ fn report_object(
                 measures.matched_code += symbol.size;
             }
             let is_oversubscribed = oversubscribed.contains(&symbol_idx);
+            // ── Disclosure, part 2 of 2: FUNCLET BYTE-SIGNATURE PAIRING ──
+            //
+            // `masked_equal_symbol` is set by `diff_objs` on every code pair the
+            // funclet byte-signature fallback produced (`pair_funclets_by_bytes`,
+            // ALL passes — not just the 2b over-subscription counted above). Such a
+            // pair was formed by comparing masked bodies: relocation targets are
+            // blanked in the signature, so the pairing says "these two bodies have
+            // the same shape", NOT "these two symbols are the same function". The
+            // credit IS supply-backed — our compiler really emitted a body of that
+            // shape — but WHICH target funclet a given base funclet is credited
+            // against is arbitrary within a byte-signature group, and the reloc
+            // targets that would distinguish them are masked in the signature AND
+            // (under the default ruler) in the score.
+            //
+            // Disclosing only the over-subscription subset understated the class by
+            // ~19x on rb3-xenon (1,201 of ~22,549 funclet-paired rows), so the
+            // `matched - masked_equal` figure quoted as "honest" still carried the
+            // whole byte-signature class inside it. Both sources are unioned here.
+            // This changes NO score: `matched_functions`, `matched_code`,
+            // `total_*` and `fuzzy_match_percent` are computed above and are not a
+            // function of this bit.
+            let is_masked_equal = is_oversubscribed || symbol_diff.masked_equal_symbol;
             functions.push(ReportItem {
                 name: symbol.name.clone(),
                 size: symbol.size,
@@ -836,13 +873,13 @@ fn report_object(
                     virtual_address: symbol.virtual_address,
                 }),
                 address: symbol.address.checked_sub(section.address),
-                masked_equal: is_oversubscribed.then_some(true),
+                masked_equal: is_masked_equal.then_some(true),
             });
             if match_percent_normalized == 100.0 {
                 measures.matched_functions += 1;
                 // Disclosure only: a SUBSET of the `matched_functions` just
                 // credited, never an addition to it.
-                if is_oversubscribed {
+                if is_masked_equal {
                     measures.masked_equal_functions += 1;
                 }
             }
