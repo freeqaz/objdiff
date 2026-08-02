@@ -902,6 +902,17 @@ fn is_compiler_local_label(name: &str) -> bool {
     name.strip_prefix('$').is_some_and(|rest| !rest.is_empty())
 }
 
+/// True when `obj` declares `name` as an UNDEFINED COFF weak external whose
+/// auxiliary record defaults to exactly `other`.
+///
+/// Deliberately an equality test against the resolved default, not a
+/// name-shape rule: `??_E<X>` defaulting to `??_G<X>` is forgiven, `??_E<X>`
+/// defaulting to `??_G<Y>` while the other side calls `??_G<Z>` is NOT. The
+/// map is empty for non-COFF objects and for any symbol this object defines.
+fn weak_external_aliases(obj: &Object, name: &str, other: &str) -> bool {
+    obj.weak_external_defaults.get(name).is_some_and(|default| default == other)
+}
+
 fn reloc_eq(
     left_obj: &Object,
     right_obj: &Object,
@@ -940,6 +951,38 @@ fn reloc_eq(
     if name_check
         && (is_placeholder_symbol_name(&left_reloc.symbol.name)
             || is_compiler_local_label(&left_reloc.symbol.name))
+    {
+        return true;
+    }
+
+    // NameCheck: COFF WEAK-EXTERNAL ALIAS.
+    //
+    // A weak external is a linkage directive, not a definition. If one side's
+    // relocation names an UNDEFINED weak external whose auxiliary record defaults
+    // to the *other* side's symbol, then both references link to the same code and
+    // charging the name difference is spurious. MSVC's vector deleting destructor
+    // is the systematic case: `??_E<C>` is an undefined weak external defaulting to
+    // `??_G<C>`, so our `bl ??_E<C>` and retail's `bl ??_G<C>` reach one body.
+    //
+    // The gate lives in the reader: `Object::weak_external_defaults` only contains
+    // symbols that are UNDEFINED weak externals in that object
+    // (`ImageSymbol::has_aux_weak_external()`), so where a definition exists the
+    // pair is NOT forgiven -- it stays a charge, because a defined `??_E<C>` binds
+    // to itself and the call does not reach `??_G<C>`. Measured on rb3-xenon: 1,158
+    // `??_E` are defined by our own objects and are correctly excluded.
+    //
+    // Checked in both directions purely so the rule cannot silently depend on which
+    // object is "target" and which is "base". Each direction is independently gated
+    // by that side's own symbol table, so the symmetry adds no forgiveness that the
+    // COFF data does not license. (In practice only the base side fires: dtk-split
+    // target objects contain no weak externals.)
+    if name_check
+        && (weak_external_aliases(right_obj, &right_reloc.symbol.name, &left_reloc.symbol.name)
+            || weak_external_aliases(
+                left_obj,
+                &left_reloc.symbol.name,
+                &right_reloc.symbol.name,
+            ))
     {
         return true;
     }
@@ -1732,6 +1775,79 @@ mod tests {
         let right = obj_with_reloc("WrongCallee", 0x100);
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
         assert!(reloc_match(&left, &right, FunctionRelocDiffs::None));
+    }
+
+    // ---- NameCheck: COFF weak-external alias ----
+
+    /// Like `obj_with_reloc`, but the reloc target is an UNDEFINED symbol that this
+    /// object declares as a COFF weak external defaulting to `default_name`.
+    ///
+    /// `weak` selects whether the weak-external declaration is present. Passing
+    /// `false` models the object DEFINING the symbol instead (the 1,158 `??_E` we
+    /// define ourselves) and is what makes the resolution gate testable: the names
+    /// are identical either way, so a test that passes under both would prove the
+    /// implementation was keying on name SHAPE rather than on the COFF record.
+    #[cfg(feature = "std")]
+    fn obj_with_weak_external(target_name: &str, default_name: &str, weak: bool) -> Object {
+        let mut obj = obj_with_reloc(target_name, 0x100);
+        if weak {
+            // Undefined: a weak external has no section.
+            obj.symbols[1].section = None;
+            obj.weak_external_defaults
+                .insert(target_name.to_string(), default_name.to_string());
+        }
+        obj
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_coff_weak_external_alias() {
+        // Retail calls the SCALAR deleting destructor; we emit a call to the VECTOR
+        // deleting destructor, which our object declares as an undefined weak
+        // external defaulting to exactly that scalar one. Both link to one body.
+        let left = obj_with_reloc("??_GFoo@@UAAPAXI@Z", 0x100);
+        let right =
+            obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", true);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // Tolerance is NameCheck-specific; NameOnly still charges the name diff.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_weak_external_gate_defined_symbol_still_charged() {
+        // NULL 1 -- THE RESOLUTION GATE. Byte-for-byte the same names as the test
+        // above, with ONE difference: the object does not declare `??_E` as an
+        // undefined weak external (i.e. it DEFINES it). A defined weak-external
+        // name binds to itself, so the call does NOT reach `??_G` and the row is
+        // ambiguous, never benign. This must stay charged.
+        let left = obj_with_reloc("??_GFoo@@UAAPAXI@Z", 0x100);
+        let right =
+            obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", false);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_weak_external_cross_class_still_charged() {
+        // NULL 2 -- natural experiment. The base side IS an undefined weak external,
+        // so the rule CAN fire here; but its default is `??_GBar`, while retail calls
+        // `??_GQux`. Different classes, different code: the rule must DECLINE.
+        let left = obj_with_reloc("??_GQux@@UAAPAXI@Z", 0x100);
+        let right =
+            obj_with_weak_external("??_EBar@@UAAPAXI@Z", "??_GBar@@UAAPAXI@Z", true);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_weak_external_does_not_forgive_arbitrary_names() {
+        // NULL 3 -- the alias is an EQUALITY test against the resolved default, not
+        // a licence to forgive any pair where a weak external is involved. Base is a
+        // weak external defaulting to `Alpha`; retail calls `Beta`.
+        let left = obj_with_reloc("Beta", 0x100);
+        let right = obj_with_weak_external("Weak", "Alpha", true);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
     }
 
     #[cfg(feature = "std")]

@@ -297,6 +297,25 @@ pub struct Object {
     #[cfg(feature = "std")]
     pub timestamp: Option<filetime::FileTime>,
     pub flow_analysis_results: BTreeMap<u64, Box<dyn FlowAnalysisResult>>,
+    /// COFF weak externals: undefined symbol name -> the name of the DEFAULT
+    /// symbol its auxiliary record resolves to.
+    ///
+    /// A COFF weak external is a linkage directive, not a definition: if the
+    /// named symbol is not defined anywhere in the link, the reference binds to
+    /// the aux record's default symbol instead. MSVC uses this for, among other
+    /// things, the vector deleting destructor -- `??_E<C>` is emitted as an
+    /// undefined weak external defaulting to `??_G<C>` (the scalar deleting
+    /// destructor), so `bl ??_E<C>` reaches `??_G<C>`.
+    ///
+    /// Only entries satisfying `ImageSymbol::has_aux_weak_external()` are
+    /// recorded, which requires storage class `IMAGE_SYM_CLASS_WEAK_EXTERNAL`
+    /// AND `section_number == IMAGE_SYM_UNDEFINED`. That is the resolution gate,
+    /// and it is structural rather than hand-rolled: a symbol this object
+    /// DEFINES has a real section number and can never appear here, so a
+    /// consumer cannot accidentally treat a defined symbol as an alias.
+    ///
+    /// Empty for every non-COFF format.
+    pub weak_external_defaults: BTreeMap<String, String>,
 }
 
 impl Default for Object {
@@ -312,6 +331,7 @@ impl Default for Object {
             #[cfg(feature = "std")]
             timestamp: None,
             flow_analysis_results: BTreeMap::<u64, Box<dyn FlowAnalysisResult>>::new(),
+            weak_external_defaults: BTreeMap::new(),
         }
     }
 }
