@@ -115,7 +115,13 @@ impl ReportCache {
     ///     unchanged obj bytes, which is exactly what this counter exists for —
     ///     WITHOUT the bump a freshly installed binary keeps serving units diffed
     ///     by the old one and the new disclosure silently reads as the old value.
-    const CACHE_LOGIC_VERSION: u32 = 3;
+    /// 4 — `diff_instructions` no longer drops onto a blind 1:1 pairing merely
+    ///     because the two instruction sequences have EQUAL LENGTH (N insertions
+    ///     plus N deletions preserve length, so that guard was unsound). 508 symbol
+    ///     pairs realign and 257 change `match_percent`, for unchanged obj bytes —
+    ///     precisely the case this counter exists for. Without the bump a mixed
+    ///     report would be served: pre-fix rows from cache, post-fix rows fresh.
+    const CACHE_LOGIC_VERSION: u32 = 4;
 
     /// Hash a unit's target and base .obj file contents together.
     fn hash_unit(object: &ObjectConfig, config_args: &[String]) -> u64 {

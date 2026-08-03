@@ -644,10 +644,22 @@ fn diff_instructions(
     left_insts: &[InstructionRef],
     right_insts: &[InstructionRef],
 ) -> Result<(Vec<InstructionDiffRow>, Vec<InstructionDiffRow>)> {
-    // Fast path: if same length, pair instructions 1:1 without running the diff algorithm.
-    // This is valid because same-length sequences have no insertions/deletions, and
-    // instruction order is preserved in decomp output, so 1:1 alignment is optimal.
-    if left_insts.len() == right_insts.len() {
+    let left_ops = left_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
+    let right_ops = right_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
+    // Fast path: if the opcode sequences are element-wise IDENTICAL, pair 1:1 and skip
+    // the diff algorithm. This is exactly what `capture_diff_slices` produces for equal
+    // slices (a single `Equal` op covering both ranges), so the fast path is provably
+    // equivalent to the general path here — it only saves the work.
+    //
+    // ⚠ This condition used to be `left_insts.len() == right_insts.len()`, justified by
+    // "same-length sequences have no insertions/deletions". THAT IS FALSE: N insertions
+    // plus N deletions preserve length. The consequence was a FALSE REGRESSION — a
+    // function whose length became EQUAL to its target's would drop off the real
+    // alignment onto a 1:1 pairing and score far lower (measured by lane DQ-1:
+    // 1253-vs-1259 → 98.7%, 1259-vs-1259 → 72.2% with 578 spurious `replace` rows,
+    // 1261-vs-1259 → 99.8%). i.e. getting a function's SIZE RIGHT collapsed its score.
+    // Do not re-weaken this guard to a length comparison. (lanes DQ-1, DR-1)
+    if left_ops == right_ops {
         let left_diff = left_insts
             .iter()
             .map(|i| InstructionDiffRow { ins_ref: Some(*i), ..Default::default() })
@@ -658,8 +670,6 @@ fn diff_instructions(
             .collect();
         return Ok((left_diff, right_diff));
     }
-    let left_ops = left_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
-    let right_ops = right_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
     let ops = similar::capture_diff_slices(similar::Algorithm::Patience, &left_ops, &right_ops);
     if ops.is_empty() {
         ensure!(left_insts.len() == right_insts.len());
@@ -1922,5 +1932,99 @@ mod tests {
         assert_eq!(section_base_name(".text$mn"), ".text");
         assert_eq!(section_base_name(".rdata$r"), ".rdata");
         assert_ne!(section_base_name(".text$dup"), section_base_name(".data"));
+    }
+
+    // ---- diff_instructions: the equal-LENGTH false-regression regression test ----
+
+    fn irefs(opcodes: &[u16]) -> Vec<InstructionRef> {
+        opcodes
+            .iter()
+            .enumerate()
+            .map(|(i, &opcode)| InstructionRef {
+                address: (i * 4) as u64,
+                size: 4,
+                opcode,
+                branch_dest: None,
+            })
+            .collect()
+    }
+
+    /// Number of row positions where BOTH sides carry an instruction and the
+    /// opcodes agree — i.e. rows the scorer can possibly credit as equal.
+    fn aligned_equal_rows(
+        left: &[InstructionDiffRow],
+        right: &[InstructionDiffRow],
+    ) -> usize {
+        left.iter()
+            .zip(right.iter())
+            .filter(|(l, r)| match (l.ins_ref, r.ins_ref) {
+                (Some(a), Some(b)) => a.opcode == b.opcode,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// What the OLD (buggy) `left.len() == right.len()` fast path would have
+    /// produced: a blind 1:1 pairing. Kept in the test only, as the counterfactual.
+    fn one_to_one_equal_rows(left: &[InstructionRef], right: &[InstructionRef]) -> usize {
+        left.iter().zip(right.iter()).filter(|(a, b)| a.opcode == b.opcode).count()
+    }
+
+    #[test]
+    fn test_diff_instructions_equal_length_still_aligns() {
+        // N deletions + N insertions preserve length. The old fast path keyed on
+        // length equality and therefore mis-scored exactly this shape.
+        let left = irefs(&[1, 2, 3, 100, 101, 4, 5, 6, 7, 8]);
+        let right = irefs(&[1, 2, 3, 4, 5, 6, 7, 8, 200, 201]);
+        assert_eq!(left.len(), right.len(), "fixture must be EQUAL length or it tests nothing");
+
+        let (l, r) = diff_instructions(&left, &right).unwrap();
+
+        // Real alignment inserts gap rows, so the row count EXCEEDS the input length.
+        // Under the length-equality fast path this was exactly 10.
+        assert!(l.len() > left.len(), "no gap rows emitted => fast path was taken (len {})", l.len());
+        assert_eq!(l.len(), r.len());
+        assert!(l.iter().any(|row| row.ins_ref.is_none()), "expected a gap row on the left");
+        assert!(r.iter().any(|row| row.ins_ref.is_none()), "expected a gap row on the right");
+
+        // The whole point: real alignment recovers the 8 shared opcodes; the blind
+        // 1:1 pairing the old guard produced recovers only 3.
+        let real = aligned_equal_rows(&l, &r);
+        let naive = one_to_one_equal_rows(&left, &right);
+        assert_eq!(real, 8, "expected the 8-opcode common run to align");
+        assert_eq!(naive, 3, "counterfactual: the old fast path only lined up the 3-op prefix");
+        assert!(real > naive);
+    }
+
+    #[test]
+    fn test_diff_instructions_identical_takes_fast_path() {
+        // Positive control for the *retained* fast path: identical opcode sequences
+        // must pair 1:1 with no gap rows (identical to what the general path yields).
+        let left = irefs(&[1, 2, 3, 4, 5]);
+        let right = irefs(&[1, 2, 3, 4, 5]);
+        let (l, r) = diff_instructions(&left, &right).unwrap();
+        assert_eq!(l.len(), 5);
+        assert_eq!(r.len(), 5);
+        assert!(l.iter().all(|row| row.ins_ref.is_some()));
+        assert!(r.iter().all(|row| row.ins_ref.is_some()));
+        assert_eq!(aligned_equal_rows(&l, &r), 5);
+    }
+
+    #[test]
+    fn test_diff_instructions_unequal_length_unchanged() {
+        // The pre-existing (already-correct) unequal-length behaviour must not move.
+        let left = irefs(&[1, 2, 3, 4, 5]);
+        let right = irefs(&[1, 2, 9, 3, 4, 5]);
+        let (l, r) = diff_instructions(&left, &right).unwrap();
+        assert_eq!(l.len(), r.len());
+        assert_eq!(l.len(), 6);
+        assert_eq!(aligned_equal_rows(&l, &r), 5);
+    }
+
+    #[test]
+    fn test_diff_instructions_empty() {
+        let (l, r) = diff_instructions(&[], &[]).unwrap();
+        assert!(l.is_empty());
+        assert!(r.is_empty());
     }
 }
