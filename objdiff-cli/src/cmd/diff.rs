@@ -2321,10 +2321,12 @@ pub fn analyze_symbol(
 /// verdict (`compute_verdict`) does that classification using detected
 /// patterns; this tier-text only suggests where to start looking.
 ///
-/// The source permuter is the first-line next step for anything in the
-/// 95-99.5% band — register-allocation, FPR scheduling, bool materialization,
-/// and stack-slot inversions are all permuter-class even when patterns
-/// suggest otherwise.
+/// The source permuter is a strong next step for anything in the 95-99.5%
+/// band — bool materialization and stack-slot inversions in particular are
+/// permuter-class even when patterns suggest otherwise. Register/FPR swaps in
+/// that band are better attacked by first identifying the liveness or
+/// scheduling difference they are a symptom of; see
+/// `docs/research/register-swap-symptom-not-cause.md`.
 fn match_guidance(percent: f32) -> &'static str {
     match percent {
         p if p >= 99.5 => {
@@ -2333,9 +2335,11 @@ fn match_guidance(percent: f32) -> &'static str {
              ICF) is detected. Otherwise run the source permuter on this function."
         }
         p if p >= 95.0 => {
-            "High-match band. Run the source permuter as the first action (regswaps, \
-             FPR scheduling, and bool materialization cascade here). Hand-edit \
-             fallbacks: variable reorder, inline assignment, member-cache hoists."
+            "High-match band. Register/FPR swaps here are usually symptoms — look for the \
+             liveness or scheduling difference behind them (a value held across a call, a \
+             member we reload that the target doesn't, a producer scheduled after its \
+             consumer) before or alongside a permuter sweep. Variable reorder is the lever \
+             for stack-slot/offset diffs, not for register-only swaps."
         }
         p if p >= 80.0 => {
             "Fine-tuning band. Check comparison patterns (>= vs >, signed vs \

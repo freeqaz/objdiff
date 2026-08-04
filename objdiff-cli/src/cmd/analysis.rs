@@ -73,8 +73,11 @@ pub enum PatternType {
     LinkerMerged,
     /// Bool return masking with clrlwi/rlwinm (permuter-class)
     BoolMask,
-    /// Consistent register allocation swaps (permuter-class — tedious by hand,
-    /// mechanical via declaration reorder / scope mutation patterns)
+    /// Consistent register allocation swaps. Usually a *symptom*, not a cause:
+    /// the whole swap set tends to flip at once when the underlying liveness or
+    /// scheduling difference is fixed. Declaration reorder is the lever for
+    /// stack-slot mismatches (`OffsetSwap`), and is usually inert here.
+    /// See `docs/research/register-swap-symptom-not-cause.md`.
     RegisterSwap,
     /// Comparison immediate differs by 1, suggesting > vs >= style difference
     ComparisonStyle,
@@ -420,8 +423,13 @@ impl Pattern {
                 let total_occurrences: usize = swaps.iter().map(|s| s.count).sum();
                 let pairs = swaps.len();
                 // Classify register types for display
+                // These labels name the likely CAUSE, not a fix recipe. Volatile
+                // swaps track instruction scheduling and operand order;
+                // callee-saved swaps track how long values stay live across
+                // calls. Declaration order is deliberately not suggested here —
+                // see docs/research/register-swap-symptom-not-cause.md.
                 let reg_class = match self.fixability {
-                    Fixability::RarelyHandFixable => " [volatile — try permuter sweep]",
+                    Fixability::RarelyHandFixable => " [volatile — scheduling/operand order]",
                     Fixability::MaybeFixable => {
                         let has_callee = swaps.iter().any(|s| {
                             is_callee_saved_register(&s.target_reg)
@@ -432,9 +440,9 @@ impl Pattern {
                                 || !is_callee_saved_register(&s.base_reg)
                         });
                         if has_callee && has_volatile {
-                            " [mixed volatile+callee-saved]"
+                            " [mixed volatile+callee-saved — liveness across calls]"
                         } else {
-                            " [callee-saved, maybe fixable]"
+                            " [callee-saved — check liveness across calls]"
                         }
                     }
                     _ => "",
@@ -1453,7 +1461,19 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
             "fixable-bool-mask.md",
             "permuter-roi.md#bool-materialization",
         ],
+        // REGISTER_SWAP reads as "the allocator picked different registers",
+        // which invites a declaration-order edit. Measured on MSVC/PowerPC
+        // (n=3, see docs/research/register-swap-symptom-not-cause.md) that is
+        // the wrong first move: the swaps were symptoms of liveness and
+        // scheduling differences, and flipped wholesale once the cause was
+        // fixed. Liveness-shaping docs therefore come first; declaration order
+        // is kept last because it is the lever for OFFSET_SWAP (stack slots),
+        // which co-occurs with regswaps often enough to still be worth listing.
+        // Anchor availability differs per consuming repo (DC3 vs RB3); links
+        // that don't resolve degrade to the top of the same file.
         PatternType::RegisterSwap => &[
+            "fixable-declarations.md#pre-compute-references-before-clobbering-calls",
+            "permuter-roi.md#instruction-scheduling",
             "permuter-roi.md#register-allocation-cascades",
             "fixable-declarations.md#variable-declaration-order",
         ],
@@ -1481,7 +1501,14 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
             "at-limit-mwcc.md#dead-store-elimination",
             "permuter-roi.md",
         ],
+        // A prologue that saves one more/fewer callee-saved register than the
+        // target is a live-range budget difference, not a declaration-order
+        // one: in the measured case (RndText::FitTextScroll, MSVC/PPC) our
+        // build reloaded a member at a call site where the target held it in a
+        // callee-saved register, costing exactly one extra save slot
+        // (__savegprlr_23 vs _22) and cascading into ~40 register swaps.
         PatternType::PrologueMismatch => &[
+            "fixable-declarations.md#pre-compute-references-before-clobbering-calls",
             "permuter-roi.md#register-allocation-cascades",
             "fixable-declarations.md#variable-declaration-order",
         ],
@@ -1796,14 +1823,23 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
         .collect();
     swaps.sort_by(|a, b| b.count.cmp(&a.count));
 
-    // Classify fixability based on register types:
-    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable — primarily via
-    //   declaration reorder; permuter sweeps crack these mechanically.
+    // Classify fixability based on register types. NOTE: this split says which
+    // CAUSE is more likely, not how hard the fix is — in both classes the swap
+    // set is a symptom that flips wholesale once the cause is addressed.
+    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable — the usual
+    //   cause is a live-range difference across a call (a value the target
+    //   keeps in a callee-saved register that our build reloads, or vice
+    //   versa). Shortening or extending that live range is the lever.
     // - Pure volatile swaps (r0-r12, f0-f13): RarelyHandFixable — driven by
-    //   instruction scheduling and live-range pressure; not directly
-    //   controllable from declarations, but the permuter's body-restructuring
-    //   patterns still help in many cases. Try a sweep before accepting.
-    // - Mixed: MaybeFixable (callee-saved part is the main lever)
+    //   instruction scheduling and operand order. Reordering the source so a
+    //   producer lands before its consumer, or flipping a commutative/compare
+    //   operand order, has moved these by hand; the permuter's
+    //   body-restructuring patterns also help. Try both before accepting.
+    // - Mixed: MaybeFixable (the callee-saved half usually carries the cause)
+    //
+    // Declaration reorder is NOT the first lever for either class; it is the
+    // lever for stack-slot (OFFSET_SWAP) mismatches. Measured n=3 on
+    // MSVC/PowerPC — see docs/research/register-swap-symptom-not-cause.md.
     let has_callee_saved_swap = swaps
         .iter()
         .any(|s| is_callee_saved_register(&s.target_reg) && is_callee_saved_register(&s.base_reg));
@@ -3821,19 +3857,33 @@ pub fn compute_verdict(
             });
         }
 
-        // PRIMARY recommendation for register-swap mismatches: dispatch the
-        // source permuter. Register-allocation cascades are tedious by hand
-        // but mechanical for the permuter — declaration reorder, member-ref
-        // binding, scope widening, and slot padding all routinely crack them.
-        // Empirical: unit-wide sweeps produce ~6% conversion rate per pass,
-        // with some functions going 0% → 100% in a single round.
+        // PRIMARY recommendation: treat the swap set as a symptom and go
+        // looking for the liveness or scheduling difference behind it.
+        // Measured on MSVC/PowerPC (n=3, one codebase — see
+        // docs/research/register-swap-symptom-not-cause.md): in every case the
+        // register names were never permuted directly, and the entire swap set
+        // flipped at once when the cause was fixed. Declaration reorder — the
+        // move the old text recommended first — was inert there (6 variants
+        // byte-identical, 2 regressed on one function).
         suggestions.push(Suggestion {
-            action: "Run the source permuter on this function/unit (regswaps are permuter-class)."
+            action: "Treat swaps as a symptom. Look for a liveness difference (a value the \
+                     target holds across a call that we reload, or vice versa) or a scheduling \
+                     difference (a producer emitted after its consumer, a compare with the \
+                     operands the other way round). Fixing the cause flips the whole swap set."
+                .to_string(),
+            doc_url: Some(format!(
+                "{}fixable-declarations.md#pre-compute-references-before-clobbering-calls",
+                DOC_BASE
+            )),
+        });
+        suggestions.push(Suggestion {
+            action: "Run the source permuter on this function/unit if the cause isn't visible."
                 .to_string(),
             doc_url: Some(format!("{}permuter-roi.md", DOC_BASE)),
         });
         suggestions.push(Suggestion {
-            action: "Hand-edit fallback: reorder local variable declarations, move init closer to first use, hoist member-cache locals."
+            action: "Declaration reorder is usually inert for register-only swaps (measured on \
+                     MSVC/PPC); reach for it when stack-slot / OFFSET_SWAP diffs are also present."
                 .to_string(),
             doc_url: Some(format!(
                 "{}fixable-declarations.md#variable-declaration-order",
@@ -3841,9 +3891,11 @@ pub fn compute_verdict(
             )),
         });
 
-        // Register swaps are NEVER "unfixable". They are tedious by hand but
-        // routinely cracked by the permuter. Even high-match functions deserve
-        // a permuter sweep before being marked at_limit.
+        // Register swaps are NEVER "unfixable" on their face. They are a
+        // downstream effect of some other difference, and both hand analysis
+        // (liveness/scheduling) and the permuter have closed them. Even
+        // high-match functions deserve a look for the cause, then a sweep,
+        // before being marked at_limit.
         let high_match = match_percent.unwrap_or(0.0) >= 99.0;
 
         let (classification, explanation, recommendation) = if high_match && register_swap_count <= 4 {
@@ -3854,14 +3906,16 @@ pub fn compute_verdict(
                 VerdictClassification::MaybeFixable,
                 format!(
                     "{} register swap instruction(s) at {:.1}% match. Small regswap counts \
-                     at very high match are often single-FPR/single-callee-saved cascades — \
-                     a permuter sweep frequently closes them; if not, accepting is reasonable.",
+                     at very high match are usually one live-range or scheduling decision \
+                     showing through — check that first, then sweep; if neither moves it, \
+                     accepting is reasonable.",
                     register_swap_count,
                     match_percent.unwrap_or(0.0)
                 ),
                 format!(
-                    "Run the source permuter on this function (~250 builds). \
-                     If no improvement, accept ({:.1}%) and mark at_limit.",
+                    "Look for the single liveness/scheduling difference behind the swaps, \
+                     then run the source permuter (~250 builds). If neither improves it, \
+                     accept ({:.1}%) and mark at_limit.",
                     match_percent.unwrap_or(0.0)
                 ),
             )
@@ -3869,27 +3923,31 @@ pub fn compute_verdict(
             (
                 VerdictClassification::MaybeFixable,
                 format!(
-                    "{} register swap instructions — large regswap cascade, typically \
-                     driven by a single declaration-order or live-range decision. \
-                     This is permuter-class; hand-editing rarely converges.",
+                    "{} register swap instructions — large cascade, typically driven by ONE \
+                     upstream decision (a value's live range across a call, or where an \
+                     operation was scheduled). Large count does not mean large fix: cascades \
+                     of 17 and ~40 swaps have both collapsed to zero from a single edit.",
                     register_swap_count
                 ),
-                "Run the source permuter on this function/unit. \
-                 Hand-edit cascades larger than ~10 instructions rarely converge from a \
-                 single edit; the permuter explores the declaration/scope-ordering space \
-                 mechanically. Only mark at_limit after a full sweep yields nothing."
+                "Find the one upstream difference rather than chasing individual registers: \
+                 compare which values survive across calls (prologue save count is a tell), \
+                 and whether producers are scheduled before their consumers. Then run the \
+                 source permuter. Only mark at_limit after both yield nothing."
                     .to_string(),
             )
         } else {
             (
                 VerdictClassification::MaybeFixable,
                 format!(
-                    "{} register swap instruction(s) detected. Permuter-class — \
-                     mechanical to fix via declaration/scope mutation but tedious by hand.",
+                    "{} register swap instruction(s) detected. Symptom class — the swaps \
+                     follow from a liveness or scheduling difference rather than being the \
+                     difference themselves.",
                     register_swap_count
                 ),
-                "Run the source permuter first. Hand-edit fallback: reorder variable \
-                 declarations, delay assignments, or hoist member caches into earlier scope."
+                "Look for the cause first: a member reloaded at a call site the target keeps \
+                 in a register, a temp whose live range spans a call it need not, or an \
+                 operation scheduled after the instruction that consumes it. Then run the \
+                 source permuter. Declaration reorder is for stack-slot diffs, not this."
                     .to_string(),
             )
         };
