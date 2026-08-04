@@ -98,10 +98,36 @@ impl ReportCache {
         let _ = std::fs::write(&self.path, buf);
     }
 
+    /// Bump whenever the *content* of a cached `ReportUnit` changes for reasons the
+    /// obj bytes + config args cannot express — i.e. whenever this file starts
+    /// emitting a new field or a different value for the same inputs. The cache key
+    /// is otherwise purely content-addressed, so without this a newly-installed
+    /// binary would keep serving units produced by the old one and silently report
+    /// the new fields as zero. Cost of a bump: one full re-diff of the report, no
+    /// change to any measure.
+    ///
+    /// 2 — populated `Measures.masked_equal_functions` (funclet over-subscription)
+    ///     and the per-item `ReportItem.masked_equal` bit.
+    /// 3 — WIDENED that disclosure to every funclet byte-signature pairing
+    ///     (`SymbolDiff::masked_equal_symbol`), not just the pass-2b
+    ///     over-subscription subset; and taught `FunctionRelocDiffs::NameCheck` to
+    ///     forgive a COFF weak-external alias. Both change the emitted content for
+    ///     unchanged obj bytes, which is exactly what this counter exists for —
+    ///     WITHOUT the bump a freshly installed binary keeps serving units diffed
+    ///     by the old one and the new disclosure silently reads as the old value.
+    /// 4 — `diff_instructions` no longer drops onto a blind 1:1 pairing merely
+    ///     because the two instruction sequences have EQUAL LENGTH (N insertions
+    ///     plus N deletions preserve length, so that guard was unsound). 508 symbol
+    ///     pairs realign and 257 change `match_percent`, for unchanged obj bytes —
+    ///     precisely the case this counter exists for. Without the bump a mixed
+    ///     report would be served: pre-fix rows from cache, post-fix rows fresh.
+    const CACHE_LOGIC_VERSION: u32 = 4;
+
     /// Hash a unit's target and base .obj file contents together.
     fn hash_unit(object: &ObjectConfig, config_args: &[String]) -> u64 {
         use xxhash_rust::xxh3::xxh3_64;
         let mut combined = Vec::new();
+        combined.extend_from_slice(&Self::CACHE_LOGIC_VERSION.to_le_bytes());
         if let Some(p) = &object.target_path {
             if let Ok(data) = std::fs::read(p.as_str()) {
                 combined.extend_from_slice(&data);
@@ -703,6 +729,50 @@ fn report_object(
 
     let obj = target.as_ref().or(base.as_ref()).unwrap();
     let obj_diff = result.left.as_ref().or(result.right.as_ref()).unwrap();
+
+    // ── Disclosure, part 1 of 2: funclet OVER-SUBSCRIPTION (`pair_funclets_by_bytes`
+    // pass 2b) ──
+    //
+    // NOTE: this is the NARROWER of the two disclosure sources. Part 2 (below, at
+    // the per-symbol loop) adds `SymbolDiff::masked_equal_symbol`, i.e. EVERY pair
+    // that exists only because the funclet byte-signature fallback matched it.
+    // Over-subscription is a strict subset of that, so this set is kept only
+    // because it is the one case where we can also name which member of a group is
+    // the surplus one.
+    //
+    // Pass 2b pairs a leftover anonymous target funclet many-to-one onto a base
+    // funclet that some other target symbol already owns, and the overflow is
+    // credited 100%. That credit is not backed by a symbol our compiled object
+    // actually supplies, so it inflates `matched_functions` with machine code we
+    // never generated.
+    //
+    // Detection needs no new plumbing: EVERY other pairing path (symbol mappings,
+    // name matching, funclet passes 1/2/3) inserts its base partner into
+    // `right_used` before moving on, so a base symbol can be the partner of at most
+    // one target symbol. Two or more target symbols sharing a `target_symbol` index
+    // is therefore *exactly* a pass-2b over-subscription, and a group of size N
+    // contributes exactly N-1 surplus symbols.
+    //
+    // Which member is the surplus one is genuinely arbitrary — the group is
+    // byte-identical by construction. We treat the member that did NOT come from
+    // funclet pairing as the legitimate owner when there is one (there is at most
+    // one, since a name match consumes the partner), else the lowest symbol index.
+    // The per-group count is exact either way.
+    let mut partner_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, symbol_diff) in obj_diff.symbols.iter().enumerate() {
+        if let Some(partner) = symbol_diff.target_symbol {
+            partner_groups.entry(partner).or_default().push(idx);
+        }
+    }
+    let mut oversubscribed: HashSet<usize> = HashSet::new();
+    for group in partner_groups.values().filter(|g| g.len() > 1) {
+        let owner = group
+            .iter()
+            .copied()
+            .find(|&i| !obj_diff.symbols[i].masked_equal_symbol)
+            .unwrap_or_else(|| group.iter().copied().min().expect("non-empty group"));
+        oversubscribed.extend(group.iter().copied().filter(|&i| i != owner));
+    }
     for ((section_idx, section), section_diff) in
         obj.sections.iter().enumerate().zip(&obj_diff.sections)
     {
@@ -738,7 +808,9 @@ fn report_object(
             _ => {}
         }
 
-        for (symbol, symbol_diff) in obj.symbols.iter().zip(&obj_diff.symbols) {
+        for (symbol_idx, (symbol, symbol_diff)) in
+            obj.symbols.iter().zip(&obj_diff.symbols).enumerate()
+        {
             if symbol.section != Some(section_idx)
                 || symbol.size == 0
                 || symbol.flags.contains(SymbolFlag::Hidden)
@@ -774,6 +846,29 @@ fn report_object(
             if match_percent == 100.0 {
                 measures.matched_code += symbol.size;
             }
+            let is_oversubscribed = oversubscribed.contains(&symbol_idx);
+            // ── Disclosure, part 2 of 2: FUNCLET BYTE-SIGNATURE PAIRING ──
+            //
+            // `masked_equal_symbol` is set by `diff_objs` on every code pair the
+            // funclet byte-signature fallback produced (`pair_funclets_by_bytes`,
+            // ALL passes — not just the 2b over-subscription counted above). Such a
+            // pair was formed by comparing masked bodies: relocation targets are
+            // blanked in the signature, so the pairing says "these two bodies have
+            // the same shape", NOT "these two symbols are the same function". The
+            // credit IS supply-backed — our compiler really emitted a body of that
+            // shape — but WHICH target funclet a given base funclet is credited
+            // against is arbitrary within a byte-signature group, and the reloc
+            // targets that would distinguish them are masked in the signature AND
+            // (under the default ruler) in the score.
+            //
+            // Disclosing only the over-subscription subset understated the class by
+            // ~19x on rb3-xenon (1,201 of ~22,549 funclet-paired rows), so the
+            // `matched - masked_equal` figure quoted as "honest" still carried the
+            // whole byte-signature class inside it. Both sources are unioned here.
+            // This changes NO score: `matched_functions`, `matched_code`,
+            // `total_*` and `fuzzy_match_percent` are computed above and are not a
+            // function of this bit.
+            let is_masked_equal = is_oversubscribed || symbol_diff.masked_equal_symbol;
             functions.push(ReportItem {
                 name: symbol.name.clone(),
                 size: symbol.size,
@@ -784,10 +879,15 @@ fn report_object(
                     virtual_address: symbol.virtual_address,
                 }),
                 address: symbol.address.checked_sub(section.address),
-                masked_equal: None,
+                masked_equal: is_masked_equal.then_some(true),
             });
             if match_percent_normalized == 100.0 {
                 measures.matched_functions += 1;
+                // Disclosure only: a SUBSET of the `matched_functions` just
+                // credited, never an addition to it.
+                if is_masked_equal {
+                    measures.masked_equal_functions += 1;
+                }
             }
             measures.total_functions += 1;
         }

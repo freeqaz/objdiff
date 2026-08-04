@@ -48,13 +48,74 @@ message Measures {
   uint32 total_units = 15;
   // Completed (or "linked") units
   uint32 complete_units = 16;
-  // Number of functions counted as matched (100%) only because the opt-in
-  // case-B global byte-equality second pass promoted them: an unmatched named
-  // method whose retail body was byte-identical to a body carved into a
-  // foreign unit's target span. Disclosure only — this is a subset of
-  // `matched_functions`, not an additional match, and it is 0 unless
-  // `report generate --global-byte-eq` was used. See the per-item
-  // `ReportItem.masked_equal` bit and docs/decomp/identity-transfer.md.
+  // Number of functions counted as matched (100%) whose 100% rests on a
+  // SYMBOL-LEVEL NORMALIZATION rather than on a name-identified pairing — i.e.
+  // the part of `matched_functions` whose per-row attribution is not verified.
+  // Three sources feed it:
+  //
+  //  0. Funclet BYTE-SIGNATURE PAIRING (`pair_funclets_by_bytes`, ALL passes,
+  //     always on). An anonymous target funclet (`fn_<addr>`, `__unwind$N`,
+  //     `__catch$N`, `??__E*`, `??__F*`) has no name to pair on, so it is paired
+  //     against a base funclet by comparing MASKED bodies — relocation targets
+  //     are blanked in the signature. The pairing therefore establishes "same
+  //     body shape", not "same function". Such credit IS supply-backed (our
+  //     compiler emitted a body of that shape) but the per-row attribution is
+  //     ARBITRARY within a byte-signature group, and the reloc targets that
+  //     would break the tie are masked in the signature and, under the default
+  //     `functionRelocDiffs=none` ruler, in the score as well. Flagged via
+  //     `SymbolDiff::masked_equal_symbol`.
+  //     ⚠ This source DOMINATES: on rb3-xenon it is ~19x larger than source 1,
+  //     which was the only source disclosed before 2026-08-02. Consumers that
+  //     compared `matched - masked_equal` across that change will see a large
+  //     one-time drop that is a DISCLOSURE change, not a regression: no score
+  //     moved.
+  //
+  //  1. Funclet OVER-SUBSCRIPTION (`pair_funclets_by_bytes` pass 2b, always on)
+  //     — a strict SUBSET of source 0, retained separately because it is the one
+  //     case where the surplus member of a group can be named:
+  //     N byte-identical anonymous target funclets (`fn_<addr>`, `__unwind$N`,
+  //     `__catch$N`, `??__E*`, `??__F*`) paired many-to-one onto M < N base
+  //     funclets. The N-M overflow is credited 100% against a base symbol some
+  //     other target symbol already owns, so it is machine code we never
+  //     generated. Detected here as two or more target symbols sharing one base
+  //     partner index (every non-funclet pairing consumes its base partner, so a
+  //     duplicated partner is exactly a pass-2b pairing).
+  //  2. The opt-in case-B global byte-equality second pass, which promotes an
+  //     unmatched named method whose retail body was byte-identical to a body
+  //     carved into a foreign unit's target span (0 unless
+  //     `report generate --global-byte-eq` was used).
+  //
+  // Disclosure only — this is a SUBSET of `matched_functions`, never an
+  // addition, and populating it changes no other measure. `matched_functions`,
+  // `matched_code`, `total_*` and `fuzzy_match_percent` are computed
+  // independently of this bit; if any of them moves when this field's definition
+  // changes, that is a BUG. See the per-item `ReportItem.masked_equal` bit and
+  // docs/decomp/identity-transfer.md.
+  //
+  //     matched_functions - masked_equal_functions  =  a CONSERVATIVE FLOOR
+  //
+  // Read it as a floor and nothing more. It is NOT "the number of real matches":
+  // source 0 subtracts credit that our compiler genuinely supplied, so the true
+  // honest count sits strictly BETWEEN the floor and `matched_functions`. Do not
+  // quote the floor as if it were an estimate of the truth, and do not quote
+  // `matched_functions` as if the attribution were verified. Two different
+  // questions:
+  //     "did we emit this many matching bodies?"      -> matched_functions
+  //     "how many are name-verified, row by row?"     -> >= the floor
+  //
+  // There is deliberately no byte-side counterpart field: the byte figure is
+  // derivable from the report itself as the sum of `size` over `functions` items
+  // with `masked_equal == true` (and `fuzzy_match_percent == 100`), so adding a
+  // measure would duplicate state that can go stale.
+  //
+  // Sizing evidence for source 1 (kept for the record): compiling pass 2b out
+  // entirely on rb3-xenon @ ca711730 moved `matched_functions` 39,743 -> 38,210,
+  // a real inflation of 1,533, while this field then reported 1,582. The 49
+  // extra were re-paired by funclet pass 3 onto genuinely UNUSED base funclets
+  // and still scored 100%, so that credit was mis-attributed rather than
+  // unsupported. Fixing that in-report would require changing which symbols pair
+  // with which (e.g. running pass 2b after pass 3), which WOULD move existing
+  // measures; this field deliberately does not.
   uint32 masked_equal_functions = 17;
 }
 
@@ -111,11 +172,28 @@ message ReportItem {
   optional uint64 address = 5;
   // Match percent excluding arg-only differences (register/offset swaps)
   optional float match_percent_normalized = 6;
-  // Disclosure: this item was promoted to 100% only by the opt-in case-B
-  // global byte-equality second pass (`reconcile_global_byte_matches`), not by
-  // a normal per-unit diff — its match rests on a cross-unit byte-equality
-  // normalization. Absent/false for a normally-diffed item. Never changes the
-  // score; it flags that the 100% came from a symbol-level normalization.
+  // Disclosure: this item's 100% rests on a SYMBOL-LEVEL NORMALIZATION rather
+  // than on a name-identified pairing. Any of:
+  //   (a) the pair was formed by funclet BYTE-SIGNATURE matching
+  //       (`pair_funclets_by_bytes`, any pass) — the bodies were compared with
+  //       relocation targets masked, so the pairing means "same body shape", and
+  //       which target funclet this base funclet is credited against is arbitrary
+  //       within the signature group;
+  //   (b) it is funclet OVER-SUBSCRIPTION surplus — a pass-2b many-to-one pairing
+  //       onto a base funclet another target symbol already owns (a subset of (a)
+  //       in which the surplus member can be named);
+  //   (c) it was promoted to 100% by the opt-in case-B global byte-equality
+  //       second pass (`reconcile_global_byte_matches`).
+  // Absent/false for a normally-diffed item. NEVER changes the score. Items
+  // flagged this way are summed into `Measures.masked_equal_functions`; summing
+  // their `size` gives the byte-side figure.
+  //
+  // (a) does NOT mean the bytes are fabricated — our compiler really emitted a
+  // body of that shape. It means the ROW ATTRIBUTION is unverified. For (b),
+  // byte-identical funclets are interchangeable, so WHICH member of an
+  // over-subscribed group carries the surplus is arbitrary (the non-funclet-paired
+  // member, else the lowest symbol index, is treated as the legitimate owner); the
+  // per-group COUNT is exact.
   optional bool masked_equal = 7;
 }
 

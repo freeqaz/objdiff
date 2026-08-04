@@ -21,6 +21,11 @@
           "description": "Relocation diffs match iff the target symbol name and section match; the addend is ignored. Strict callee/data-target check without penalizing benign build-address (addend) differences."
         },
         {
+          "value": "name_check",
+          "name": "Name check (tolerant of unverifiable targets)",
+          "description": "Like 'Name only', but a relocation difference is only charged when BOTH sides carry a relocation AND the (left/target) symbol has a real, non-placeholder name. A missing left-side relocation or a placeholder name (fn_*, lbl_*, jumptable_* — dtk split conventions) is unverifiable and scores equal. Designed for split/disassembled target objects whose relocation coverage and symbol identification are incomplete: catches wrong callees / wrong data targets without penalizing unidentified ones."
+        },
+        {
           "value": "data_value",
           "name": "Data value"
         },

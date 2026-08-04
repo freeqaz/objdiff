@@ -644,10 +644,22 @@ fn diff_instructions(
     left_insts: &[InstructionRef],
     right_insts: &[InstructionRef],
 ) -> Result<(Vec<InstructionDiffRow>, Vec<InstructionDiffRow>)> {
-    // Fast path: if same length, pair instructions 1:1 without running the diff algorithm.
-    // This is valid because same-length sequences have no insertions/deletions, and
-    // instruction order is preserved in decomp output, so 1:1 alignment is optimal.
-    if left_insts.len() == right_insts.len() {
+    let left_ops = left_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
+    let right_ops = right_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
+    // Fast path: if the opcode sequences are element-wise IDENTICAL, pair 1:1 and skip
+    // the diff algorithm. This is exactly what `capture_diff_slices` produces for equal
+    // slices (a single `Equal` op covering both ranges), so the fast path is provably
+    // equivalent to the general path here — it only saves the work.
+    //
+    // ⚠ This condition used to be `left_insts.len() == right_insts.len()`, justified by
+    // "same-length sequences have no insertions/deletions". THAT IS FALSE: N insertions
+    // plus N deletions preserve length. The consequence was a FALSE REGRESSION — a
+    // function whose length became EQUAL to its target's would drop off the real
+    // alignment onto a 1:1 pairing and score far lower (measured by lane DQ-1:
+    // 1253-vs-1259 → 98.7%, 1259-vs-1259 → 72.2% with 578 spurious `replace` rows,
+    // 1261-vs-1259 → 99.8%). i.e. getting a function's SIZE RIGHT collapsed its score.
+    // Do not re-weaken this guard to a length comparison. (lanes DQ-1, DR-1)
+    if left_ops == right_ops {
         let left_diff = left_insts
             .iter()
             .map(|i| InstructionDiffRow { ins_ref: Some(*i), ..Default::default() })
@@ -658,8 +670,6 @@ fn diff_instructions(
             .collect();
         return Ok((left_diff, right_diff));
     }
-    let left_ops = left_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
-    let right_ops = right_insts.iter().map(|i| i.opcode).collect::<Vec<_>>();
     let ops = similar::capture_diff_slices(similar::Algorithm::Patience, &left_ops, &right_ops);
     if ops.is_empty() {
         ensure!(left_insts.len() == right_insts.len());
@@ -871,6 +881,48 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
     if had_array { String::from_utf8(result).ok() } else { None }
 }
 
+/// True for the auto-generated placeholder names a splitter assigns to
+/// symbols it could not identify. Used by `FunctionRelocDiffs::NameCheck` to
+/// treat relocations against unidentified symbols as unverifiable rather than
+/// as mismatches. Covers dtk (PowerPC ELF: `fn_<hexaddr>`, `lbl_<hexaddr>`,
+/// `jumptable_<hexaddr>`) and csplit (i386 PE: `code_<hexaddr>`,
+/// `data_<hexaddr>`, `bss_<hexaddr>`, `rdata_<hexaddr>`, each optionally
+/// carrying the cdecl leading underscore, e.g. `_bss_00456208`).
+/// The suffix must be non-empty hex (plus `_` separators) so a genuine source
+/// symbol that merely starts with one of these prefixes is not swallowed.
+fn is_placeholder_symbol_name(name: &str) -> bool {
+    // Tolerate a single leading underscore (i386 PE cdecl decoration).
+    let name = name.strip_prefix('_').unwrap_or(name);
+    ["fn_", "lbl_", "jumptable_", "code_", "data_", "bss_", "rdata_"].iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_')
+        })
+    })
+}
+
+/// True for MSVC compiler-internal local labels: `$L18077` (block / jump-table
+/// labels), `$T18082` (SEH scope-table records), `$SG...` etc. The numeric
+/// suffix is a compilation-order counter, NOT a stable identity — the same
+/// source recompiled produces different numbers — so comparing these names
+/// across target/base is pure noise. `FunctionRelocDiffs::NameCheck` treats a
+/// target-side relocation against one as unverifiable. (Content-derived names
+/// like `__real@3f800000` / `??_C@...` string literals are deterministic and
+/// are deliberately NOT covered: a mismatch there is a real defect.)
+fn is_compiler_local_label(name: &str) -> bool {
+    name.strip_prefix('$').is_some_and(|rest| !rest.is_empty())
+}
+
+/// True when `obj` declares `name` as an UNDEFINED COFF weak external whose
+/// auxiliary record defaults to exactly `other`.
+///
+/// Deliberately an equality test against the resolved default, not a
+/// name-shape rule: `??_E<X>` defaulting to `??_G<X>` is forgiven, `??_E<X>`
+/// defaulting to `??_G<Y>` while the other side calls `??_G<Z>` is NOT. The
+/// map is empty for non-COFF objects and for any symbol this object defines.
+fn weak_external_aliases(obj: &Object, name: &str, other: &str) -> bool {
+    obj.weak_external_defaults.get(name).is_some_and(|default| default == other)
+}
+
 fn reloc_eq(
     left_obj: &Object,
     right_obj: &Object,
@@ -883,10 +935,14 @@ fn reloc_eq(
     >,
 ) -> bool {
     let relax_reloc_diffs = diff_config.function_reloc_diffs == FunctionRelocDiffs::None;
+    let name_check = diff_config.function_reloc_diffs == FunctionRelocDiffs::NameCheck;
     let (left_reloc, right_reloc) = match (left_ins.relocation, right_ins.relocation) {
         (Some(left_reloc), Some(right_reloc)) => (left_reloc, right_reloc),
         // If relocations are relaxed, match if left is missing a reloc
-        (None, Some(_)) => return relax_reloc_diffs,
+        // NameCheck: split/disassembled target objects add relocations on a
+        // per-site basis with no guarantee of coverage (dtk), so a MISSING
+        // left-side relocation is "unverifiable", never evidence of a diff.
+        (None, Some(_)) => return relax_reloc_diffs || name_check,
         (None, None) => return true,
         _ => return false,
     };
@@ -894,6 +950,50 @@ fn reloc_eq(
         return false;
     }
     if relax_reloc_diffs {
+        return true;
+    }
+    // NameCheck: a placeholder-named target (fn_8xxxxxxx / lbl_* / jumptable_* /
+    // _bss_xxxxxxxx / ...) is a split symbol that was never identified — there
+    // is no real name to verify our callee/data target against, so the site is
+    // unverifiable. Likewise MSVC `$`-labels, whose numeric suffixes are
+    // nondeterministic across compilations. Only a REAL left-side name that
+    // disagrees with ours is charged.
+    if name_check
+        && (is_placeholder_symbol_name(&left_reloc.symbol.name)
+            || is_compiler_local_label(&left_reloc.symbol.name))
+    {
+        return true;
+    }
+
+    // NameCheck: COFF WEAK-EXTERNAL ALIAS.
+    //
+    // A weak external is a linkage directive, not a definition. If one side's
+    // relocation names an UNDEFINED weak external whose auxiliary record defaults
+    // to the *other* side's symbol, then both references link to the same code and
+    // charging the name difference is spurious. MSVC's vector deleting destructor
+    // is the systematic case: `??_E<C>` is an undefined weak external defaulting to
+    // `??_G<C>`, so our `bl ??_E<C>` and retail's `bl ??_G<C>` reach one body.
+    //
+    // The gate lives in the reader: `Object::weak_external_defaults` only contains
+    // symbols that are UNDEFINED weak externals in that object
+    // (`ImageSymbol::has_aux_weak_external()`), so where a definition exists the
+    // pair is NOT forgiven -- it stays a charge, because a defined `??_E<C>` binds
+    // to itself and the call does not reach `??_G<C>`. Measured on rb3-xenon: 1,158
+    // `??_E` are defined by our own objects and are correctly excluded.
+    //
+    // Checked in both directions purely so the rule cannot silently depend on which
+    // object is "target" and which is "base". Each direction is independently gated
+    // by that side's own symbol table, so the symmetry adds no forgiveness that the
+    // COFF data does not license. (In practice only the base side fires: dtk-split
+    // target objects contain no weak externals.)
+    if name_check
+        && (weak_external_aliases(right_obj, &right_reloc.symbol.name, &left_reloc.symbol.name)
+            || weak_external_aliases(
+                left_obj,
+                &left_reloc.symbol.name,
+                &right_reloc.symbol.name,
+            ))
+    {
         return true;
     }
 
@@ -921,7 +1021,10 @@ fn reloc_eq(
     // NameOnly: target symbol name (+ section) must match, but the addend is ignored.
     // This is the strict wrong-call-target / wrong-data-symbol check WITHOUT penalizing
     // benign build-address (addend) differences, which NameAddress couples in.
-    let name_only = diff_config.function_reloc_diffs == FunctionRelocDiffs::NameOnly;
+    let name_only = matches!(
+        diff_config.function_reloc_diffs,
+        FunctionRelocDiffs::NameOnly | FunctionRelocDiffs::NameCheck
+    );
     match (&left_reloc.symbol.section, &right_reloc.symbol.section) {
         (Some(sl), Some(sr)) => {
             if name_only {
@@ -1606,6 +1709,221 @@ mod tests {
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
     }
 
+    // ---- FunctionRelocDiffs::NameCheck semantics ----
+    // NameOnly with two tolerances for split/disassembled TARGET objects (dtk):
+    // a missing left-side relocation and a placeholder-named left target are both
+    // "unverifiable" (score equal); only a REAL left name that disagrees is charged.
+
+    /// `resolved_ref` variant that strips the relocation (models a dtk split
+    /// site where no relocation was emitted for the branch).
+    #[cfg(feature = "std")]
+    fn resolved_ref_no_reloc(obj: &Object) -> ResolvedInstructionRef<'_> {
+        ResolvedInstructionRef { relocation: None, ..resolved_ref(obj) }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_missing_target_reloc() {
+        let left = obj_with_reloc("Callee", 0x100);
+        let right = obj_with_reloc("Callee", 0x100);
+        let cfg_check = DiffObjConfig {
+            function_reloc_diffs: FunctionRelocDiffs::NameCheck,
+            ..Default::default()
+        };
+        let cfg_name_only = DiffObjConfig {
+            function_reloc_diffs: FunctionRelocDiffs::NameOnly,
+            ..Default::default()
+        };
+        let eq = std::collections::HashMap::new();
+        // Left (target) side has NO relocation, right (base) does: unverifiable
+        // under NameCheck -> MATCH; NameOnly treats it as a diff (the reason
+        // NameOnly alone is not deployable against dtk-split targets).
+        assert!(reloc_eq(
+            &left,
+            &right,
+            resolved_ref_no_reloc(&left),
+            resolved_ref(&right),
+            &cfg_check,
+            &eq
+        ));
+        assert!(!reloc_eq(
+            &left,
+            &right,
+            resolved_ref_no_reloc(&left),
+            resolved_ref(&right),
+            &cfg_name_only,
+            &eq
+        ));
+        // The REVERSE (target relocated, base not) stays a mismatch under NameCheck.
+        assert!(!reloc_eq(
+            &left,
+            &right,
+            resolved_ref(&left),
+            resolved_ref_no_reloc(&right),
+            &cfg_check,
+            &eq
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_placeholder_target_name() {
+        // Target callee was never identified by the splitter: placeholder name.
+        let left = obj_with_reloc("fn_82345678", 0x100);
+        let right = obj_with_reloc("?Poll@CharServoBone@@UAAXXZ", 0x100);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // NameOnly would charge it — placeholder tolerance is NameCheck-specific.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_catches_wrong_callee() {
+        // Both sides relocated, both REAL names, names differ: the wrong-callee
+        // case the report pipeline's None mode scores as 100%.
+        let left = obj_with_reloc("RightCallee", 0x100);
+        let right = obj_with_reloc("WrongCallee", 0x100);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::None));
+    }
+
+    // ---- NameCheck: COFF weak-external alias ----
+
+    /// Like `obj_with_reloc`, but the reloc target is an UNDEFINED symbol that this
+    /// object declares as a COFF weak external defaulting to `default_name`.
+    ///
+    /// `weak` selects whether the weak-external declaration is present. Passing
+    /// `false` models the object DEFINING the symbol instead (the 1,158 `??_E` we
+    /// define ourselves) and is what makes the resolution gate testable: the names
+    /// are identical either way, so a test that passes under both would prove the
+    /// implementation was keying on name SHAPE rather than on the COFF record.
+    #[cfg(feature = "std")]
+    fn obj_with_weak_external(target_name: &str, default_name: &str, weak: bool) -> Object {
+        let mut obj = obj_with_reloc(target_name, 0x100);
+        if weak {
+            // Undefined: a weak external has no section.
+            obj.symbols[1].section = None;
+            obj.weak_external_defaults
+                .insert(target_name.to_string(), default_name.to_string());
+        }
+        obj
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_coff_weak_external_alias() {
+        // Retail calls the SCALAR deleting destructor; we emit a call to the VECTOR
+        // deleting destructor, which our object declares as an undefined weak
+        // external defaulting to exactly that scalar one. Both link to one body.
+        let left = obj_with_reloc("??_GFoo@@UAAPAXI@Z", 0x100);
+        let right =
+            obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", true);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // Tolerance is NameCheck-specific; NameOnly still charges the name diff.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_weak_external_gate_defined_symbol_still_charged() {
+        // NULL 1 -- THE RESOLUTION GATE. Byte-for-byte the same names as the test
+        // above, with ONE difference: the object does not declare `??_E` as an
+        // undefined weak external (i.e. it DEFINES it). A defined weak-external
+        // name binds to itself, so the call does NOT reach `??_G` and the row is
+        // ambiguous, never benign. This must stay charged.
+        let left = obj_with_reloc("??_GFoo@@UAAPAXI@Z", 0x100);
+        let right =
+            obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", false);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_weak_external_cross_class_still_charged() {
+        // NULL 2 -- natural experiment. The base side IS an undefined weak external,
+        // so the rule CAN fire here; but its default is `??_GBar`, while retail calls
+        // `??_GQux`. Different classes, different code: the rule must DECLINE.
+        let left = obj_with_reloc("??_GQux@@UAAPAXI@Z", 0x100);
+        let right =
+            obj_with_weak_external("??_EBar@@UAAPAXI@Z", "??_GBar@@UAAPAXI@Z", true);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_weak_external_does_not_forgive_arbitrary_names() {
+        // NULL 3 -- the alias is an EQUALITY test against the resolved default, not
+        // a licence to forgive any pair where a weak external is involved. Base is a
+        // weak external defaulting to `Alpha`; retail calls `Beta`.
+        let left = obj_with_reloc("Beta", 0x100);
+        let right = obj_with_weak_external("Weak", "Alpha", true);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_addend() {
+        // Same callee, different addend: benign build-address noise, like NameOnly.
+        let left = obj_with_reloc("Callee", 0x100);
+        let right = obj_with_reloc("Callee", 0x200);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_comdat_bucket_variant_matches() {
+        // COMDAT-bucket tolerance carries over from NameOnly.
+        let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
+        let right = obj_with_reloc_in_section("Callee", 0x100, ".text");
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[test]
+    fn test_is_placeholder_symbol_name() {
+        assert!(is_placeholder_symbol_name("fn_82345678"));
+        assert!(is_placeholder_symbol_name("fn_82345678_0"));
+        assert!(is_placeholder_symbol_name("lbl_829fc4a0"));
+        assert!(is_placeholder_symbol_name("jumptable_82A477BC"));
+        // csplit (i386 PE) placeholders, with and without cdecl underscore.
+        assert!(is_placeholder_symbol_name("_bss_00456208"));
+        assert!(is_placeholder_symbol_name("_data_00317a84"));
+        assert!(is_placeholder_symbol_name("_code_000fab20"));
+        assert!(is_placeholder_symbol_name("_rdata_002e4c84"));
+        assert!(is_placeholder_symbol_name("code_000fab20"));
+        // Real names that merely share a prefix are NOT placeholders.
+        assert!(!is_placeholder_symbol_name("fn_helper"));
+        assert!(!is_placeholder_symbol_name("fnord"));
+        assert!(!is_placeholder_symbol_name("fn_"));
+        assert!(!is_placeholder_symbol_name("?Poll@CharServoBone@@UAAXXZ"));
+        assert!(!is_placeholder_symbol_name("label_1234"));
+        assert!(!is_placeholder_symbol_name("_data_ptr"));
+        assert!(!is_placeholder_symbol_name("_bss_"));
+        assert!(!is_placeholder_symbol_name("_code_gen_table"));
+    }
+
+    #[test]
+    fn test_is_compiler_local_label() {
+        assert!(is_compiler_local_label("$L18077"));
+        assert!(is_compiler_local_label("$T18082"));
+        assert!(is_compiler_local_label("$SG12345"));
+        assert!(!is_compiler_local_label("$"));
+        assert!(!is_compiler_local_label("_main"));
+        // Content-derived literal names are NOT local labels: they are stable
+        // across compilations and must still be compared.
+        assert!(!is_compiler_local_label("__real@3f800000"));
+        assert!(!is_compiler_local_label("??_C@_06PFFNFMJI@XDEMOS?$AA@"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_msvc_local_label_numbering() {
+        // SEH scope-table label: same construct, different compilation counter.
+        let left = obj_with_reloc("$T18083", 0x100);
+        let right = obj_with_reloc("$T18082", 0x100);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn test_section_base_name_strips_comdat_suffix() {
@@ -1614,5 +1932,99 @@ mod tests {
         assert_eq!(section_base_name(".text$mn"), ".text");
         assert_eq!(section_base_name(".rdata$r"), ".rdata");
         assert_ne!(section_base_name(".text$dup"), section_base_name(".data"));
+    }
+
+    // ---- diff_instructions: the equal-LENGTH false-regression regression test ----
+
+    fn irefs(opcodes: &[u16]) -> Vec<InstructionRef> {
+        opcodes
+            .iter()
+            .enumerate()
+            .map(|(i, &opcode)| InstructionRef {
+                address: (i * 4) as u64,
+                size: 4,
+                opcode,
+                branch_dest: None,
+            })
+            .collect()
+    }
+
+    /// Number of row positions where BOTH sides carry an instruction and the
+    /// opcodes agree — i.e. rows the scorer can possibly credit as equal.
+    fn aligned_equal_rows(
+        left: &[InstructionDiffRow],
+        right: &[InstructionDiffRow],
+    ) -> usize {
+        left.iter()
+            .zip(right.iter())
+            .filter(|(l, r)| match (l.ins_ref, r.ins_ref) {
+                (Some(a), Some(b)) => a.opcode == b.opcode,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// What the OLD (buggy) `left.len() == right.len()` fast path would have
+    /// produced: a blind 1:1 pairing. Kept in the test only, as the counterfactual.
+    fn one_to_one_equal_rows(left: &[InstructionRef], right: &[InstructionRef]) -> usize {
+        left.iter().zip(right.iter()).filter(|(a, b)| a.opcode == b.opcode).count()
+    }
+
+    #[test]
+    fn test_diff_instructions_equal_length_still_aligns() {
+        // N deletions + N insertions preserve length. The old fast path keyed on
+        // length equality and therefore mis-scored exactly this shape.
+        let left = irefs(&[1, 2, 3, 100, 101, 4, 5, 6, 7, 8]);
+        let right = irefs(&[1, 2, 3, 4, 5, 6, 7, 8, 200, 201]);
+        assert_eq!(left.len(), right.len(), "fixture must be EQUAL length or it tests nothing");
+
+        let (l, r) = diff_instructions(&left, &right).unwrap();
+
+        // Real alignment inserts gap rows, so the row count EXCEEDS the input length.
+        // Under the length-equality fast path this was exactly 10.
+        assert!(l.len() > left.len(), "no gap rows emitted => fast path was taken (len {})", l.len());
+        assert_eq!(l.len(), r.len());
+        assert!(l.iter().any(|row| row.ins_ref.is_none()), "expected a gap row on the left");
+        assert!(r.iter().any(|row| row.ins_ref.is_none()), "expected a gap row on the right");
+
+        // The whole point: real alignment recovers the 8 shared opcodes; the blind
+        // 1:1 pairing the old guard produced recovers only 3.
+        let real = aligned_equal_rows(&l, &r);
+        let naive = one_to_one_equal_rows(&left, &right);
+        assert_eq!(real, 8, "expected the 8-opcode common run to align");
+        assert_eq!(naive, 3, "counterfactual: the old fast path only lined up the 3-op prefix");
+        assert!(real > naive);
+    }
+
+    #[test]
+    fn test_diff_instructions_identical_takes_fast_path() {
+        // Positive control for the *retained* fast path: identical opcode sequences
+        // must pair 1:1 with no gap rows (identical to what the general path yields).
+        let left = irefs(&[1, 2, 3, 4, 5]);
+        let right = irefs(&[1, 2, 3, 4, 5]);
+        let (l, r) = diff_instructions(&left, &right).unwrap();
+        assert_eq!(l.len(), 5);
+        assert_eq!(r.len(), 5);
+        assert!(l.iter().all(|row| row.ins_ref.is_some()));
+        assert!(r.iter().all(|row| row.ins_ref.is_some()));
+        assert_eq!(aligned_equal_rows(&l, &r), 5);
+    }
+
+    #[test]
+    fn test_diff_instructions_unequal_length_unchanged() {
+        // The pre-existing (already-correct) unequal-length behaviour must not move.
+        let left = irefs(&[1, 2, 3, 4, 5]);
+        let right = irefs(&[1, 2, 9, 3, 4, 5]);
+        let (l, r) = diff_instructions(&left, &right).unwrap();
+        assert_eq!(l.len(), r.len());
+        assert_eq!(l.len(), 6);
+        assert_eq!(aligned_equal_rows(&l, &r), 5);
+    }
+
+    #[test]
+    fn test_diff_instructions_empty() {
+        let (l, r) = diff_instructions(&[], &[]).unwrap();
+        assert!(l.is_empty());
+        assert!(r.is_empty());
     }
 }

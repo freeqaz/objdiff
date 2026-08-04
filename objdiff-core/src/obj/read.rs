@@ -230,9 +230,12 @@ fn map_symbols(
         symbols.push(symbol);
     }
 
-    // Infer symbol sizes for 0-size symbols
-    infer_symbol_sizes(arch, &mut symbols, sections)?;
-
+    // NOTE: symbol sizes are NOT inferred here. `Arch::infer_function_size` needs
+    // `section.relocations` to recognise inline data (jump tables) inside a function, and
+    // relocations are not populated until `map_relocations`, which needs the symbol indices this
+    // function returns. Inferring here read an empty relocation list, so the inline-data branch
+    // never fired for any object in any project. The caller runs `infer_symbol_sizes` after
+    // `map_relocations` instead.
     Ok((symbols, symbol_indices))
 }
 
@@ -287,8 +290,24 @@ fn add_section_symbols(sections: &[Section], symbols: &mut Vec<Symbol>) {
 /// usually emitted as branch targets and do not represent the start of a function or object.
 fn is_local_label(symbol: &Symbol) -> bool {
     const LABEL_PREFIXES: &[&str] = &[".L", "LAB_", "switchD_"];
-    symbol.size == 0
-        && symbol.flags.contains(SymbolFlag::Local)
+    if symbol.size != 0 {
+        return false;
+    }
+    // `$L` is MSVC's spelling of GCC's `.L`: a block or jump-table label interior to a function.
+    // The Local-flag test is deliberately skipped for these, because the two sides of a diff do
+    // not agree on it. MSVC emits `$L2587` as STATIC with type 0, which reads back as a local
+    // data symbol; a splitter recovering the same label from a map file emits it as EXTERNAL
+    // with type 0x20, which reads back as a global function. Requiring Local therefore makes it
+    // a hard boundary on one side and an interior label on the other, so the two disagree about
+    // where the enclosing function ends — `_inflate_blocks` came out 2920 bytes against 2976.
+    // The `$L` name is unambiguous on its own.
+    //
+    // Deliberately NOT `$T`: on MSVC PowerPC those name real 8-byte data-section entries that
+    // must keep their inferred sizes (see tests/snapshots/arch_ppc__read_vmx128_coff.snap).
+    if symbol.name.starts_with("$L") {
+        return true;
+    }
+    symbol.flags.contains(SymbolFlag::Local)
         && LABEL_PREFIXES.iter().any(|p| symbol.name.starts_with(p))
 }
 
@@ -772,6 +791,69 @@ fn parse_line_info_dwarf1(obj_file: &object::File, sections: &mut [Section]) -> 
     Ok(())
 }
 
+/// Collect COFF weak externals: undefined symbol name -> aux default symbol name.
+///
+/// A weak external is a linkage directive, not a definition. MSVC emits, for a
+/// polymorphic class `C`, the VECTOR deleting destructor as an undefined weak
+/// external whose auxiliary record names a DEFAULT symbol:
+///
+/// ```text
+/// ??_E<C>@@UAAPAXI@Z   storage 105 (IMAGE_SYM_CLASS_WEAK_EXTERNAL), 1 aux
+///     aux.TagIndex  -> ??_G<C>@@UAAPAXI@Z   (SCALAR deleting destructor)
+/// ```
+///
+/// so if `??_E<C>` is not defined anywhere in the link, `bl ??_E<C>` resolves to
+/// `??_G<C>`. Measured on rb3-xenon over `build/45410914/src/**/*.obj`: 10,119
+/// undefined `??_E`, ALL storage 105 with 1 aux, aux resolving to `??_G` of the
+/// SAME class 10,119 / 10,119, zero exceptions.
+///
+/// THE RESOLUTION GATE. `has_aux_weak_external()` requires storage class
+/// `IMAGE_SYM_CLASS_WEAK_EXTERNAL` *and* `section_number == IMAGE_SYM_UNDEFINED`
+/// *and* `value == 0` *and* at least one aux record. That gate is what makes a
+/// consumer of this map able to be WRONG rather than vacuously right: the same
+/// tree DEFINES 1,158 `??_E` symbols, and a defined symbol has a real section
+/// number, so it never lands in this map and never earns an alias verdict.
+fn parse_coff_weak_externals(
+    coff: &object::coff::CoffFile,
+    obj_data: &[u8],
+) -> Result<BTreeMap<String, String>> {
+    use object::{
+        coff::{CoffHeader as _, ImageSymbol as _},
+        endian::LittleEndian as LE,
+    };
+    let symbol_table = coff.coff_header().symbols(obj_data)?;
+    let strings = symbol_table.strings();
+    let mut out = BTreeMap::new();
+    for (index, symbol) in symbol_table.iter() {
+        if !symbol.has_aux_weak_external() {
+            continue;
+        }
+        let Ok(aux) = symbol_table.aux_weak_external(index) else { continue };
+        let default_index = object::SymbolIndex(aux.weak_default_sym_index.get(LE) as usize);
+        // A self-referential default would be a degenerate record; skip it rather
+        // than record an alias from a name to itself.
+        if default_index == index {
+            continue;
+        }
+        let Ok(default_symbol) = symbol_table.symbol(default_index) else { continue };
+        let (Ok(name), Ok(default_name)) =
+            (symbol.name(strings), default_symbol.name(strings))
+        else {
+            continue;
+        };
+        let (Ok(name), Ok(default_name)) =
+            (core::str::from_utf8(name), core::str::from_utf8(default_name))
+        else {
+            continue;
+        };
+        if name.is_empty() || default_name.is_empty() || name == default_name {
+            continue;
+        }
+        out.insert(name.to_string(), default_name.to_string());
+    }
+    Ok(out)
+}
+
 fn parse_line_info_coff(
     coff: &object::coff::CoffFile,
     sections: &mut [Section],
@@ -1103,12 +1185,25 @@ pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result
         config,
     )?;
     map_relocations(arch.as_ref(), &obj_file, &mut sections, &section_indices, &symbol_indices)?;
+    // Must follow map_relocations: infer_function_size uses the section's relocations to tell
+    // inline data (jump tables, literal pools) from code. See the note in map_symbols.
+    infer_symbol_sizes(arch.as_ref(), &mut symbols, &sections)?;
     parse_line_info(&obj_file, &mut sections, &section_indices, data)?;
     if config.combine_data_sections || config.combine_text_sections {
         combine_sections(&mut sections, &mut symbols, config)?;
     }
     add_section_symbols(&sections, &mut symbols);
     arch.post_init(&sections, &symbols);
+    let weak_external_defaults = match &obj_file {
+        object::File::Coff(coff) => match parse_coff_weak_externals(coff, data) {
+            Ok(map) => map,
+            Err(e) => {
+                log::warn!("Failed to parse COFF weak externals: {e}");
+                BTreeMap::new()
+            }
+        },
+        _ => BTreeMap::new(),
+    };
     let mut obj = Object {
         arch,
         endianness: obj_file.endianness(),
@@ -1120,6 +1215,7 @@ pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result
         #[cfg(feature = "std")]
         timestamp: None,
         flow_analysis_results: Default::default(),
+        weak_external_defaults,
     };
 
     // Need to construct the obj first so that we have a convinient package to

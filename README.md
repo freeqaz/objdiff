@@ -28,7 +28,7 @@ Large decompilation projects produce hundreds of functions that _almost_ match b
 
 This fork adds an **analysis engine** to objdiff-cli that examines instruction diffs, detects common mismatch patterns, classifies each function with a **fixability verdict**, and outputs everything as structured JSON or human-readable markdown. The key insight is that this output is designed to be consumed by AI agents via MCP (Model Context Protocol), not just read by humans.
 
-In dc3-decomp, an **MCP orchestrator server** wraps objdiff-cli and exposes tools like `run_objdiff` and `run_diff_inspect` to Claude Code agents. An agent working on a function calls `run_objdiff`, gets back a verdict like `LIKELY_FIXABLE` with pattern details ("register swap on r3/r4, 5 occurrences -- try reordering variable declarations"), makes a code change, rebuilds in ~2-4 seconds, and checks the new diff. This tight loop runs autonomously, with 6-10 agents working in parallel on different functions using isolated git worktrees.
+In dc3-decomp, an **MCP orchestrator server** wraps objdiff-cli and exposes tools like `run_objdiff` and `run_diff_inspect` to Claude Code agents. An agent working on a function calls `run_objdiff`, gets back a verdict like `LIKELY_FIXABLE` with pattern details ("register swap on r3/r4, 5 occurrences -- look for the liveness/scheduling difference behind them"), makes a code change, rebuilds in ~2-4 seconds, and checks the new diff. This tight loop runs autonomously, with 6-10 agents working in parallel on different functions using isolated git worktrees.
 
 The structured output -- verdicts, pattern types, match percentages, call diffs, instruction clusters -- gives agents the context they need to make targeted fixes without staring at raw PowerPC assembly. It also tells them when to stop: if the verdict is `AT_LIMIT` because 80%+ of remaining mismatches are linker-merged calls, there's nothing more to try.
 
@@ -55,7 +55,7 @@ In the dc3-decomp workflow, the MCP orchestrator exposes these objdiff-powered t
 | `run_diff_inspect` | Deep analysis modes: `diagnose` (root cause), `clusters`, `regswaps`, `offsets`, `replaces`, `mismatches` |
 | `run_analyze_function` | Combined objdiff + Ghidra analysis with struct field resolution for offset mismatches |
 
-Agents follow a structured workflow: receive pre-computed context (RB3 reference code, Ghidra decompilation, objdiff analysis) -> edit source -> rebuild + diff via `run_objdiff` -> respond to verdict -> iterate or accept limit. The verdict system prevents wasted effort -- agents learn that `AT_LIMIT` means stop, `LIKELY_FIXABLE` means try control flow changes, and `MAYBE_FIXABLE` means try variable reordering.
+Agents follow a structured workflow: receive pre-computed context (RB3 reference code, Ghidra decompilation, objdiff analysis) -> edit source -> rebuild + diff via `run_objdiff` -> respond to verdict -> iterate or accept limit. The verdict system prevents wasted effort -- agents learn that `AT_LIMIT` means stop, `LIKELY_FIXABLE` means try control flow changes, and `MAYBE_FIXABLE` means look for the liveness/scheduling difference behind a register-swap cascade (see [register-swap-symptom-not-cause.md](docs/research/register-swap-symptom-not-cause.md)) or run the permuter.
 
 See the [dc3-decomp docs](https://github.com/rjkiv/dc3-decomp/tree/main/docs) for the full orchestrator setup, master agent prompt, and subagent strategy.
 
