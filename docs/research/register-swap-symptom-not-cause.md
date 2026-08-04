@@ -1,10 +1,18 @@
 # REGISTER_SWAP is a symptom, not a cause
 
-**Scope of this finding: n = 3 functions, MSVC 2010-era PowerPC (Xbox 360), one
-codebase (dc3-decomp), measured 2026-08-02/03.** It is not a general law of
+**Scope of this finding: n = 4 functions, MSVC 2010-era PowerPC (Xbox 360), one
+codebase (dc3-decomp), measured 2026-08-02/04.** It is not a general law of
 compilers, and it has not been checked against MWCC/PowerPC (RB3), GCC, or any
 other backend. Treat it as a strong prior for this target and a hypothesis
 elsewhere.
+
+> **2026-08-04 update.** A fourth function
+> (`LabelShrinkWrapper::UpdateAndDrawWrapper`) added a *second* stack-slot
+> lever, which is the exact inverse of the scope-narrowing one — see
+> "[Naming temporaries is the other stack-slot
+> lever](#naming-temporaries-is-the-other-stack-slot-lever)". The same session
+> also pinned down why EH funclet scores wobble when you fix their parent — see
+> "[Funclet score wobble is parent frame size](#funclet-score-wobble-is-parent-frame-size)".
 
 ## The claim
 
@@ -72,6 +80,101 @@ Note that these were *volatile* FPRs (`f0`–`f13`), which the detector classifi
 as `RarelyHandFixable`. Hand analysis closed them anyway — so that label should
 not be read as "hand-editing won't work".
 
+### `LabelShrinkWrapper::UpdateAndDrawWrapper` — 80.4% → 99.9%
+
+Lever: **naming unnamed temporaries so they get frame-packed.** Covered in full
+in the next section, because it is a lever the earlier three did not exercise.
+
+## Naming temporaries is the other stack-slot lever
+
+Scope-narrowing (`FitTextScroll`, above) packs *locals* by shortening the scope
+they are declared in. This one goes the other way: it widens the live range of
+**unnamed temporaries**, by giving them names, so the frame packer sees them at
+all.
+
+An unnamed `Vector3(...)` passed by const-ref dies at the end of its own call
+expression. Four such temporaries in four consecutive calls therefore share
+**one** stack slot: each dies before the next is built. The frame comes out
+short — `stwu r1, -0xb0` against the target's `-0xc0` — with 21 inserts / 21
+deletes and essentially every FPR and GPR downstream of the first call permuted.
+
+Naming all four extended each live range to the end of the enclosing block, so
+all four were in the frame at once. MSVC's frame packer then coalesced two of
+them on its own: the first value dies as soon as its 16 bytes have been copied
+into the callee, before the third is stored, so those two share a slot. Four
+names, three slots — the target's shape.
+
+Getting the **slot count** right fixed the FPR assignment and the instruction
+schedule with no further edits.
+
+| lever | what it moves | direction |
+|---|---|---|
+| narrow a declaration's scope | where *locals* pack in the frame | shorten a live range |
+| name an unnamed temporary | whether *temporaries* are in the frame at all | lengthen a live range |
+
+Both are stack-slot levers, and both surface as `REGISTER_SWAP` — which is the
+whole point of this document. A wrong slot *count* repermutes every register
+downstream of it.
+
+### The intermediate-shape trap
+
+**Fewer names is not closer to the answer.** Two partial spellings were measured
+on the same function and both read exactly like floors:
+
+| shape | score | what is wrong |
+|---|---:|---|
+| two named right-column locals + two unnamed temps | 90.6% | right slot *count*, wrong assignment |
+| three names + a mid-function `.Set()` to recycle one | 86.2% | right slots *and* frame, but one value materializes in the wrong basic block |
+
+Each buys real points and then stalls. If you are partway through this lever and
+the score has stopped moving, the reading "this is the floor" is available and
+wrong — match the target's **number of live values** and let the packer choose
+the sharing, rather than hand-recycling a slot.
+
+## Funclet score wobble is parent frame size
+
+An MSVC EH funclet's first instruction reconstructs its parent's frame pointer
+by subtracting the **parent's** frame size:
+
+```asm
+subi r31, r12, 0x80          ; <- parent frame size, not the funclet's
+mflr r12
+stw  r12, -0x8(r1)
+stwu r1,  -0x60(r1)          ; the funclet's own frame
+addi r3,  r31, 0x58          ; a parent local, by parent-frame offset
+bl   ??1<T>@@QAA@XZ
+```
+
+So **any edit that grows the parent's frame changes one instruction inside every
+one of its funclets**, and the funclet bodies also address the parent's locals
+by parent-frame offset.
+
+Verified directly in `dc3-decomp`'s `default/system/obj/Dir` (target
+disassembly, 2026-08-04). The listing above is `fn_82590924` verbatim: a 40-byte
+funclet whose `subi` immediate is `0x80` and whose sole job is to destroy a
+parent local at `r31+0x58`. Across that one unit the funclet immediates take the
+values `0x70`, `0x80`, `0x90`, `0xc0`, `0xd0`, `0xe0` — the distinct frame sizes
+of their parents, not of themselves; every funclet establishes the same
+`stwu r1, -0x60` for its own use. `ObjectDir::Iterate` is one of the `0xe0`
+parents (`stwu r1, -0xe0`, `DataNode` at `r31+0x68`, `ObjDirItr` at `r31+0x80`),
+and the `0xe0` funclets in the unit address exactly those offsets.
+
+Consequences:
+
+1. A funclet body is ~10 instructions. One changed instruction is ~10% of it,
+   so a **16-byte frame growth in the parent shows up as a visible score drop in
+   a tiny symbol** while the parent itself improves. That is the same edit
+   counted twice, not a regression.
+2. **Do not read it as funclet pairing noise, and do not let it veto a parent
+   fix.** The byte-signature pairing is doing its job; the immediate genuinely
+   differs.
+3. A liveness lever that does *not* move the frame leaves the funclet at exactly
+   100.0. That is the control: if the funclets moved, your edit changed the
+   frame, whether or not you meant it to.
+
+Practically: when scoring a stack-slot lever, score the parent and its funclets
+together, or score the parent alone and expect the funclets to follow.
+
 ## The volatile / callee-saved split is decidable, not heuristic
 
 The register-class split the detector already computes is stronger than it was
@@ -98,9 +201,15 @@ practice does.
 
 ## How to use a REGISTER_SWAP hint
 
-1. Read the prologue first. A different callee-saved save count
-   (`__savegprlr_NN`) means the two builds disagree about how many values must
-   survive calls — that is the cause, and the swaps are its shadow.
+1. Read the prologue first, for two things.
+   - A different **callee-saved save count** (`__savegprlr_NN`) means the two
+     builds disagree about how many values must survive calls — that is the
+     cause, and the swaps are its shadow.
+   - A different **frame size** (`stwu r1, -N`) means the two builds disagree
+     about how many stack slots there are. Fix that before reading a single
+     register: a wrong slot count repermutes everything downstream of it. If
+     *our* frame is the smaller one, look for aggregates constructed inside call
+     argument lists (see the naming-temporaries lever above).
 2. Read the register-class label; it tells you which cause is even possible.
 3. For callee-saved (or mixed) swaps: find a value the target holds across a
    call that we reload (or one we hold that the target rematerializes). Shorten
@@ -111,8 +220,12 @@ practice does.
 5. Do not chase individual register names, and do not expect swap *count* to
    predict fix size. Cascades of 17 and ~40 swaps both collapsed to zero from a
    single edit.
-6. Reach for declaration reorder when `OFFSET_SWAP` or stack-slot diffs are also
-   present. That guidance is still correct — for that class.
+6. Reach for the stack-slot levers when `OFFSET_SWAP`, a frame-size delta, or
+   stack-slot diffs are also present: declaration reorder, scope narrowing, and
+   naming temporaries. That guidance is still correct — for that class.
+7. Ignore the funclets while you work. Their scores move with the parent's frame
+   size (above), so a drop there during a stack-slot fix is expected and is not
+   a reason to back the fix out.
 
 ## What changed in the tool
 
@@ -136,6 +249,57 @@ compiler is not enough to justify changing what the tool asserts.
 - `match_guidance()`'s 95%+ band no longer recommends variable reorder for
   register swaps.
 
+## The "dominated by" line was non-deterministic (fixed 2026-08-04)
+
+Recorded here because the bug class is easy to reintroduce: every "dominated by"
+line in `analysis.rs` is built by counting into a `HashMap` and then sorting by
+count, and that sort is the only thing between the reader and a random ordering.
+
+`detect_register_swap` counted pairs into a `HashMap<(String, String), usize>`,
+drained it with `into_iter()`, and sorted with
+`sort_by(|a, b| b.count.cmp(&a.count))`. The sort is stable, but its *input*
+order was the hash order — and `std::collections::HashMap` takes a fresh seed
+per instance, so **equal-count entries came out in a different order on every
+construction**.
+
+Observed in the field on the same binary against the same object: `f0`↔`f10` on
+one run and `f13`↔`f9` on the next, both with a count of 4, plus a third-place
+entry that also varied. Reproduced in-tree by building the pattern repeatedly
+from identical input:
+
+```
+left:  ("… dominated by f0↔f10 (3 of 12) …",  ["f0↔f10: 3", "f13↔f9: 3", "f2↔f8: 3"])
+right: ("… dominated by f13↔f9 (3 of 12) …",  ["f13↔f9: 3", "f11↔f3: 3", "f2↔f8: 3"])
+```
+
+The cost is not cosmetic. It makes diff reports irreproducible in that line and
+— for the workflow this whole document is about — **useless for A/B-ing a source
+edit**, because a "dominated by" that renames itself between two runs is
+indistinguishable from an edit that changed the dominant swap pair. The defect
+was **pre-existing**; it was not introduced by the guidance work above.
+
+**Fixed, not merely filed.** A new `register_sort_key(reg)` orders registers by
+class then *number* (so `f9` precedes `f10`, which a lexicographic key would
+not; unparsable names sort last, by name), and `detect_register_swap` now sorts
+by count descending, then `target_reg`, then `base_reg`. The same one-line
+treatment went onto the four sibling histograms with the identical shape —
+`OFFSET_SWAP` pair counts, the `FloatPrecisionMismatch` and
+`SignednessMismatch` opcode-pair counts, and the insert/delete cluster
+`dominant_opcodes` list — all of which also feed user-visible output. *Which*
+entries are reported did not change; only the order of equals.
+
+`test_register_swap_summary_is_deterministic_under_ties` builds four pairs with
+identical counts, renders the summary 65 times, and requires every rendering to
+agree. Each call constructs a fresh `HashMap` and so draws a fresh seed, which
+is what makes the test bite: it was confirmed to **fail on the unfixed code**
+before the fix was written. It also pins the numeric ordering, so the tie-break
+is a stated rule rather than "whatever happens to be stable today".
+
+The general rule: if a summary names a "top" or "dominant" item drawn from a
+hash container, it needs a total order. `sort_by(count)` alone is a bug whenever
+two counts can be equal — which in mismatch histograms is the common case, not
+the corner case.
+
 ## The cross-repo link problem
 
 Doc URLs are relative to the *consuming* project (`docs/decomp/patterns/`), and
@@ -152,15 +316,17 @@ two projects target different compilers, so RB3-named content is usually written
 for MWCC and can be actively misleading in a DC3 hint even when a
 similarly-named file exists.
 
-Current resolution: the scheduling link uses the DC3 filename
-(`PERMUTER_ROI_ANALYSIS.md#instruction-scheduling`), because that is where the
-scheduling section and the measurements behind this document live, with a
-comment at the call site naming the divergence. dc3-decomp's
-`docs/decomp/patterns/INDEX.md` carries the divergence table and an "anchor
-contract" listing the headings objdiff links into.
+**Resolved 2026-08-04 in `7e5eb98` / `1030000`** — the "separate piece of work"
+this section called for was done. Links are now named by what they explain
+(`DocLink`) and resolved through a per-project table, with project identity
+detected from the consuming repo's `docs/decomp/patterns/` directory by marker
+filename. Full writeup, including why detection beat a CLI flag or an
+`objdiff.json` field, how to add a third consumer, and the verification
+workflow: **[`doc-link-project-detection.md`](doc-link-project-detection.md)**.
 
-`permuter-roi.md#register-allocation-cascades` (third URL for `REGISTER_SWAP`)
-and the `at-limit-mwcc.md` links used by other patterns still carry RB3 names.
-Those predate this work and were left alone. **A real fix — mapping doc URLs per
-consuming project, e.g. via `objdiff.json` — is a separate piece of work and
-should not be improvised inside a guidance change.**
+For the record, the interim state described here was worse than it looked: 29 of
+the 30 emittable URLs failed against the RB3 tree, `at-limit-mwcc.md` was
+putting MetroWerks content on four patterns inside an MSVC repo, and two of the
+URLs existed in neither repo. dc3-decomp's `docs/decomp/patterns/INDEX.md` still
+carries the consumer-side divergence table and the anchor contract; both are now
+asserted by `scripts/check_doc_links.py` and by unit test rather than by eye.
