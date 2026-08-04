@@ -40,11 +40,24 @@ correct advice attached to the wrong pattern.
 
 ## The evidence
 
-Three functions taken to or near 100%. In all three, no register name was ever
-permuted directly; the entire swap set flipped at once when the underlying
-cause was fixed.
+Four functions taken to or near 100%, **all four measured in `dc3-decomp`
+(`373307D9`)** — not rb3-xenon, whose binary contains symbols by the same names.
+In all four, no register name was ever permuted directly; the entire swap set
+flipped at once when the underlying cause was fixed.
 
-### `ObjectDir::Iterate` — 99.4% → 100%
+> **Percentages corrected 2026-08-04, and a standing caveat.** Two of the four
+> figures below were wrong. `SizeCheck` was written as 99.1% and is **98.6%**;
+> `UpdateAndDrawWrapper` was written from an 80.4% baseline that was itself a
+> match-hack state rather than a clean starting point, so the honest span is
+> **68.1% → 99.9%**. The 99.1% was never a direct diff — it came from a
+> `dc3-decomp` commit subject line.
+>
+> The caveat that generalises: **a percentage in a research note is a reading
+> taken on one repo at one commit.** A function's match% can move when a
+> *different* function in the same translation unit changes, and a number typed
+> into a commit message is not a measurement. Re-measure before citing.
+
+### `ObjectDir::Iterate` (dc3-decomp) — 99.4% → 100%
 
 Lever: **live-range shortening.** Call arguments were read back out of an
 already-constructed, never-modified `std::pair` (`key.first` / `key.second`)
@@ -58,7 +71,7 @@ call inside the loop.
   byte-identical, 2 regressed. A 65-variant permuter beam search found 0
   improvements.
 
-### `RndText::FitTextScroll` — 92.7% → 98.2%
+### `RndText::FitTextScroll` (dc3-decomp) — 92.7% → 98.2%
 
 Lever: **not re-loading a member at a call site.** The target keeps a local
 pointer in a callee-saved register across an intervening call; our build
@@ -73,20 +86,22 @@ all 14 offset diffs. **This is the boundary in one function:** the declaration
 edit fixed the offsets and nothing else; the liveness edit fixed the registers
 and nothing else.
 
-### `RndText::SizeCheck` — 96.5% → 99.1%
+### `RndText::SizeCheck` (dc3-decomp) — 96.5% → 98.6%
 
 Lever: **instruction scheduling, then comparison polarity.** Hoisting a product
 so the `fmuls` landed before the `fcmpu` that consumes it, then flipping two
 float compares to the target's operand order (`fcmpu f13,f0; bge` versus our
 `fcmpu f0,f12; ble` — exact logical equivalences, including NaN behaviour).
 
-All nine FPR swaps fell out automatically.
+All nine FPR swaps fell out automatically. The residual at 98.6% is a single
+`mr r4, r27` appearing two slots later than the target has it — and it was
+**already present at 96.5%**, so this lever neither created nor closed it.
 
 Note that these were *volatile* FPRs (`f0`–`f13`), which the detector classifies
 as `RarelyHandFixable`. Hand analysis closed them anyway — so that label should
 not be read as "hand-editing won't work".
 
-### `LabelShrinkWrapper::UpdateAndDrawWrapper` — 80.4% → 99.9%
+### `LabelShrinkWrapper::UpdateAndDrawWrapper` (dc3-decomp) — 68.1% → 99.9%
 
 Lever: **naming unnamed temporaries so they get frame-packed.** Covered in full
 in the next section, because it is a lever the earlier three did not exercise.
