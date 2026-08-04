@@ -1,10 +1,16 @@
 # REGISTER_SWAP is a symptom, not a cause
 
-**Scope of this finding: n = 4 functions, MSVC 2010-era PowerPC (Xbox 360), one
-codebase (dc3-decomp), measured 2026-08-02/04.** It is not a general law of
+**Scope of this finding: n = 4 functions, MSVC 2010-era PowerPC (Xbox 360),
+one codebase (dc3-decomp), measured 2026-08-02/04.** It is not a general law of
 compilers, and it has not been checked against MWCC/PowerPC (RB3), GCC, or any
 other backend. Treat it as a strong prior for this target and a hypothesis
 elsewhere.
+
+The funclet section at the end is scoped differently — it is an ABI/codegen
+property rather than one of the n=4 register-swap measurements, and it is
+evidenced from **both `dc3-decomp` (`373307D9`) and `rb3-xenon` (`45410914`)**.
+Those two binaries share address ranges without sharing contents, so every
+symbol cited below carries its repo.
 
 > **2026-08-04 update.** A fourth function
 > (`LabelShrinkWrapper::UpdateAndDrawWrapper`) added a *second* stack-slot
@@ -133,6 +139,13 @@ the sharing, rather than hand-recycling a slot.
 
 ## Funclet score wobble is parent frame size
 
+Measured in **two repositories**: the mechanism across a whole unit in
+`dc3-decomp`, and a worked before/after in `rb3-xenon`. Both are MSVC/PowerPC
+Milo-engine builds with overlapping address ranges, so **name the repo whenever
+you quote one of these symbols** — the same address means different things in
+each, and a measurement passed on without its repo cost a round of
+re-verification here.
+
 An MSVC EH funclet's first instruction reconstructs its parent's frame pointer
 by subtracting the **parent's** frame size:
 
@@ -149,25 +162,71 @@ So **any edit that grows the parent's frame changes one instruction inside every
 one of its funclets**, and the funclet bodies also address the parent's locals
 by parent-frame offset.
 
-Verified directly in `dc3-decomp`'s `default/system/obj/Dir` (target
-disassembly, 2026-08-04). The listing above is `fn_82590924` verbatim: a 40-byte
-funclet whose `subi` immediate is `0x80` and whose sole job is to destroy a
-parent local at `r31+0x58`. Across that one unit the funclet immediates take the
-values `0x70`, `0x80`, `0x90`, `0xc0`, `0xd0`, `0xe0` — the distinct frame sizes
-of their parents, not of themselves; every funclet establishes the same
-`stwu r1, -0x60` for its own use. `ObjectDir::Iterate` is one of the `0xe0`
-parents (`stwu r1, -0xe0`, `DataNode` at `r31+0x68`, `ObjDirItr` at `r31+0x80`),
-and the `0xe0` funclets in the unit address exactly those offsets.
+### The mechanism, across a whole unit (dc3-decomp)
 
-Consequences:
+**Repo: `dc3-decomp`, build `373307D9`, unit `default/system/obj/Dir`, target
+disassembly, 2026-08-04.** The listing above is `fn_82590924` verbatim: a
+40-byte funclet whose `subi` immediate is `0x80` and whose sole job is to
+destroy a parent local at `r31+0x58`.
+
+Across that one unit the funclet immediates take the values `0x70`, `0x80`,
+`0x90`, `0xc0`, `0xd0`, `0xe0` — **the distinct frame sizes of their parents,
+not of themselves**; every funclet establishes the same `stwu r1, -0x60` for its
+own use. `ObjectDir::Iterate` is one of the `0xe0` parents (`stwu r1, -0xe0`,
+`DataNode` at `r31+0x68`, `ObjDirItr` at `r31+0x80`), and the `0xe0` funclets in
+the unit address exactly those offsets.
+
+That spread is the demonstration: the immediate cannot be a property of the
+funclet, because every funclet in the unit is the same ten instructions with the
+same own-frame, and yet the immediates differ. It tracks the parent.
+
+### The worked before/after (rb3-xenon)
+
+**Repo: `rb3-xenon`, build `45410914`, unit `default/system/obj/Dir`** —
+a *different binary* that happens to occupy overlapping address ranges, so
+always name the repo when quoting these symbols. (The same address in
+`dc3-decomp` is unrelated: `0x8274FEC8` there is mid-function inside
+`system/synth/MoggClip`. Two binaries, same address space, different contents.)
+
+There `ObjectDir::Iterate` is `fn_8274FCE8`, 440 bytes, pinned in
+`scripts/target_symbol_map.json:17181` to
+`?Iterate@ObjectDir@@IAAXPAVDataArray@@_N@Z`, and its unwind funclet is
+`fn_8274FEC8`, 40 bytes:
+
+```asm
+subi r31, r12, 0xe0          ; the parent's frame
+mflr r12
+stw  r12, -0x8(r1)
+stwu r1,  -0x60(r1)          ; its own
+addi r3,  r31, 0x60          ; the parent's saved varNode
+bl   fn_82270560             ; ~DataNode (unnamed in this repo's map)
+```
+
+(The parent stores a `DataNode` there: `li r10, 0x4` / `stw r10, 0x64(r31)` /
+`stw r11, 0x60(r31)` — type tag then pointer.)
+
+A semantic fix in the parent — a class symbol replaced by the correct type
+symbol — grew the parent's frame by `0x10`:
+
+| symbol | size | before (buggy) | after (correct) |
+|---|---:|---:|---:|
+| `ObjectDir::Iterate` (`fn_8274FCE8`) | 440 | 58.8% | **60.7%** |
+| unwind funclet (`fn_8274FEC8`) | 40 | 100.0% | 99.9% |
+
+The funclet's *sole* mismatch was `0xe0` against `0xf0` — one instruction, the
+parent's frame size. **The 16-byte growth is counted twice: once as a gain on
+440 bytes, once as a loss on 40.** Netting the two and calling the fix neutral,
+or backing it out because a symbol regressed, would have discarded a correct
+semantic fix.
+
+### Consequences
 
 1. A funclet body is ~10 instructions. One changed instruction is ~10% of it,
-   so a **16-byte frame growth in the parent shows up as a visible score drop in
-   a tiny symbol** while the parent itself improves. That is the same edit
-   counted twice, not a regression.
+   so a **frame growth in the parent shows up as a visible score drop in a tiny
+   symbol** while the parent itself improves.
 2. **Do not read it as funclet pairing noise, and do not let it veto a parent
    fix.** The byte-signature pairing is doing its job; the immediate genuinely
-   differs.
+   differs, and it differs *because the parent got better*.
 3. A liveness lever that does *not* move the frame leaves the funclet at exactly
    100.0. That is the control: if the funclets moved, your edit changed the
    frame, whether or not you meant it to.
