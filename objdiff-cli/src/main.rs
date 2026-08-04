@@ -87,6 +87,7 @@ struct TopLevel {
 enum SubCommand {
     Diff(cmd::diff::Args),
     Report(cmd::report::Args),
+    DocLinks(cmd::analysis::DocLinksArgs),
 }
 
 // Duplicated from supports-color so we can check early.
@@ -142,6 +143,7 @@ fn main() {
     result = result.and_then(|_| match args.command {
         SubCommand::Diff(c_args) => cmd::diff::run(c_args),
         SubCommand::Report(c_args) => cmd::report::run(c_args),
+        SubCommand::DocLinks(c_args) => cmd::analysis::run_doc_links(c_args),
     });
     if let Err(e) = result {
         eprintln!("Failed: {e:?}");
