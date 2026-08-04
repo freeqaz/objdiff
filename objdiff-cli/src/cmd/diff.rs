@@ -517,6 +517,12 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    // Pin the doc-link project identity before any analysis runs. `--project`
+    // when given, otherwise detection walks up from the working directory.
+    super::analysis::init_doc_project(
+        args.project.as_ref().map(|p| std::path::Path::new(p.as_str())),
+    );
+
     if args.batch {
         return run_batch(args);
     }

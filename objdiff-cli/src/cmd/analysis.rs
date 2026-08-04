@@ -1453,8 +1453,487 @@ pub struct Verdict {
 /// Base URL prefix for pattern documentation.
 ///
 /// Relative to the consuming project root. Both RB3 and DC3 mirror this
-/// `docs/decomp/patterns/` layout; the same URLs resolve in either repo.
+/// `docs/decomp/patterns/` directory layout — but *not* the filenames or the
+/// section headings inside it, which is what [`DocProject`] exists to resolve.
 const DOC_BASE: &str = "docs/decomp/patterns/";
+
+/// Which decompilation project objdiff is being run inside.
+///
+/// Doc URLs are emitted relative to the consuming project root, so the same
+/// string has to name a file that exists *in that repo*. DC3 and RB3 diverge
+/// on both counts: DC3 keeps the permuter ROI writeup in
+/// `PERMUTER_ROI_ANALYSIS.md` and its compiler-floor catalogue in
+/// `unfixable-compiler.md` / `at-limit-systemic.md`, RB3 uses `permuter-roi.md`
+/// and `at-limit-mwcc.md`, and nearly every section heading differs. Emitting
+/// one repo's string in the other is worse than emitting nothing: DC3 is MSVC
+/// and RB3 is MetroWerks, so a link that happens to resolve can hand the reader
+/// advice written for a different backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocProject {
+    /// dc3-decomp (MSVC / PowerPC).
+    Dc3,
+    /// rb3 (MetroWerks / PowerPC).
+    Rb3,
+    /// Not recognised — only project-independent links are emitted.
+    Unknown,
+}
+
+impl DocProject {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DocProject::Dc3 => "dc3",
+            DocProject::Rb3 => "rb3",
+            DocProject::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<DocProject> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dc3" | "dc3-decomp" => Some(DocProject::Dc3),
+            "rb3" | "rb3-decomp" => Some(DocProject::Rb3),
+            "unknown" | "none" | "generic" => Some(DocProject::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// A documentation target, named by what it *explains* rather than by where it
+/// lives. The file/anchor for each project is resolved by [`doc_entry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DocLink {
+    /// ICF explained as a verifiable (accept-after-checking) pattern.
+    IcfVerifiable,
+    /// ICF listed in the project's compiler/linker floor catalogue.
+    IcfAtLimit,
+    /// Bool return masking shapes.
+    BoolMask,
+    /// Bool materialization as a permuter lever.
+    BoolMaterialization,
+    /// Pre-compute references before a call clobbers the register.
+    PrecomputeRefsBeforeCalls,
+    /// Instruction scheduling as a source-controllable lever.
+    InstructionScheduling,
+    /// How a single allocation difference cascades into many register swaps.
+    RegallocCascades,
+    /// Local variable declaration order (a stack-slot lever).
+    DeclarationOrder,
+    /// `>` vs `>=` style differences.
+    ComparisonStyle,
+    /// Branch polarity / early-return inversion.
+    BranchPolarity,
+    /// `x > 0` vs `x != 0` on unsigned types.
+    UnsignedZeroComparison,
+    /// Operand order in commutative operations.
+    CommutativeOperandOrder,
+    /// Two stack offsets swapped between target and base.
+    OffsetSwap,
+    /// Stack slot inversion as a permuter lever.
+    StackSlotInversion,
+    /// Anonymous-namespace TU hash (path-derived, source-immune).
+    AnonymousNamespaceHash,
+    /// TU-wide function definition order driving static guard counters.
+    StaticGuardCounter,
+    /// Order of static symbols within a TU.
+    StaticSymbolOrder,
+    /// Avoiding an unnecessary `dynamic_cast`.
+    DynamicCast,
+    /// Dead store elimination around RAII members.
+    DeadStoreElimination,
+    /// The permuter ROI writeup as a whole.
+    PermuterRoi,
+    /// `alloca` vs the `_alloca` intrinsic.
+    Alloca,
+    /// Scope counter in static local names (extra braces).
+    ScopeCounter,
+    /// MakeString template parameter mismatches in MILO macros.
+    MakeStringTemplate,
+    /// Address relocation noise (linker layout artifact).
+    AddressRelocationNoise,
+    /// Boolean negation, subfic vs subic.
+    BooleanNegation,
+    /// Cast placement controlling float precision (fmul vs fmuls).
+    FloatPrecision,
+    /// fsel via an explicit ternary.
+    FselTernary,
+    /// float→int→float reconversion.
+    FloatToIntToFloat,
+    /// Signed vs unsigned comparison.
+    SignedVsUnsignedComparison,
+    /// Signedness/width type disagreements.
+    SignednessWidth,
+}
+
+/// Per-project location of a [`DocLink`]. `None` means the project has no
+/// document covering it — better to emit no link than a wrong one.
+struct DocEntry {
+    dc3: Option<&'static str>,
+    rb3: Option<&'static str>,
+}
+
+/// Resolve a logical link to its per-project `file.md#anchor`.
+///
+/// Every string here is checked against the real repositories by
+/// `scripts/check_doc_links.py`; do not edit one without re-running it.
+fn doc_entry(link: DocLink) -> DocEntry {
+    macro_rules! e {
+        (dc3: $d:expr, rb3: $r:expr) => {
+            DocEntry { dc3: Some($d), rb3: Some($r) }
+        };
+        (dc3: $d:expr) => {
+            DocEntry { dc3: Some($d), rb3: None }
+        };
+        (both: $b:expr) => {
+            DocEntry { dc3: Some($b), rb3: Some($b) }
+        };
+    }
+    match link {
+        DocLink::IcfVerifiable => e!(
+            dc3: "verifiable-icf.md#linker-merged-icf",
+            rb3: "verifiable-icf.md#linker_merged-functions"
+        ),
+        DocLink::IcfAtLimit => e!(
+            dc3: "at-limit-systemic.md#2-linker_merged-icf-identical-comdat-folding",
+            rb3: "at-limit-mwcc.md#linker-merged-icf"
+        ),
+        DocLink::BoolMask => e!(
+            dc3: "fixable-bool-mask.md#fixable-patterns-bool-mask",
+            rb3: "fixable-bool-mask.md#fixable-bool-materialization"
+        ),
+        DocLink::BoolMaterialization => e!(
+            dc3: "fixable-bool-mask.md#permuter-pattern",
+            rb3: "permuter-roi.md#bool-materialization"
+        ),
+        DocLink::PrecomputeRefsBeforeCalls => e!(
+            dc3: "fixable-declarations.md#pre-compute-references-before-clobbering-calls",
+            rb3: "fixable-declarations.md#pre-declare-heavy-temp-before-a-function-call-to-force-callee-saved"
+        ),
+        DocLink::InstructionScheduling => e!(
+            dc3: "PERMUTER_ROI_ANALYSIS.md#instruction-scheduling",
+            rb3: "permuter-roi.md#instruction-scheduling"
+        ),
+        DocLink::RegallocCascades => e!(
+            dc3: "fixable-liveness.md#diagnostic-order-for-a-register-swap-residual",
+            rb3: "permuter-roi.md#register-allocation-cascades"
+        ),
+        DocLink::DeclarationOrder => e!(both: "fixable-declarations.md#variable-declaration-order"),
+        DocLink::ComparisonStyle => e!(
+            dc3: "fixable-comparison.md#comparison-style",
+            rb3: "fixable-comparison.md#fixable-comparison-patterns"
+        ),
+        DocLink::BranchPolarity => e!(
+            dc3: "fixable-control-flow.md#branch-polarity-steering-beqbne-blebge",
+            rb3: "fixable-control-flow.md#early-return-inversion"
+        ),
+        DocLink::UnsignedZeroComparison => e!(
+            dc3: "fixable-comparison.md#unsigned-zero-comparison",
+            rb3: "fixable-casting.md#unsigned-int-diff-over-int-diff-for-cmplw"
+        ),
+        DocLink::CommutativeOperandOrder => e!(
+            dc3: "fixable-operators.md#commutative-operand-order",
+            rb3: "fixable-operators.md#operand-order-in-commutative-operations"
+        ),
+        DocLink::OffsetSwap => e!(
+            dc3: "fixable-declarations.md#offset-swap",
+            rb3: "at-limit-mwcc.md#stack-slot-inversion-offset_swap-on-r1"
+        ),
+        DocLink::StackSlotInversion => e!(
+            dc3: "fixable-liveness.md#lever-4-scope-a-declaration-into-the-block-that-uses-it-stack-lever-not-a-register-lever",
+            rb3: "permuter-roi.md#stack-slot-inversion"
+        ),
+        DocLink::AnonymousNamespaceHash => e!(
+            dc3: "unfixable-compiler.md#anonymous-namespace-hash-mismatch",
+            rb3: "at-limit-mwcc.md#anonymous-namespace-hash"
+        ),
+        DocLink::StaticGuardCounter => e!(
+            dc3: "fixable-declarations.md#function-definition-order-tu-wide-static-guard-counters",
+            rb3: "fixable-declarations.md#function-definition-order-affects-string-pool"
+        ),
+        DocLink::StaticSymbolOrder => e!(dc3: "fixable-declarations.md#static-symbol-order"),
+        DocLink::DynamicCast => {
+            e!(dc3: "fixable-casting.md#avoid-unnecessary-dynamic_cast-getobj-vs-objt")
+        }
+        DocLink::DeadStoreElimination => e!(
+            dc3: "unfixable-compiler.md#dead-store-elimination-destructor-merging",
+            rb3: "at-limit-mwcc.md#dead-store-elimination"
+        ),
+        DocLink::PermuterRoi => e!(dc3: "PERMUTER_ROI_ANALYSIS.md", rb3: "permuter-roi.md"),
+        DocLink::Alloca => {
+            e!(dc3: "fixable-declarations.md#alloca-vs-_alloca-intrinsic-stack-allocation")
+        }
+        DocLink::ScopeCounter => {
+            e!(dc3: "fixable-declarations.md#braced-vs-braceless-if-scope-counter")
+        }
+        DocLink::MakeStringTemplate => e!(
+            dc3: "fixable-casting.md#makestring-template-type-mismatch-milo-macro-arguments",
+            rb3: "fixable-operators.md#milo_warnmilo_log-argument-order-affects-makestring-template"
+        ),
+        DocLink::AddressRelocationNoise => e!(
+            dc3: "unfixable-compiler.md#address-relocation-noise",
+            rb3: "at-limit-mwcc.md#address-relocation-noise"
+        ),
+        DocLink::BooleanNegation => e!(
+            dc3: "unfixable-compiler.md#boolean-negation-subfic-vs-subic",
+            rb3: "at-limit-mwcc.md#boolean-negation-subfic-vs-subic"
+        ),
+        DocLink::FloatPrecision => e!(
+            dc3: "fixable-casting.md#cast-placement-controls-fmul-vs-fmuls",
+            rb3: "fixable-casting.md#floatx-vs-floatlong-longx"
+        ),
+        DocLink::FselTernary => e!(
+            dc3: "fixable-fsel-fma.md#fsel-via-explicit-ternary-subtractionnegation",
+            rb3: "fixable-fsel-fma.md#fixable-float-scheduling-fsel-fma"
+        ),
+        DocLink::FloatToIntToFloat => e!(
+            dc3: "fixable-casting.md#float-to-int-to-float-reconversion",
+            rb3: "fixable-casting.md#tfloatfloor-forces-frsp-before-fctiwz"
+        ),
+        DocLink::SignedVsUnsignedComparison => e!(
+            dc3: "fixable-comparison.md#signedunsigned-cast",
+            rb3: "fixable-casting.md#unsigned-int-diff-over-int-diff-for-cmplw"
+        ),
+        DocLink::SignednessWidth => e!(
+            dc3: "fixable-casting.md#sizeof-signedness",
+            rb3: "fixable-casting.md#int-cast-for-signed-arithmetic-shift"
+        ),
+    }
+}
+
+/// Every [`DocLink`], for exhaustive checking.
+pub const ALL_DOC_LINKS: &[DocLink] = &[
+    DocLink::IcfVerifiable,
+    DocLink::IcfAtLimit,
+    DocLink::BoolMask,
+    DocLink::BoolMaterialization,
+    DocLink::PrecomputeRefsBeforeCalls,
+    DocLink::InstructionScheduling,
+    DocLink::RegallocCascades,
+    DocLink::DeclarationOrder,
+    DocLink::ComparisonStyle,
+    DocLink::BranchPolarity,
+    DocLink::UnsignedZeroComparison,
+    DocLink::CommutativeOperandOrder,
+    DocLink::OffsetSwap,
+    DocLink::StackSlotInversion,
+    DocLink::AnonymousNamespaceHash,
+    DocLink::StaticGuardCounter,
+    DocLink::StaticSymbolOrder,
+    DocLink::DynamicCast,
+    DocLink::DeadStoreElimination,
+    DocLink::PermuterRoi,
+    DocLink::Alloca,
+    DocLink::ScopeCounter,
+    DocLink::MakeStringTemplate,
+    DocLink::AddressRelocationNoise,
+    DocLink::BooleanNegation,
+    DocLink::FloatPrecision,
+    DocLink::FselTernary,
+    DocLink::FloatToIntToFloat,
+    DocLink::SignedVsUnsignedComparison,
+    DocLink::SignednessWidth,
+];
+
+/// Every [`PatternType`], for exhaustive checking.
+pub const ALL_PATTERN_TYPES: &[PatternType] = &[
+    PatternType::LinkerMerged,
+    PatternType::BoolMask,
+    PatternType::RegisterSwap,
+    PatternType::ComparisonStyle,
+    PatternType::ControlFlow,
+    PatternType::CommutativeOpOrder,
+    PatternType::OffsetSwap,
+    PatternType::AnonymousNamespaceHash,
+    PatternType::StaticGuardCounter,
+    PatternType::DynamicCastMismatch,
+    PatternType::DeadStoreElimination,
+    PatternType::PrologueMismatch,
+    PatternType::AllocaMismatch,
+    PatternType::ScopeCounterMismatch,
+    PatternType::MakeStringTemplateMismatch,
+    PatternType::AddressRelocationNoise,
+    PatternType::BooleanNegation,
+    PatternType::FloatPrecisionMismatch,
+    PatternType::FselTernary,
+    PatternType::FloatToIntToFloat,
+    PatternType::SignednessMismatch,
+];
+
+/// Resolve a logical link to a project-relative URL.
+///
+/// For an unrecognised project this degrades to the *intersection*: a link is
+/// emitted only when both known projects put the topic in the same file, and
+/// then without the anchor unless the anchors also agree. Anything
+/// project-specific is dropped rather than guessed.
+pub fn doc_url_for(project: DocProject, link: DocLink) -> Option<String> {
+    let entry = doc_entry(link);
+    let path = match project {
+        DocProject::Dc3 => entry.dc3?,
+        DocProject::Rb3 => entry.rb3?,
+        DocProject::Unknown => {
+            let (dc3, rb3) = (entry.dc3?, entry.rb3?);
+            if dc3 == rb3 {
+                dc3
+            } else {
+                let dc3_file = dc3.split('#').next().unwrap_or(dc3);
+                let rb3_file = rb3.split('#').next().unwrap_or(rb3);
+                if dc3_file != rb3_file {
+                    return None;
+                }
+                dc3_file
+            }
+        }
+    };
+    Some(format!("{}{}", DOC_BASE, path))
+}
+
+/// Detected project identity, resolved once per process.
+static DOC_PROJECT: std::sync::OnceLock<DocProject> = std::sync::OnceLock::new();
+
+/// Environment override, mostly for tests and for repos that have not been
+/// taught to objdiff yet. Values: `dc3`, `rb3`, `unknown`.
+const DOC_PROJECT_ENV: &str = "OBJDIFF_DOC_PROJECT";
+
+/// Identify the project from the docs tree at `root`.
+///
+/// Detection is by marker filename rather than by repo name or git remote:
+/// the thing we actually need to know is which filenames exist, and probing
+/// that answers it directly (and self-heals if a repo is moved or renamed).
+pub fn detect_doc_project_at(root: &std::path::Path) -> Option<DocProject> {
+    let dir = root.join("docs").join("decomp").join("patterns");
+    if !dir.is_dir() {
+        return None;
+    }
+    if dir.join("PERMUTER_ROI_ANALYSIS.md").is_file() {
+        return Some(DocProject::Dc3);
+    }
+    if dir.join("at-limit-mwcc.md").is_file() || dir.join("permuter-roi.md").is_file() {
+        return Some(DocProject::Rb3);
+    }
+    Some(DocProject::Unknown)
+}
+
+/// Walk up from `start` looking for a recognisable docs tree.
+pub fn detect_doc_project_from(start: &std::path::Path) -> DocProject {
+    let mut cur = Some(start);
+    for _ in 0..12 {
+        let Some(dir) = cur else { break };
+        if let Some(project) = detect_doc_project_at(dir) {
+            return project;
+        }
+        cur = dir.parent();
+    }
+    DocProject::Unknown
+}
+
+fn doc_project_from_env() -> Option<DocProject> {
+    std::env::var(DOC_PROJECT_ENV).ok().and_then(|v| DocProject::from_name(&v))
+}
+
+/// Pin the project identity for this process. Called once from the CLI entry
+/// points with `--project` if given; a later call is ignored.
+pub fn init_doc_project(project_dir: Option<&std::path::Path>) {
+    let resolved = doc_project_from_env().unwrap_or_else(|| match project_dir {
+        Some(dir) => detect_doc_project_from(dir),
+        // No --project: fall back to the same working-directory walk the lazy
+        // accessor uses, so `-1 a.obj -2 b.obj` inside a project still works.
+        None => std::env::current_dir()
+            .map(|dir| detect_doc_project_from(&dir))
+            .unwrap_or(DocProject::Unknown),
+    });
+    let _ = DOC_PROJECT.set(resolved);
+}
+
+/// The project identity in effect. Falls back to detection from the current
+/// working directory, so wrappers that `cd` into the project (ninja, the
+/// orchestrator, the skills) get correct links without passing anything.
+pub fn doc_project() -> DocProject {
+    *DOC_PROJECT.get_or_init(|| {
+        doc_project_from_env().unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|dir| detect_doc_project_from(&dir))
+                .unwrap_or(DocProject::Unknown)
+        })
+    })
+}
+
+/// Resolve a logical link against the detected project.
+fn doc_url(link: DocLink) -> Option<String> { doc_url_for(doc_project(), link) }
+
+// =============================================================================
+// `objdiff-cli doc-links` — dump the emitted URLs for external verification
+// =============================================================================
+
+#[derive(argp::FromArgs, PartialEq, Debug)]
+#[argp(subcommand, name = "doc-links")]
+/// Print the documentation URLs emitted for each pattern, for link checking.
+pub struct DocLinksArgs {
+    #[argp(option, short = 'P')]
+    /// Project identity: dc3, rb3, unknown, or auto (default: auto-detect)
+    project: Option<String>,
+    #[argp(option, short = 'f')]
+    /// Output format: text (default) or json
+    format: Option<String>,
+}
+
+/// Everything `doc-links` knows, in a shape a checker can consume.
+#[derive(Serialize)]
+struct DocLinksOutput {
+    project: &'static str,
+    /// Every logical link that resolves for this project.
+    links: Vec<DocLinkEntryOut>,
+    /// Per-pattern URL lists, in emission order. The first entry is the only
+    /// one objdiff renders inline, so its stability is contractual.
+    patterns: Vec<PatternLinksOut>,
+}
+
+#[derive(Serialize)]
+struct DocLinkEntryOut {
+    link: DocLink,
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PatternLinksOut {
+    pattern: &'static str,
+    urls: Vec<String>,
+}
+
+pub fn run_doc_links(args: DocLinksArgs) -> anyhow::Result<()> {
+    let project = match args.project.as_deref() {
+        None | Some("auto") => doc_project(),
+        Some(name) => DocProject::from_name(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown project '{name}' (dc3, rb3, unknown, auto)"))?,
+    };
+    let out = DocLinksOutput {
+        project: project.as_str(),
+        links: ALL_DOC_LINKS
+            .iter()
+            .map(|&link| DocLinkEntryOut { link, url: doc_url_for(project, link) })
+            .collect(),
+        patterns: ALL_PATTERN_TYPES
+            .iter()
+            .map(|&pattern| PatternLinksOut {
+                pattern: pattern.as_str(),
+                urls: pattern_doc_urls_for(project, pattern),
+            })
+            .collect(),
+    };
+    match args.format.as_deref() {
+        Some("json") => println!("{}", serde_json::to_string_pretty(&out)?),
+        None | Some("text") => {
+            println!("project: {}", out.project);
+            for entry in &out.links {
+                println!("  {:?} = {}", entry.link, entry.url.as_deref().unwrap_or("(none)"));
+            }
+            for pattern in &out.patterns {
+                println!("  {} -> {}", pattern.pattern, pattern.urls.join(", "));
+            }
+        }
+        Some(other) => anyhow::bail!("unknown format '{other}' (text, json)"),
+    }
+    Ok(())
+}
 
 /// Return documentation URLs for a pattern type.
 ///
@@ -1463,16 +1942,10 @@ const DOC_BASE: &str = "docs/decomp/patterns/";
 /// (anon-namespace hash, address-relocation noise, ICF) live in
 /// `at-limit-mwcc.md` (RB3) / `at-limit-msvc.md` (DC3) — these are genuinely
 /// source-immune and the only correct action is to accept the match.
-pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
-    let paths: &[&str] = match pattern {
-        PatternType::LinkerMerged => &[
-            "verifiable-icf.md#linker-merged-icf",
-            "at-limit-mwcc.md#linker-merged-icf",
-        ],
-        PatternType::BoolMask => &[
-            "fixable-bool-mask.md",
-            "permuter-roi.md#bool-materialization",
-        ],
+pub fn pattern_doc_links(pattern: PatternType) -> &'static [DocLink] {
+    match pattern {
+        PatternType::LinkerMerged => &[DocLink::IcfVerifiable, DocLink::IcfAtLimit],
+        PatternType::BoolMask => &[DocLink::BoolMask, DocLink::BoolMaterialization],
         // REGISTER_SWAP reads as "the allocator picked different registers",
         // which invites a declaration-order edit. Measured on MSVC/PowerPC
         // (n=3, see docs/research/register-swap-symptom-not-cause.md) that is
@@ -1481,47 +1954,30 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
         // fixed. Liveness-shaping docs therefore come first; declaration order
         // is kept last because it is the lever for OFFSET_SWAP (stack slots),
         // which co-occurs with regswaps often enough to still be worth listing.
-        // FILENAME DIVERGENCE, deliberate: the scheduling link uses the DC3
-        // filename (`PERMUTER_ROI_ANALYSIS.md`); RB3 calls the same document
-        // `permuter-roi.md`. These URLs resolve against whichever repo is
-        // consuming objdiff, so no single string is correct for both, and this
-        // module has no repo context to choose with. DC3 wins because that is
-        // where the scheduling section (with the SizeCheck worked example) and
-        // the measurements behind this ordering live. Note that a wrong-repo
-        // filename is worse than a 404 here: DC3 is MSVC and RB3 is MetroWerks,
-        // so cross-repo doc content is often written for the other backend.
-        // See dc3-decomp `docs/decomp/patterns/INDEX.md` for the divergence
-        // table and the anchor contract covering these links.
+        // FILENAME/ANCHOR DIVERGENCE is handled by DocLink, not by picking a
+        // winner: DC3 keeps the scheduling section in `PERMUTER_ROI_ANALYSIS.md`
+        // and the regswap diagnostic order in `fixable-liveness.md`, RB3 keeps
+        // both in `permuter-roi.md`, and the anchors differ. See
+        // dc3-decomp `docs/decomp/patterns/INDEX.md` for the anchor contract
+        // covering the first entry here.
         PatternType::RegisterSwap => &[
-            "fixable-declarations.md#pre-compute-references-before-clobbering-calls",
-            "PERMUTER_ROI_ANALYSIS.md#instruction-scheduling",
-            "permuter-roi.md#register-allocation-cascades",
-            "fixable-declarations.md#variable-declaration-order",
+            DocLink::PrecomputeRefsBeforeCalls,
+            DocLink::InstructionScheduling,
+            DocLink::RegallocCascades,
+            DocLink::DeclarationOrder,
         ],
-        PatternType::ComparisonStyle => &["fixable-comparison.md#comparison-style"],
-        PatternType::ControlFlow => &[
-            "fixable-control-flow.md#branch-polarity-steering-beqbne-blebge",
-            "fixable-comparison.md#unsigned-zero-comparison",
-        ],
-        PatternType::CommutativeOpOrder => &["fixable-operators.md#commutative-operand-order"],
-        PatternType::OffsetSwap => &[
-            "fixable-declarations.md#offset-swap",
-            "permuter-roi.md#stack-slot-inversion",
-        ],
-        PatternType::AnonymousNamespaceHash => {
-            &["at-limit-mwcc.md#anonymous-namespace-hash"]
+        PatternType::ComparisonStyle => &[DocLink::ComparisonStyle],
+        PatternType::ControlFlow => &[DocLink::BranchPolarity, DocLink::UnsignedZeroComparison],
+        PatternType::CommutativeOpOrder => &[DocLink::CommutativeOperandOrder],
+        PatternType::OffsetSwap => &[DocLink::OffsetSwap, DocLink::StackSlotInversion],
+        PatternType::AnonymousNamespaceHash => &[DocLink::AnonymousNamespaceHash],
+        PatternType::StaticGuardCounter => {
+            &[DocLink::StaticGuardCounter, DocLink::StaticSymbolOrder]
         }
-        PatternType::StaticGuardCounter => &[
-            "fixable-declarations.md#function-definition-order-tu-wide-static-guard-counters",
-            "fixable-declarations.md#static-symbol-order",
-        ],
-        PatternType::DynamicCastMismatch => {
-            &["fixable-casting.md#avoid-unnecessary-dynamic_cast-getobj-vs-objt"]
+        PatternType::DynamicCastMismatch => &[DocLink::DynamicCast],
+        PatternType::DeadStoreElimination => {
+            &[DocLink::DeadStoreElimination, DocLink::PermuterRoi]
         }
-        PatternType::DeadStoreElimination => &[
-            "at-limit-mwcc.md#dead-store-elimination",
-            "permuter-roi.md",
-        ],
         // A prologue that saves one more/fewer callee-saved register than the
         // target is a live-range budget difference, not a declaration-order
         // one: in the measured case (RndText::FitTextScroll, MSVC/PPC) our
@@ -1529,41 +1985,32 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
         // callee-saved register, costing exactly one extra save slot
         // (__savegprlr_23 vs _22) and cascading into ~40 register swaps.
         PatternType::PrologueMismatch => &[
-            "fixable-declarations.md#pre-compute-references-before-clobbering-calls",
-            "permuter-roi.md#register-allocation-cascades",
-            "fixable-declarations.md#variable-declaration-order",
+            DocLink::PrecomputeRefsBeforeCalls,
+            DocLink::RegallocCascades,
+            DocLink::DeclarationOrder,
         ],
-        PatternType::AllocaMismatch => {
-            &["fixable-declarations.md#alloca-vs-_alloca-intrinsic-stack-allocation"]
+        PatternType::AllocaMismatch => &[DocLink::Alloca],
+        PatternType::ScopeCounterMismatch => &[DocLink::ScopeCounter],
+        PatternType::MakeStringTemplateMismatch => &[DocLink::MakeStringTemplate],
+        PatternType::AddressRelocationNoise => &[DocLink::AddressRelocationNoise],
+        PatternType::BooleanNegation => &[DocLink::BooleanNegation, DocLink::PermuterRoi],
+        PatternType::FloatPrecisionMismatch => &[DocLink::FloatPrecision],
+        PatternType::FselTernary => &[DocLink::FselTernary],
+        PatternType::FloatToIntToFloat => &[DocLink::FloatToIntToFloat],
+        PatternType::SignednessMismatch => {
+            &[DocLink::SignedVsUnsignedComparison, DocLink::SignednessWidth]
         }
-        PatternType::ScopeCounterMismatch => {
-            &["fixable-declarations.md#braced-vs-braceless-if-scope-counter"]
-        }
-        PatternType::MakeStringTemplateMismatch => {
-            &["fixable-casting.md#makestring-template-type-mismatch-milo-macro-arguments"]
-        }
-        PatternType::AddressRelocationNoise => {
-            &["at-limit-mwcc.md#address-relocation-noise"]
-        }
-        PatternType::BooleanNegation => &[
-            "at-limit-mwcc.md#boolean-negation-subfic-vs-subic",
-            "permuter-roi.md",
-        ],
-        PatternType::FloatPrecisionMismatch => {
-            &["fixable-casting.md#cast-placement-controls-fmul-vs-fmuls"]
-        }
-        PatternType::FselTernary => {
-            &["fixable-fsel-fma.md#fsel-via-explicit-ternary-subtractionnegation"]
-        }
-        PatternType::FloatToIntToFloat => {
-            &["fixable-casting.md#float-to-int-to-float-reconversion"]
-        }
-        PatternType::SignednessMismatch => &[
-            "fixable-comparison.md#signed-vs-unsigned-comparison",
-            "fixable-casting.md#signedness-and-width-mismatch",
-        ],
-    };
-    paths.iter().map(|p| format!("{}{}", DOC_BASE, p)).collect()
+    }
+}
+
+/// Documentation URLs for a pattern, resolved for an explicit project.
+pub fn pattern_doc_urls_for(project: DocProject, pattern: PatternType) -> Vec<String> {
+    pattern_doc_links(pattern).iter().filter_map(|&l| doc_url_for(project, l)).collect()
+}
+
+/// Documentation URLs for a pattern, resolved against the detected project.
+pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
+    pattern_doc_urls_for(doc_project(), pattern)
 }
 
 // =============================================================================
@@ -3567,7 +4014,7 @@ pub fn compute_verdict(
                 ),
                 suggestions: vec![Suggestion {
                     action: "Run the source permuter on this function/unit before accepting.".to_string(),
-                    doc_url: Some(format!("{}permuter-roi.md", DOC_BASE)),
+                    doc_url: doc_url(DocLink::PermuterRoi),
                 }],
                 doc_urls: verdict_doc_urls.clone(),
             };
@@ -3629,7 +4076,7 @@ pub fn compute_verdict(
             ),
             suggestions: vec![Suggestion {
                 action: "Run the source permuter on this function before accepting.".to_string(),
-                doc_url: Some(format!("{}fixable-bool-mask.md", DOC_BASE)),
+                doc_url: doc_url(DocLink::BoolMask),
             }],
             doc_urls: verdict_doc_urls.clone(),
         };
@@ -3683,7 +4130,7 @@ pub fn compute_verdict(
             ),
             suggestions: vec![Suggestion {
                 action: "Accept current match — merged calls are a linker artifact.".to_string(),
-                doc_url: Some(format!("{}verifiable-icf.md#linker-merged-icf", DOC_BASE)),
+                doc_url: doc_url(DocLink::IcfVerifiable),
             }],
             doc_urls: verdict_doc_urls.clone(),
         };
@@ -3713,7 +4160,7 @@ pub fn compute_verdict(
                 .to_string(),
             suggestions: vec![Suggestion {
                 action: "Filter out merged-call diffs and inspect remaining mismatches.".to_string(),
-                doc_url: Some(format!("{}verifiable-icf.md#linker-merged-icf", DOC_BASE)),
+                doc_url: doc_url(DocLink::IcfVerifiable),
             }],
             doc_urls: verdict_doc_urls.clone(),
         };
@@ -3748,10 +4195,7 @@ pub fn compute_verdict(
             suggestions: vec![Suggestion {
                 action: "Accept current match — address-relocation noise is a linker artifact."
                     .to_string(),
-                doc_url: Some(format!(
-                    "{}at-limit-mwcc.md#address-relocation-noise",
-                    DOC_BASE
-                )),
+                doc_url: doc_url(DocLink::AddressRelocationNoise),
             }],
             doc_urls: verdict_doc_urls.clone(),
         };
@@ -3790,10 +4234,7 @@ pub fn compute_verdict(
                         recommendation: "Add .Str() to Symbol/DataNode arguments in MILO macros.".to_string(),
                         suggestions: vec![Suggestion {
                             action: "Add .Str() conversions to MILO macro arguments".to_string(),
-                            doc_url: Some(format!(
-                                "{}fixable-casting.md#makestring-template-type-mismatch-milo-macro-arguments",
-                                DOC_BASE
-                            )),
+                            doc_url: doc_url(DocLink::MakeStringTemplate),
                         }],
                         doc_urls: verdict_doc_urls.clone(),
                     };
@@ -3842,10 +4283,7 @@ pub fn compute_verdict(
 
         suggestions.push(Suggestion {
             action: "Try `> 0` vs `!= 0`, `>=` vs `>`, if/else inversion".to_string(),
-            doc_url: Some(format!(
-                "{}fixable-comparison.md#unsigned-zero-comparison",
-                DOC_BASE
-            )),
+            doc_url: doc_url(DocLink::UnsignedZeroComparison),
         });
 
         return Verdict {
@@ -3905,24 +4343,18 @@ pub fn compute_verdict(
                      volatile-only swap rules liveness out. Fixing the cause flips the whole \
                      swap set."
                 .to_string(),
-            doc_url: Some(format!(
-                "{}fixable-declarations.md#pre-compute-references-before-clobbering-calls",
-                DOC_BASE
-            )),
+            doc_url: doc_url(DocLink::PrecomputeRefsBeforeCalls),
         });
         suggestions.push(Suggestion {
             action: "Run the source permuter on this function/unit if the cause isn't visible."
                 .to_string(),
-            doc_url: Some(format!("{}permuter-roi.md", DOC_BASE)),
+            doc_url: doc_url(DocLink::PermuterRoi),
         });
         suggestions.push(Suggestion {
             action: "Declaration reorder is usually inert for register-only swaps (measured on \
                      MSVC/PPC); reach for it when stack-slot / OFFSET_SWAP diffs are also present."
                 .to_string(),
-            doc_url: Some(format!(
-                "{}fixable-declarations.md#variable-declaration-order",
-                DOC_BASE
-            )),
+            doc_url: doc_url(DocLink::DeclarationOrder),
         });
 
         // Register swaps are NEVER "unfixable" on their face. They are a
@@ -4034,6 +4466,174 @@ pub fn compute_verdict(
             .to_string(),
         suggestions,
         doc_urls: verdict_doc_urls,
+    }
+}
+
+#[cfg(test)]
+mod doc_link_tests {
+    use super::*;
+
+    /// Filenames that exist in only one of the two known projects. Emitting one
+    /// of these for the other project is the failure mode this module exists to
+    /// prevent: DC3 is MSVC and RB3 is MetroWerks, so a cross-repo doc link
+    /// either 404s or, worse, hands the reader advice for the wrong backend.
+    const DC3_ONLY_FILES: &[&str] = &[
+        "PERMUTER_ROI_ANALYSIS.md",
+        "at-limit-systemic.md",
+        "unfixable-compiler.md",
+        "fixable-liveness.md",
+    ];
+    const RB3_ONLY_FILES: &[&str] = &["permuter-roi.md", "at-limit-mwcc.md"];
+
+    fn all_urls(project: DocProject) -> Vec<String> {
+        let mut urls: Vec<String> =
+            ALL_DOC_LINKS.iter().filter_map(|&l| doc_url_for(project, l)).collect();
+        for &p in ALL_PATTERN_TYPES {
+            urls.extend(pattern_doc_urls_for(project, p));
+        }
+        urls
+    }
+
+    fn file_of(url: &str) -> &str {
+        let path = url.strip_prefix(DOC_BASE).unwrap_or(url);
+        path.split('#').next().unwrap_or(path)
+    }
+
+    #[test]
+    fn dc3_first_url_anchor_contract() {
+        // objdiff renders only the FIRST doc URL inline, and dc3-decomp's docs
+        // are maintained against these exact anchors.
+        assert_eq!(
+            pattern_doc_urls_for(DocProject::Dc3, PatternType::RegisterSwap)[0],
+            "docs/decomp/patterns/fixable-declarations.md\
+             #pre-compute-references-before-clobbering-calls"
+        );
+        assert_eq!(
+            pattern_doc_urls_for(DocProject::Dc3, PatternType::OffsetSwap)[0],
+            "docs/decomp/patterns/fixable-declarations.md#offset-swap"
+        );
+        assert!(
+            pattern_doc_urls_for(DocProject::Dc3, PatternType::RegisterSwap).contains(
+                &"docs/decomp/patterns/PERMUTER_ROI_ANALYSIS.md#instruction-scheduling".to_string()
+            ),
+            "the scheduling writeup must stay reachable from REGISTER_SWAP"
+        );
+    }
+
+    #[test]
+    fn no_cross_project_filenames() {
+        for url in all_urls(DocProject::Dc3) {
+            let file = file_of(&url);
+            assert!(!RB3_ONLY_FILES.contains(&file), "DC3 emitted RB3-only doc: {url}");
+        }
+        for url in all_urls(DocProject::Rb3) {
+            let file = file_of(&url);
+            assert!(!DC3_ONLY_FILES.contains(&file), "RB3 emitted DC3-only doc: {url}");
+        }
+    }
+
+    #[test]
+    fn unknown_project_emits_only_universal_links() {
+        for &link in ALL_DOC_LINKS {
+            let Some(url) = doc_url_for(DocProject::Unknown, link) else { continue };
+            let dc3 = doc_url_for(DocProject::Dc3, link)
+                .unwrap_or_else(|| panic!("{link:?}: unknown resolved but dc3 did not"));
+            let rb3 = doc_url_for(DocProject::Rb3, link)
+                .unwrap_or_else(|| panic!("{link:?}: unknown resolved but rb3 did not"));
+            assert!(
+                dc3.starts_with(&url) && rb3.starts_with(&url),
+                "{link:?}: unknown emitted {url}, not common to {dc3} and {rb3}"
+            );
+            if dc3 != rb3 {
+                assert!(!url.contains('#'), "{link:?}: kept a diverging anchor: {url}");
+            }
+        }
+        // Degrading gracefully must not mean degrading to nothing useful.
+        assert!(all_urls(DocProject::Unknown).iter().any(|u| u.contains("fixable-declarations")));
+    }
+
+    #[test]
+    fn every_pattern_has_a_dc3_doc() {
+        for &pattern in ALL_PATTERN_TYPES {
+            assert!(
+                !pattern_doc_urls_for(DocProject::Dc3, pattern).is_empty(),
+                "{pattern:?} has no DC3 documentation"
+            );
+        }
+    }
+
+    #[test]
+    fn urls_are_well_formed() {
+        for project in [DocProject::Dc3, DocProject::Rb3, DocProject::Unknown] {
+            for url in all_urls(project) {
+                assert!(url.starts_with(DOC_BASE), "{url} is not project-relative");
+                assert!(file_of(&url).ends_with(".md"), "{url} does not name a markdown file");
+                assert!(!url.ends_with('#'), "{url} has an empty anchor");
+            }
+        }
+    }
+
+    #[test]
+    fn enumerations_are_complete_and_unique() {
+        // Guards against adding a variant and forgetting the ALL_ table, which
+        // would silently exclude it from the link checker.
+        let mut links = ALL_DOC_LINKS.to_vec();
+        links.sort_by_key(|l| format!("{l:?}"));
+        links.dedup_by_key(|l| format!("{l:?}"));
+        assert_eq!(links.len(), ALL_DOC_LINKS.len(), "duplicate entry in ALL_DOC_LINKS");
+        assert_eq!(ALL_DOC_LINKS.len(), 30, "update ALL_DOC_LINKS when adding a DocLink");
+        let mut patterns = ALL_PATTERN_TYPES.to_vec();
+        patterns.sort_by_key(|p| p.as_str());
+        patterns.dedup_by_key(|p| p.as_str());
+        assert_eq!(patterns.len(), ALL_PATTERN_TYPES.len(), "duplicate in ALL_PATTERN_TYPES");
+        assert_eq!(
+            ALL_PATTERN_TYPES.len(),
+            21,
+            "update ALL_PATTERN_TYPES when adding a PatternType"
+        );
+    }
+
+    #[test]
+    fn project_names_round_trip() {
+        for project in [DocProject::Dc3, DocProject::Rb3, DocProject::Unknown] {
+            assert_eq!(DocProject::from_name(project.as_str()), Some(project));
+        }
+        assert_eq!(DocProject::from_name("DC3"), Some(DocProject::Dc3));
+        assert_eq!(DocProject::from_name("none"), Some(DocProject::Unknown));
+        assert_eq!(DocProject::from_name("mario"), None);
+    }
+
+    #[test]
+    fn detection_reads_the_docs_tree() {
+        let root = std::env::temp_dir().join(format!("objdiff-doclinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let make = |name: &str, markers: &[&str]| {
+            let dir = root.join(name).join("docs").join("decomp").join("patterns");
+            std::fs::create_dir_all(&dir).unwrap();
+            for marker in markers {
+                std::fs::write(dir.join(marker), "# x\n").unwrap();
+            }
+            root.join(name)
+        };
+        let dc3 = make("dc3", &["PERMUTER_ROI_ANALYSIS.md"]);
+        let rb3 = make("rb3", &["permuter-roi.md", "at-limit-mwcc.md"]);
+        let bare = make("bare", &["something-else.md"]);
+        let nodocs = root.join("nodocs");
+        std::fs::create_dir_all(nodocs.join("src")).unwrap();
+
+        assert_eq!(detect_doc_project_at(&dc3), Some(DocProject::Dc3));
+        assert_eq!(detect_doc_project_at(&rb3), Some(DocProject::Rb3));
+        assert_eq!(detect_doc_project_at(&bare), Some(DocProject::Unknown));
+        assert_eq!(detect_doc_project_at(&nodocs), None);
+
+        // Detection must work from a subdirectory (ninja and the orchestrator
+        // both invoke objdiff-cli from wherever the build happens to be).
+        let deep = dc3.join("src").join("system").join("rndobj");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(detect_doc_project_from(&deep), DocProject::Dc3);
+        assert_eq!(detect_doc_project_from(&nodocs), DocProject::Unknown);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
