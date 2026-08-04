@@ -249,6 +249,57 @@ compiler is not enough to justify changing what the tool asserts.
 - `match_guidance()`'s 95%+ band no longer recommends variable reorder for
   register swaps.
 
+## The "dominated by" line was non-deterministic (fixed 2026-08-04)
+
+Recorded here because the bug class is easy to reintroduce: every "dominated by"
+line in `analysis.rs` is built by counting into a `HashMap` and then sorting by
+count, and that sort is the only thing between the reader and a random ordering.
+
+`detect_register_swap` counted pairs into a `HashMap<(String, String), usize>`,
+drained it with `into_iter()`, and sorted with
+`sort_by(|a, b| b.count.cmp(&a.count))`. The sort is stable, but its *input*
+order was the hash order — and `std::collections::HashMap` takes a fresh seed
+per instance, so **equal-count entries came out in a different order on every
+construction**.
+
+Observed in the field on the same binary against the same object: `f0`↔`f10` on
+one run and `f13`↔`f9` on the next, both with a count of 4, plus a third-place
+entry that also varied. Reproduced in-tree by building the pattern repeatedly
+from identical input:
+
+```
+left:  ("… dominated by f0↔f10 (3 of 12) …",  ["f0↔f10: 3", "f13↔f9: 3", "f2↔f8: 3"])
+right: ("… dominated by f13↔f9 (3 of 12) …",  ["f13↔f9: 3", "f11↔f3: 3", "f2↔f8: 3"])
+```
+
+The cost is not cosmetic. It makes diff reports irreproducible in that line and
+— for the workflow this whole document is about — **useless for A/B-ing a source
+edit**, because a "dominated by" that renames itself between two runs is
+indistinguishable from an edit that changed the dominant swap pair. The defect
+was **pre-existing**; it was not introduced by the guidance work above.
+
+**Fixed, not merely filed.** A new `register_sort_key(reg)` orders registers by
+class then *number* (so `f9` precedes `f10`, which a lexicographic key would
+not; unparsable names sort last, by name), and `detect_register_swap` now sorts
+by count descending, then `target_reg`, then `base_reg`. The same one-line
+treatment went onto the four sibling histograms with the identical shape —
+`OFFSET_SWAP` pair counts, the `FloatPrecisionMismatch` and
+`SignednessMismatch` opcode-pair counts, and the insert/delete cluster
+`dominant_opcodes` list — all of which also feed user-visible output. *Which*
+entries are reported did not change; only the order of equals.
+
+`test_register_swap_summary_is_deterministic_under_ties` builds four pairs with
+identical counts, renders the summary 65 times, and requires every rendering to
+agree. Each call constructs a fresh `HashMap` and so draws a fresh seed, which
+is what makes the test bite: it was confirmed to **fail on the unfixed code**
+before the fix was written. It also pins the numeric ordering, so the tie-break
+is a stated rule rather than "whatever happens to be stable today".
+
+The general rule: if a summary names a "top" or "dominant" item drawn from a
+hash container, it needs a total order. `sort_by(count)` alone is a bug whenever
+two counts can be equal — which in mismatch histograms is the common case, not
+the corner case.
+
 ## The cross-repo link problem
 
 Doc URLs are relative to the *consuming* project (`docs/decomp/patterns/`), and

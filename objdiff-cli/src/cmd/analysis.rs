@@ -49,6 +49,26 @@ fn is_callee_saved_register(reg: &str) -> bool {
     false
 }
 
+/// Total-order key for a PowerPC register name, by class then number.
+///
+/// Used to break ties in count-ordered summaries. Without an explicit
+/// tie-break those orderings fall out of `HashMap` iteration, which
+/// `std::collections::HashMap` reseeds per instance — so equal-count entries
+/// came out in a different order on every run of the same binary against the
+/// same object, making diff reports irreproducible.
+///
+/// Ordering by number rather than lexicographically also puts `f9` before
+/// `f10`, which is what a reader expects.
+fn register_sort_key(reg: &str) -> (u8, u32, &str) {
+    if let (Some(class), Some(rest)) = (reg.as_bytes().first(), reg.get(1..)) {
+        if let Ok(number) = rest.parse::<u32>() {
+            return (*class, number, reg);
+        }
+    }
+    // Not `<class><number>`: sort after everything recognisable, by name.
+    (u8::MAX, u32::MAX, reg)
+}
+
 /// Don't analyze functions with only 1 mismatch (simple manual check)
 const MIN_MISMATCH_FOR_ANALYSIS: usize = 2;
 
@@ -503,7 +523,8 @@ impl Pattern {
                     *pair_counts.entry(key).or_insert(0) += 1;
                 }
                 let mut sorted_pairs: Vec<_> = pair_counts.into_iter().collect();
-                sorted_pairs.sort_by(|a, b| b.1.cmp(&a.1));
+                // Tie-break on the offset pair itself: see register_sort_key.
+                sorted_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
                 let one_line = if sorted_pairs.len() == 1 {
                     let ((a, b), count) = sorted_pairs[0];
@@ -795,7 +816,8 @@ impl Pattern {
                     *pair_counts.entry(key).or_insert(0) += 1;
                 }
                 let mut sorted: Vec<_> = pair_counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                // Tie-break on the opcode pair: see register_sort_key.
+                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 let dominant = sorted.first().map(|(k, _)| k.as_str()).unwrap_or("?");
                 let one_line = format!(
                     "{} float precision mismatch(es), dominated by {}",
@@ -840,7 +862,8 @@ impl Pattern {
                     *pair_counts.entry(key).or_insert(0) += 1;
                 }
                 let mut sorted: Vec<_> = pair_counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                // Tie-break on the opcode pair: see register_sort_key.
+                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 let dominant = sorted.first().map(|(k, _)| k.as_str()).unwrap_or("?");
                 let one_line = format!(
                     "{} signed/unsigned mismatch(es), dominated by {}",
@@ -1038,7 +1061,8 @@ pub fn compute_insert_delete_clusters(
         let total = inserts + deletes;
         if total >= 3 {
             let mut sorted_opcodes: Vec<_> = opcode_counts.into_iter().collect();
-            sorted_opcodes.sort_by(|a, b| b.1.cmp(&a.1));
+            // Tie-break on the opcode name: see register_sort_key.
+            sorted_opcodes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let dominant_opcodes: Vec<String> =
                 sorted_opcodes.into_iter().take(3).map(|(op, _)| op).collect();
 
@@ -2289,7 +2313,16 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
         .into_iter()
         .map(|((reg1, reg2), count)| RegisterSwapInfo { target_reg: reg1, base_reg: reg2, count })
         .collect();
-    swaps.sort_by(|a, b| b.count.cmp(&a.count));
+    // Count descending, then by register so equal counts do not inherit the
+    // HashMap's per-instance iteration order. `summarize()` reports the head of
+    // this list as "dominated by", and a diff report that renames its dominant
+    // pair between runs cannot be used to A/B a source edit.
+    swaps.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| register_sort_key(&a.target_reg).cmp(&register_sort_key(&b.target_reg)))
+            .then_with(|| register_sort_key(&a.base_reg).cmp(&register_sort_key(&b.base_reg)))
+    });
 
     // Classify fixability based on register types. This split says which CAUSE
     // to look for, not how hard the fix is — in both classes the swap set is a
@@ -4810,6 +4843,69 @@ mod tests {
         assert_eq!(pattern.pattern, PatternType::RegisterSwap);
         assert_eq!(pattern.instruction_count, 4);
         assert_eq!(pattern.confidence, Confidence::Medium);
+    }
+
+    /// The REGISTER_SWAP summary's "dominated by" line must not depend on
+    /// HashMap iteration order.
+    ///
+    /// `detect_register_swap` counts pairs into a `HashMap` and then sorts by
+    /// count. With tied counts a plain count-sort leaves the order to whatever
+    /// the hasher produced, and `std::collections::HashMap` reseeds per
+    /// instance — so the same binary on the same object emitted `f0<->f10` on
+    /// one run and `f13<->f9` on the next, with a varying third place. That
+    /// makes diff reports non-reproducible and useless for A/B-ing a source
+    /// edit. Regression test: build the same pattern many times and require
+    /// every rendering to agree.
+    #[test]
+    fn test_register_swap_summary_is_deterministic_under_ties() {
+        // Four pairs, all with exactly MIN_REGISTER_SWAP_OCCURRENCES
+        // occurrences: nothing but the tie-break can order them.
+        let mut instructions = Vec::new();
+        let pairs = [("f0", "f10"), ("f13", "f9"), ("f2", "f8"), ("f11", "f3")];
+        let reps = MIN_REGISTER_SWAP_OCCURRENCES;
+        for (i, (t, b)) in pairs.iter().enumerate() {
+            for rep in 0..reps {
+                let index = i * reps + rep;
+                instructions.push(make_instr(
+                    index,
+                    "diff_arg",
+                    Some("fmr"),
+                    Some(&format!("{t}, f31")),
+                    Some("fmr"),
+                    Some(&format!("{b}, f31")),
+                ));
+            }
+        }
+
+        let render = || {
+            let pattern =
+                detect_register_swap(&instructions).expect("Should detect register swap");
+            let summary = pattern.summarize();
+            (summary.one_line, summary.top_details)
+        };
+
+        let expected = render();
+        assert!(
+            expected.0.contains("dominated by"),
+            "expected a dominated-by line: {}",
+            expected.0
+        );
+        // A fresh HashMap (and therefore a fresh seed) on every iteration.
+        for _ in 0..64 {
+            assert_eq!(render(), expected, "REGISTER_SWAP summary varied between runs");
+        }
+
+        // And the tie-break orders by register NUMBER, not lexicographically:
+        // f2 and f11 come before f13, where a string sort would give
+        // f0, f11, f13, f2. (`top_details` is capped at 3.)
+        assert_eq!(
+            expected.1,
+            vec![
+                format!("f0↔f10: {reps}"),
+                format!("f2↔f8: {reps}"),
+                format!("f11↔f3: {reps}"),
+            ]
+        );
     }
 
     #[test]
