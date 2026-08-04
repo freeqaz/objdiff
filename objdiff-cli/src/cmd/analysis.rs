@@ -26,8 +26,15 @@ const MIN_REGISTER_SWAP_OCCURRENCES: usize = 3;
 
 /// Check if a PowerPC register is callee-saved (preserved across function calls).
 /// GPR r13-r31 and FPR f14-f31 are callee-saved per the Xbox 360 ABI.
-/// Volatile registers (GPR r0,r3-r12; FPR f0-f13) are compiler-internal and
-/// their allocation cannot be influenced by source-level changes.
+///
+/// This is the discriminator behind the register-swap hints: a volatile
+/// register (GPR r0,r3-r12; FPR f0-f13) cannot hold a value across a call, so a
+/// swap confined to volatiles is never itself a live-across-call disagreement —
+/// look at scheduling and operand order instead. That does NOT mean volatile
+/// allocation is beyond source-level influence: measured on MSVC/PPC,
+/// rescheduling a product before its compare and matching the target's compare
+/// operand order closed nine volatile FPR swaps by hand
+/// (`RndText::SizeCheck`).
 fn is_callee_saved_register(reg: &str) -> bool {
     if let Some(num_str) = reg.strip_prefix('r') {
         if let Ok(n) = num_str.parse::<u32>() {
@@ -423,13 +430,18 @@ impl Pattern {
                 let total_occurrences: usize = swaps.iter().map(|s| s.count).sum();
                 let pairs = swaps.len();
                 // Classify register types for display
-                // These labels name the likely CAUSE, not a fix recipe. Volatile
-                // swaps track instruction scheduling and operand order;
-                // callee-saved swaps track how long values stay live across
-                // calls. Declaration order is deliberately not suggested here —
-                // see docs/research/register-swap-symptom-not-cause.md.
+                // These labels name the CAUSE to look for, not a fix recipe.
+                // The volatile/callee-saved split is decidable from the ABI, not
+                // guessed: a volatile register can't hold a value across a call,
+                // so a pure-volatile swap rules liveness out and leaves
+                // scheduling and operand order. Callee-saved swaps are the
+                // live-across-call case. Declaration order is deliberately not
+                // suggested here — see
+                // docs/research/register-swap-symptom-not-cause.md.
                 let reg_class = match self.fixability {
-                    Fixability::RarelyHandFixable => " [volatile — scheduling/operand order]",
+                    Fixability::RarelyHandFixable => {
+                        " [volatile — scheduling/operand order, not liveness]"
+                    }
                     Fixability::MaybeFixable => {
                         let has_callee = swaps.iter().any(|s| {
                             is_callee_saved_register(&s.target_reg)
@@ -440,7 +452,7 @@ impl Pattern {
                                 || !is_callee_saved_register(&s.base_reg)
                         });
                         if has_callee && has_volatile {
-                            " [mixed volatile+callee-saved — liveness across calls]"
+                            " [mixed volatile+callee-saved — one liveness cause, start there]"
                         } else {
                             " [callee-saved — check liveness across calls]"
                         }
@@ -1469,11 +1481,20 @@ pub fn pattern_doc_urls(pattern: PatternType) -> Vec<String> {
         // fixed. Liveness-shaping docs therefore come first; declaration order
         // is kept last because it is the lever for OFFSET_SWAP (stack slots),
         // which co-occurs with regswaps often enough to still be worth listing.
-        // Anchor availability differs per consuming repo (DC3 vs RB3); links
-        // that don't resolve degrade to the top of the same file.
+        // FILENAME DIVERGENCE, deliberate: the scheduling link uses the DC3
+        // filename (`PERMUTER_ROI_ANALYSIS.md`); RB3 calls the same document
+        // `permuter-roi.md`. These URLs resolve against whichever repo is
+        // consuming objdiff, so no single string is correct for both, and this
+        // module has no repo context to choose with. DC3 wins because that is
+        // where the scheduling section (with the SizeCheck worked example) and
+        // the measurements behind this ordering live. Note that a wrong-repo
+        // filename is worse than a 404 here: DC3 is MSVC and RB3 is MetroWerks,
+        // so cross-repo doc content is often written for the other backend.
+        // See dc3-decomp `docs/decomp/patterns/INDEX.md` for the divergence
+        // table and the anchor contract covering these links.
         PatternType::RegisterSwap => &[
             "fixable-declarations.md#pre-compute-references-before-clobbering-calls",
-            "permuter-roi.md#instruction-scheduling",
+            "PERMUTER_ROI_ANALYSIS.md#instruction-scheduling",
             "permuter-roi.md#register-allocation-cascades",
             "fixable-declarations.md#variable-declaration-order",
         ],
@@ -1823,19 +1844,29 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
         .collect();
     swaps.sort_by(|a, b| b.count.cmp(&a.count));
 
-    // Classify fixability based on register types. NOTE: this split says which
-    // CAUSE is more likely, not how hard the fix is — in both classes the swap
-    // set is a symptom that flips wholesale once the cause is addressed.
-    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable — the usual
-    //   cause is a live-range difference across a call (a value the target
-    //   keeps in a callee-saved register that our build reloads, or vice
-    //   versa). Shortening or extending that live range is the lever.
-    // - Pure volatile swaps (r0-r12, f0-f13): RarelyHandFixable — driven by
-    //   instruction scheduling and operand order. Reordering the source so a
-    //   producer lands before its consumer, or flipping a commutative/compare
-    //   operand order, has moved these by hand; the permuter's
-    //   body-restructuring patterns also help. Try both before accepting.
-    // - Mixed: MaybeFixable (the callee-saved half usually carries the cause)
+    // Classify fixability based on register types. This split says which CAUSE
+    // to look for, not how hard the fix is — in both classes the swap set is a
+    // symptom that flips wholesale once the cause is addressed.
+    //
+    // The split is a first-principles discriminator, not just an empirical
+    // heuristic: by ABI a volatile register cannot hold a value across a call,
+    // so a *volatile* swap is never itself a disagreement about what stays live
+    // across a call. It can still be the downstream shadow of one elsewhere in
+    // the function — which is exactly why the mixed case points at liveness.
+    //
+    // - Pure callee-saved swaps (r13-r31, f14-f31): MaybeFixable — the cause is
+    //   a live-range difference across a call (a value the target keeps in a
+    //   callee-saved register that our build reloads, or vice versa).
+    //   Shortening or extending that live range is the lever.
+    // - Pure volatile swaps (r0-r12, f0-f13): RarelyHandFixable — rule liveness
+    //   out and look at instruction scheduling and operand order. Reordering
+    //   the source so a producer lands before its consumer, or flipping a
+    //   commutative/compare operand order, has moved these by hand; the
+    //   permuter's body-restructuring patterns also help. Try both.
+    // - Mixed: MaybeFixable — the callee-saved half carries the cause and the
+    //   volatile half usually follows it. Measured: RndText::FitTextScroll
+    //   showed r27<->r28, r22<->r23 (callee-saved) and f12<->f13 (volatile)
+    //   simultaneously, all from ONE member reload at a call site.
     //
     // Declaration reorder is NOT the first lever for either class; it is the
     // lever for stack-slot (OFFSET_SWAP) mismatches. Measured n=3 on
@@ -3869,7 +3900,10 @@ pub fn compute_verdict(
             action: "Treat swaps as a symptom. Look for a liveness difference (a value the \
                      target holds across a call that we reload, or vice versa) or a scheduling \
                      difference (a producer emitted after its consumer, a compare with the \
-                     operands the other way round). Fixing the cause flips the whole swap set."
+                     operands the other way round). The pattern's register-class label says \
+                     which: volatile registers cannot be live across a call, so a \
+                     volatile-only swap rules liveness out. Fixing the cause flips the whole \
+                     swap set."
                 .to_string(),
             doc_url: Some(format!(
                 "{}fixable-declarations.md#pre-compute-references-before-clobbering-calls",

@@ -69,26 +69,49 @@ float compares to the target's operand order (`fcmpu f13,f0; bge` versus our
 All nine FPR swaps fell out automatically.
 
 Note that these were *volatile* FPRs (`f0`–`f13`), which the detector classifies
-as `RarelyHandFixable`. Hand analysis closed them anyway. The
-volatile/callee-saved split remains useful as a hint about *which cause* to look
-for — scheduling versus liveness — but it should not be read as "hand-editing
-won't work".
+as `RarelyHandFixable`. Hand analysis closed them anyway — so that label should
+not be read as "hand-editing won't work".
+
+## The volatile / callee-saved split is decidable, not heuristic
+
+The register-class split the detector already computes is stronger than it was
+being used as. It follows from the ABI rather than from these measurements: a
+volatile register cannot hold a value across a call, so **a swap confined to
+volatile registers is never itself a disagreement about what stays live across a
+call.** That rules liveness out and leaves scheduling and operand order — which
+is what closed `SizeCheck`.
+
+The converse is not symmetric, and the difference matters:
+
+- A pure-volatile swap set: liveness is *excluded* as the direct cause. Look at
+  emission order.
+- A pure-callee-saved swap set: liveness across calls is the cause.
+- A mixed set: **one liveness cause, and the volatile half is its shadow.**
+  `FitTextScroll` showed `r27`↔`r28` and `r22`↔`r23` (callee-saved) alongside
+  `f12`↔`f13` (volatile) simultaneously, all from a single member reload at a
+  call site. So a volatile swap can be *downstream* of a liveness problem
+  elsewhere in the function even though it cannot *be* one.
+
+Unlike the rest of this document, the exclusion argument is an ABI consequence
+and does not depend on n=3; only the claim about which causes show up in
+practice does.
 
 ## How to use a REGISTER_SWAP hint
 
 1. Read the prologue first. A different callee-saved save count
    (`__savegprlr_NN`) means the two builds disagree about how many values must
    survive calls — that is the cause, and the swaps are its shadow.
-2. For callee-saved swaps: find a value the target holds across a call that we
-   reload (or one we hold that the target rematerializes). Shorten or lengthen
-   that live range.
-3. For volatile swaps: look at emission order around the swap — a producer
-   scheduled after its consumer, or a compare with the operands the other way
-   round.
-4. Do not chase individual register names, and do not expect swap *count* to
+2. Read the register-class label; it tells you which cause is even possible.
+3. For callee-saved (or mixed) swaps: find a value the target holds across a
+   call that we reload (or one we hold that the target rematerializes). Shorten
+   or lengthen that live range.
+4. For volatile-only swaps: liveness is excluded. Look at emission order around
+   the swap — a producer scheduled after its consumer, or a compare with the
+   operands the other way round.
+5. Do not chase individual register names, and do not expect swap *count* to
    predict fix size. Cascades of 17 and ~40 swaps both collapsed to zero from a
    single edit.
-5. Reach for declaration reorder when `OFFSET_SWAP` or stack-slot diffs are also
+6. Reach for declaration reorder when `OFFSET_SWAP` or stack-slot diffs are also
    present. That guidance is still correct — for that class.
 
 ## What changed in the tool
@@ -102,17 +125,42 @@ compiler is not enough to justify changing what the tool asserts.
   list liveness/scheduling docs first; the declaration-order link is retained
   but demoted (it is still the right link for `OFFSET_SWAP`, which is
   unchanged).
-- `Pattern::summarize()` register-class labels name the likely cause
+- `Pattern::summarize()` register-class labels name the cause to look for
   (`[callee-saved — check liveness across calls]`,
-  `[volatile — scheduling/operand order]`) instead of prescribing a sweep.
+  `[volatile — scheduling/operand order, not liveness]`,
+  `[mixed volatile+callee-saved — one liveness cause, start there]`) instead of
+  prescribing a sweep.
 - The `compute_verdict` register-swap branch leads with "find the cause", keeps
   the permuter as the second move, and explicitly marks declaration reorder as
   usually inert for register-only swaps.
 - `match_guidance()`'s 95%+ band no longer recommends variable reorder for
   register swaps.
 
+## The cross-repo link problem
+
 Doc URLs are relative to the *consuming* project (`docs/decomp/patterns/`), and
-anchor names differ between dc3-decomp and rb3 — links that don't resolve
-degrade to the top of the same file. Several pre-existing URLs already dangle in
-dc3-decomp (`permuter-roi.md`, `at-limit-mwcc.md` exist only in rb3); that
-naming reconciliation is a separate, downstream job.
+the two consumers use **different filenames for the same document**:
+
+| Topic | dc3-decomp (MSVC) | rb3 (MetroWerks) |
+|---|---|---|
+| Permuter ROI / pattern automation | `PERMUTER_ROI_ANALYSIS.md` | `permuter-roi.md` |
+| Systemic at-limit classes | `at-limit-systemic.md` | `at-limit-mwcc.md` |
+
+`pattern_doc_urls()` is a pure function with no repo context, so no single
+string is correct for both. Worse, a wrong-repo filename is not merely a 404: the
+two projects target different compilers, so RB3-named content is usually written
+for MWCC and can be actively misleading in a DC3 hint even when a
+similarly-named file exists.
+
+Current resolution: the scheduling link uses the DC3 filename
+(`PERMUTER_ROI_ANALYSIS.md#instruction-scheduling`), because that is where the
+scheduling section and the measurements behind this document live, with a
+comment at the call site naming the divergence. dc3-decomp's
+`docs/decomp/patterns/INDEX.md` carries the divergence table and an "anchor
+contract" listing the headings objdiff links into.
+
+`permuter-roi.md#register-allocation-cascades` (third URL for `REGISTER_SWAP`)
+and the `at-limit-mwcc.md` links used by other patterns still carry RB3 names.
+Those predate this work and were left alone. **A real fix — mapping doc URLs per
+consuming project, e.g. via `objdiff.json` — is a separate piece of work and
+should not be improvised inside a guidance change.**
