@@ -15,7 +15,10 @@ use objdiff_core::{
         ChangeItem, ChangeItemInfo, ChangeUnit, Changes, ChangesInput, Measures, REPORT_VERSION,
         Report, ReportCategory, ReportItem, ReportItemMetadata, ReportUnit, ReportUnitMetadata,
     },
-    config::{ProjectObject, ProjectOptions, apply_project_options, path::platform_path},
+    config::{
+        ProjectObject, ProjectOptionValue, ProjectOptions, apply_project_options,
+        path::platform_path,
+    },
     diff,
     obj::{self, SectionKind, SymbolFlag, SymbolKind},
 };
@@ -123,8 +126,25 @@ impl ReportCache {
     ///     report would be served: pre-fix rows from cache, post-fix rows fresh.
     const CACHE_LOGIC_VERSION: u32 = 4;
 
-    /// Hash a unit's target and base .obj file contents together.
-    fn hash_unit(object: &ObjectConfig, config_args: &[String]) -> u64 {
+    /// Hash a unit's target and base .obj file contents together, plus every input
+    /// that can change the *effective* [`diff::DiffObjConfig`] used to diff it:
+    /// `-c key=value` CLI args, the project-level `options` block, and the unit's own
+    /// `options` block. All three feed [`build_unit_diff_config`], so all three have
+    /// to be in the key or the cache serves a unit diffed under a different config.
+    ///
+    /// The option maps are appended ONLY when non-empty, and with separators distinct
+    /// from the CLI-arg separator. That is deliberate: a project that sets no options
+    /// (which today is all of them) produces byte-identical key material to the
+    /// pre-fix version of this function, so existing `.cache` files stay valid and
+    /// nobody eats a full re-diff — or a changed number — for a fix they did not opt
+    /// into. Distinct separators keep `-c foo=bar` from colliding with an `options`
+    /// entry `foo: bar`, which layer in a different order and can differ in effect.
+    fn hash_unit(
+        object: &ObjectConfig,
+        config_args: &[String],
+        project_options: Option<&ProjectOptions>,
+        unit_options: Option<&ProjectOptions>,
+    ) -> u64 {
         use xxhash_rust::xxh3::xxh3_64;
         let mut combined = Vec::new();
         combined.extend_from_slice(&Self::CACHE_LOGIC_VERSION.to_le_bytes());
@@ -144,7 +164,28 @@ impl ReportCache {
             combined.push(0xFE);
             combined.extend_from_slice(arg.as_bytes());
         }
+        // Project-level options (0xFD) then unit-level options (0xFC). `ProjectOptions`
+        // is a BTreeMap, so iteration order is canonical and the key is stable across
+        // runs regardless of how the JSON happened to be written.
+        Self::hash_options(&mut combined, 0xFD, project_options);
+        Self::hash_options(&mut combined, 0xFC, unit_options);
         xxh3_64(&combined)
+    }
+
+    /// Append `options` to `combined` under `separator`, or nothing at all if the map
+    /// is absent or empty (see [`Self::hash_unit`] for why "nothing at all" matters).
+    fn hash_options(combined: &mut Vec<u8>, separator: u8, options: Option<&ProjectOptions>) {
+        let Some(options) = options else { return };
+        for (key, value) in options.iter() {
+            combined.push(separator);
+            combined.extend_from_slice(key.as_bytes());
+            combined.push(b'=');
+            match value {
+                ProjectOptionValue::Bool(true) => combined.extend_from_slice(b"true"),
+                ProjectOptionValue::Bool(false) => combined.extend_from_slice(b"false"),
+                ProjectOptionValue::String(value) => combined.extend_from_slice(value.as_bytes()),
+            }
+        }
     }
 }
 
@@ -185,7 +226,9 @@ pub struct GenerateArgs {
     /// Output format (json, json-pretty, proto) (default: json)
     format: Option<String>,
     #[argp(option, short = 'c')]
-    /// Configuration property (key=value)
+    /// Configuration property (key=value), e.g. -c functionRelocDiffs=name_only.
+    /// Overrides the project's and unit's "options" blocks in objdiff.json, which
+    /// are the persistent way to set the same properties. Repeatable.
     config: Vec<String>,
     #[argp(switch)]
     /// Enable the case-B global byte-equality second pass: promote an unmatched
@@ -403,6 +446,17 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 fn generate(args: GenerateArgs) -> Result<()> {
+    // ── Report base config. These four differ from the schema defaults in
+    // objdiff-core/config-schema.json (which are name_address / false / false / true)
+    // and they are the de-facto scoring semantics of every project that has ever run
+    // `report generate`: dc3-decomp, rb3-xenon, ChimpsAtSea_Reach, decomp-clones/halo,
+    // cea-decomp. Their match percentages are tracked over time against THESE values.
+    //
+    // So this is a FALLBACK, not a policy: `build_unit_diff_config` layers the
+    // project's `options` block, then the unit's `options` block, then `-c key=value`
+    // on top, and any of the four can be overridden that way. Do not "fix" these to
+    // the schema defaults — a project that sets no options must keep scoring exactly
+    // as it does today, or every recorded score in every project is silently invalid.
     let base_diff_config = diff::DiffObjConfig {
         function_reloc_diffs: diff::FunctionRelocDiffs::None,
         combine_data_sections: true,
@@ -460,7 +514,8 @@ fn generate(args: GenerateArgs) -> Result<()> {
     };
 
     // Load content-hash based cache for incremental report generation.
-    // Cache key = xxHash3 of target+base .obj file contents + config args.
+    // Cache key = xxHash3 of target+base .obj file contents + config args + the
+    // project/unit `options` blocks (see `ReportCache::hash_unit`).
     let cache_path = args
         .output
         .as_ref()
@@ -479,13 +534,19 @@ fn generate(args: GenerateArgs) -> Result<()> {
     if args.deduplicate {
         // If deduplicating, we need to run single-threaded
         for (object, unit_idx) in &objects {
+            let unit_options = project_units.get(*unit_idx).and_then(ProjectObject::options);
             let diff_config = build_unit_diff_config(
                 &base_diff_config,
                 project.options.as_ref(),
-                project_units.get(*unit_idx).and_then(ProjectObject::options),
+                unit_options,
                 &args.config,
             )?;
-            let hash = ReportCache::hash_unit(object, &args.config);
+            let hash = ReportCache::hash_unit(
+                object,
+                &args.config,
+                project.options.as_ref(),
+                unit_options,
+            );
             if let Some(cached_unit) = cache.get(hash) {
                 units.push(cached_unit);
             } else if let Some(unit) = report_object(
@@ -503,14 +564,20 @@ fn generate(args: GenerateArgs) -> Result<()> {
         let vec = objects
             .par_iter()
             .map(|(object, unit_idx)| {
-                let hash = ReportCache::hash_unit(object, &args.config);
+                let unit_options = project_units.get(*unit_idx).and_then(ProjectObject::options);
+                let hash = ReportCache::hash_unit(
+                    object,
+                    &args.config,
+                    project.options.as_ref(),
+                    unit_options,
+                );
                 if let Some(cached_unit) = cache.get(hash) {
                     return Ok(Some(cached_unit));
                 }
                 let diff_config = build_unit_diff_config(
                     &base_diff_config,
                     project.options.as_ref(),
-                    project_units.get(*unit_idx).and_then(ProjectObject::options),
+                    unit_options,
                     &args.config,
                 )?;
                 let result =
@@ -559,19 +626,28 @@ fn generate(args: GenerateArgs) -> Result<()> {
             .with_context(|| format!("Failed to load oracle: {oracle_path}"))?;
         info!("Loaded {} oracle VA-attribution entries from {}", oracle.len(), oracle_path);
 
-        let gbe_diff_config = base_diff_config.clone();
+        // Read each obj under the SAME effective config the per-unit pass used —
+        // project options, then that unit's options, then `-c` — not the bare base.
+        // Reading with a different config than the unit was diffed with would compare
+        // byte signatures derived from differently-decoded instructions.
         let unit_objs: Vec<diff::UnitObjs> = objects
             .par_iter()
-            .map(|(object, _unit_idx)| {
+            .map(|(object, unit_idx)| {
+                let gbe_diff_config = build_unit_diff_config(
+                    &base_diff_config,
+                    project.options.as_ref(),
+                    project_units.get(*unit_idx).and_then(ProjectObject::options),
+                    &args.config,
+                )?;
                 let target = object.target_path.as_ref().and_then(|p| {
                     obj::read::read(p.as_ref(), &gbe_diff_config, diff::DiffSide::Target).ok()
                 });
                 let base = object.base_path.as_ref().and_then(|p| {
                     obj::read::read(p.as_ref(), &gbe_diff_config, diff::DiffSide::Base).ok()
                 });
-                diff::UnitObjs { unit_name: object.name.clone(), target, base }
+                Ok(diff::UnitObjs { unit_name: object.name.clone(), target, base })
             })
-            .collect();
+            .collect::<Result<Vec<diff::UnitObjs>>>()?;
         let promotions = diff::reconcile_global_byte_matches(
             &mut units,
             &unit_objs,
@@ -656,6 +732,15 @@ fn load_va_oracle(path: &str) -> Result<diff::VaOracle> {
     Ok(map)
 }
 
+/// Layer diff options onto `base`, lowest precedence first:
+/// report base (`base`) → project `options` → unit `options` → `-c key=value`.
+///
+/// `base` is a fallback that a project overrides by opting in, never a policy. A
+/// project with no `options` block and no `-c` gets `base` back verbatim — that is the
+/// invariant that keeps every project's tracked match percentage stable.
+///
+/// Anything appearing here must also appear in [`ReportCache::hash_unit`], or the
+/// option gets silently dropped on a cache hit.
 fn build_unit_diff_config(
     base: &diff::DiffObjConfig,
     project_options: Option<&ProjectOptions>,
@@ -2416,5 +2501,168 @@ mod tests {
         assert!(!is_mangled_name("_foo")); // _foo alone is not mangled
         assert!(is_mangled_name("??"));
         assert!(is_mangled_name("_Z"));
+    }
+
+    // ── `report generate` diff-option layering.
+    //
+    // `report_base_diff_config` below is a copy of the literal in `generate`. It has
+    // to be, because `generate` takes a `GenerateArgs` and walks a project directory;
+    // the point of these tests is the layering, so they exercise
+    // `build_unit_diff_config` directly against the same four base values.
+
+    fn report_base_diff_config() -> diff::DiffObjConfig {
+        diff::DiffObjConfig {
+            function_reloc_diffs: diff::FunctionRelocDiffs::None,
+            combine_data_sections: true,
+            combine_text_sections: true,
+            ppc_calculate_pool_relocations: false,
+            ..Default::default()
+        }
+    }
+
+    fn options(pairs: &[(&str, &str)]) -> ProjectOptions {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), ProjectOptionValue::String(v.to_string())))
+            .collect()
+    }
+
+    fn bool_options(pairs: &[(&str, bool)]) -> ProjectOptions {
+        pairs.iter().map(|(k, v)| (k.to_string(), ProjectOptionValue::Bool(*v))).collect()
+    }
+
+    /// A project with no `options` block must score exactly as it always has: the four
+    /// report base values survive untouched. Every tracked match percentage in every
+    /// project depends on this.
+    #[test]
+    fn test_report_options_absent_leaves_base_config_untouched() {
+        let base = report_base_diff_config();
+        let config = build_unit_diff_config(&base, None, None, &[]).unwrap();
+        assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::None);
+        assert!(config.combine_data_sections);
+        assert!(config.combine_text_sections);
+        assert!(!config.ppc_calculate_pool_relocations);
+        // And an empty (but present) options block is the same as no options block.
+        let empty = ProjectOptions::new();
+        let config = build_unit_diff_config(&base, Some(&empty), Some(&empty), &[]).unwrap();
+        assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::None);
+        assert!(config.combine_data_sections);
+        assert!(config.combine_text_sections);
+        assert!(!config.ppc_calculate_pool_relocations);
+    }
+
+    /// `{"options": {"functionRelocDiffs": "name_only"}}` reaches the diff config, and
+    /// touches nothing else.
+    #[test]
+    fn test_report_project_options_function_reloc_diffs_name_only() {
+        let base = report_base_diff_config();
+        let project = options(&[("functionRelocDiffs", "name_only")]);
+        let config = build_unit_diff_config(&base, Some(&project), None, &[]).unwrap();
+        assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::NameOnly);
+        // Unrelated base values are not disturbed by opting into one option.
+        assert!(config.combine_data_sections);
+        assert!(config.combine_text_sections);
+        assert!(!config.ppc_calculate_pool_relocations);
+    }
+
+    /// All four of the report's non-default base values are overridable from the
+    /// project file, not just `functionRelocDiffs`.
+    #[test]
+    fn test_report_project_options_can_override_all_four_base_values() {
+        let base = report_base_diff_config();
+        let mut project = options(&[("functionRelocDiffs", "all")]);
+        project.extend(bool_options(&[
+            ("combineDataSections", false),
+            ("combineTextSections", false),
+            ("ppc.calculatePoolRelocations", true),
+        ]));
+        let config = build_unit_diff_config(&base, Some(&project), None, &[]).unwrap();
+        assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::All);
+        assert!(!config.combine_data_sections);
+        assert!(!config.combine_text_sections);
+        assert!(config.ppc_calculate_pool_relocations);
+    }
+
+    /// Per-unit options win over project options; `-c` wins over both.
+    #[test]
+    fn test_report_options_layer_unit_over_project_and_cli_over_all() {
+        let base = report_base_diff_config();
+        let project = options(&[("functionRelocDiffs", "name_address")]);
+        let unit = options(&[("functionRelocDiffs", "name_only")]);
+        let config = build_unit_diff_config(&base, Some(&project), Some(&unit), &[]).unwrap();
+        assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::NameOnly);
+        let config = build_unit_diff_config(
+            &base,
+            Some(&project),
+            Some(&unit),
+            &["functionRelocDiffs=name_check".to_string()],
+        )
+        .unwrap();
+        assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::NameCheck);
+    }
+
+    #[test]
+    fn test_report_invalid_project_option_is_an_error() {
+        let base = report_base_diff_config();
+        let bad_key = options(&[("notAProperty", "name_only")]);
+        assert!(build_unit_diff_config(&base, Some(&bad_key), None, &[]).is_err());
+        let bad_value = options(&[("functionRelocDiffs", "sideways")]);
+        assert!(build_unit_diff_config(&base, Some(&bad_value), None, &[]).is_err());
+    }
+
+    // ── Report cache key.
+    //
+    // The options blocks feed the effective diff config, so they must feed the cache
+    // key too — otherwise adding `options` to objdiff.json is silently a no-op for as
+    // long as the previous `.cache` file survives. That was the actual bug: the
+    // layering above already existed and worked, but a second run over the same output
+    // path served the pre-option units back out of cache.
+
+    #[test]
+    fn test_hash_unit_key_unchanged_when_no_options_are_set() {
+        let object = ObjectConfig::default();
+        let empty = ProjectOptions::new();
+        let none = ReportCache::hash_unit(&object, &[], None, None);
+        // Present-but-empty must not invalidate either.
+        assert_eq!(none, ReportCache::hash_unit(&object, &[], Some(&empty), Some(&empty)));
+        // This is the literal key material the pre-fix hash_unit built, so existing
+        // caches for projects that set no options stay valid.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&ReportCache::CACHE_LOGIC_VERSION.to_le_bytes());
+        expected.push(0xFF);
+        assert_eq!(none, xxhash_rust::xxh3::xxh3_64(&expected));
+    }
+
+    #[test]
+    fn test_hash_unit_key_changes_when_options_are_set() {
+        let object = ObjectConfig::default();
+        let baseline = ReportCache::hash_unit(&object, &[], None, None);
+        let opts = options(&[("functionRelocDiffs", "name_only")]);
+        let with_project = ReportCache::hash_unit(&object, &[], Some(&opts), None);
+        let with_unit = ReportCache::hash_unit(&object, &[], None, Some(&opts));
+        assert_ne!(baseline, with_project, "project options must be in the cache key");
+        assert_ne!(baseline, with_unit, "unit options must be in the cache key");
+        // Project-level and unit-level are distinct scopes and must not alias.
+        assert_ne!(with_project, with_unit);
+        // Nor may an option alias the equivalent `-c` arg, which layers later.
+        assert_ne!(
+            with_project,
+            ReportCache::hash_unit(&object, &["functionRelocDiffs=name_only".to_string()], None, None)
+        );
+        // Different values give different keys; equal values give equal keys.
+        let other = options(&[("functionRelocDiffs", "name_check")]);
+        assert_ne!(with_project, ReportCache::hash_unit(&object, &[], Some(&other), None));
+        assert_eq!(with_project, ReportCache::hash_unit(&object, &[], Some(&opts.clone()), None));
+    }
+
+    #[test]
+    fn test_hash_unit_key_distinguishes_bool_option_values() {
+        let object = ObjectConfig::default();
+        let on = bool_options(&[("combineTextSections", true)]);
+        let off = bool_options(&[("combineTextSections", false)]);
+        assert_ne!(
+            ReportCache::hash_unit(&object, &[], Some(&on), None),
+            ReportCache::hash_unit(&object, &[], Some(&off), None)
+        );
     }
 }
