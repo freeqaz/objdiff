@@ -2531,6 +2531,9 @@ mod tests {
         pairs.iter().map(|(k, v)| (k.to_string(), ProjectOptionValue::Bool(*v))).collect()
     }
 
+    /// `-c key=value` args, as `generate` receives them.
+    fn cli_args(args: &[&str]) -> Vec<String> { args.iter().map(|s| s.to_string()).collect() }
+
     /// A project with no `options` block must score exactly as it always has: the four
     /// report base values survive untouched. Every tracked match percentage in every
     /// project depends on this.
@@ -2591,13 +2594,8 @@ mod tests {
         let unit = options(&[("functionRelocDiffs", "name_only")]);
         let config = build_unit_diff_config(&base, Some(&project), Some(&unit), &[]).unwrap();
         assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::NameOnly);
-        let config = build_unit_diff_config(
-            &base,
-            Some(&project),
-            Some(&unit),
-            &["functionRelocDiffs=name_check".to_string()],
-        )
-        .unwrap();
+        let cli = cli_args(&["functionRelocDiffs=name_check"]);
+        let config = build_unit_diff_config(&base, Some(&project), Some(&unit), &cli).unwrap();
         assert_eq!(config.function_reloc_diffs, diff::FunctionRelocDiffs::NameCheck);
     }
 
@@ -2645,10 +2643,8 @@ mod tests {
         // Project-level and unit-level are distinct scopes and must not alias.
         assert_ne!(with_project, with_unit);
         // Nor may an option alias the equivalent `-c` arg, which layers later.
-        assert_ne!(
-            with_project,
-            ReportCache::hash_unit(&object, &["functionRelocDiffs=name_only".to_string()], None, None)
-        );
+        let cli = cli_args(&["functionRelocDiffs=name_only"]);
+        assert_ne!(with_project, ReportCache::hash_unit(&object, &cli, None, None));
         // Different values give different keys; equal values give equal keys.
         let other = options(&[("functionRelocDiffs", "name_check")]);
         assert_ne!(with_project, ReportCache::hash_unit(&object, &[], Some(&other), None));
