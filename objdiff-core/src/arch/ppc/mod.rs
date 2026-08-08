@@ -830,20 +830,35 @@ fn make_fake_pool_reloc(
     let target_address = pool_reloc.symbol.address.checked_add_signed(offset_from_pool)?;
     let target_symbol;
     let addend;
-    if let Some(section_index) = pool_reloc.symbol.section {
-        // Find the exact data symbol within the pool being accessed here based on the address.
-        target_symbol = symbols.iter().position(|s| {
+    if let Some(section_index) = pool_reloc.symbol.section
+        && let Some(exact_symbol) = symbols.iter().position(|s| {
             s.section == Some(section_index)
                 && s.size > 0
                 && !s.flags.contains(SymbolFlag::Hidden)
                 && !s.flags.contains(SymbolFlag::Ignored)
                 && s.kind != SymbolKind::Section
                 && (s.address..s.address + s.size).contains(&target_address)
-        })?;
+        })
+    {
+        // Find the exact data symbol within the pool being accessed here based on the address.
+        target_symbol = exact_symbol;
         addend = target_address.checked_sub(symbols[target_symbol].address)? as i64;
     } else {
-        // If the target symbol is in a different object (extern), we simply copy the pool
-        // relocation's target. This is because it's not possible to locate the actual symbol if
+        // Fallback: either the pool symbol is EXTERN (no section), or it is defined here but the
+        // computed address does not land inside any sized symbol of that section -- e.g. a loop
+        // pointer that has been incremented past the end of a short string literal. In both cases
+        // we simply copy the pool relocation's target and carry the offset as an addend.
+        //
+        // The "defined but out of range" half of that used to `return None`, which made the
+        // annotation depend on whether the referenced symbol happened to be DEFINED in this
+        // translation unit: a target object where the string is an undefined extern got the
+        // annotation, our object that defines the same string in a COMDAT `.rdata` did not, and
+        // two byte-identical functions diffed as unequal. See `reloc_eq`: a relocation present on
+        // one side and absent on the other is charged under every `functionRelocDiffs` mode except
+        // `None`. Falling back keeps the annotation a pure function of (pool relocation target,
+        // offset), so the exact-symbol lookup can only REFINE the name, never suppress it.
+        //
+        // For the extern case specifically: it's not possible to locate the actual symbol if
         // it's extern. And doing that for external symbols would also be unnecessary, because when
         // the compiler generates an instruction that accesses an external "pool" plus some offset,
         // that won't be a normal pool that contains other symbols within it that we want to
