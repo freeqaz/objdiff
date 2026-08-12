@@ -979,8 +979,71 @@ fn counter_named_data_eq(
         return false;
     }
     match (
-        counter_named_content(left_obj, left_reloc),
-        counter_named_content(right_obj, right_reloc),
+        counter_named_content(left_obj, left_reloc.relocation.target_symbol as usize),
+        counter_named_content(right_obj, right_reloc.relocation.target_symbol as usize),
+    ) {
+        (Some(l), Some(r)) => content_eq(&l, &r),
+        // Unreadable on one or both sides: unverifiable, so not charged.
+        _ => true,
+    }
+}
+
+/// NameCheck: the MIXED counter/anchor shape, verified by CONTENT.
+///
+/// [`counter_named_data_eq`] handles counter-vs-counter and
+/// [`resolve_pool_anchor`] handles anchor-vs-anchor, but the two producers do
+/// not have to agree on which spelling to use for the same datum: a datum that
+/// sits at offset 0 of `.data`/`.bss` has BOTH a counter name and the section
+/// anchor sitting on it, and retail's dtk-split object relocates against the
+/// counter (`@13392`) where ours relocates against the anchor (`...bss.0`).
+/// Measured on rb3, that mixed shape was 146 charges over 72 functions — half
+/// the whole `name_check` residual — and no source edit can reach any of it.
+///
+/// So compose the two tolerances: the caller has already resolved whichever
+/// side is an anchor to the sized symbol its addend lands in, and this compares
+/// the CONTENT of the two resolved referents whenever both of their names are
+/// per-TU counters and therefore carry no identity.
+///
+/// The guards are the ones the rest of NameCheck keeps: a counter-named
+/// FUNCTION is never credited against a counter-named datum, the code/data
+/// section guard still applies, and content that cannot be read on either side
+/// is UNVERIFIABLE rather than wrong (see [`counter_named_data_eq`]).
+///
+/// Measured on rb3: 146 exposed functions -> 75, +71 complete at `name_check`
+/// and none lost, with the `none` ruler byte-identical. The four charges of
+/// this shape that SURVIVE are the check doing its job — `NANDInit` and
+/// `ReportOSInfo` reach an SDK banner string whose build date genuinely differs
+/// (`Dec 11 2009 15:59:08` against `Dec 11 2007 01:35:48`), which is a real
+/// difference in what is referenced and not a spelling of it.
+fn counter_named_referents_eq(
+    left_obj: &Object,
+    right_obj: &Object,
+    left_index: usize,
+    right_index: usize,
+) -> bool {
+    let (Some(left_symbol), Some(right_symbol)) =
+        (left_obj.symbols.get(left_index), right_obj.symbols.get(right_index))
+    else {
+        return false;
+    };
+    if !is_counter_suffixed_name(&left_symbol.name)
+        || !is_counter_suffixed_name(&right_symbol.name)
+    {
+        return false;
+    }
+    if left_symbol.kind == SymbolKind::Function || right_symbol.kind == SymbolKind::Function {
+        return false;
+    }
+    let (Some(left_section), Some(right_section)) = (left_symbol.section, right_symbol.section)
+    else {
+        return false;
+    };
+    if !section_name_eq_comdat(left_obj, right_obj, left_section, right_section) {
+        return false;
+    }
+    match (
+        counter_named_content(left_obj, left_index),
+        counter_named_content(right_obj, right_index),
     ) {
         (Some(l), Some(r)) => content_eq(&l, &r),
         // Unreadable on one or both sides: unverifiable, so not charged.
@@ -995,11 +1058,7 @@ enum CounterContent<'a> {
     Bytes(&'a [u8]),
 }
 
-fn counter_named_content<'a>(
-    obj: &'a Object,
-    reloc: &ResolvedRelocation,
-) -> Option<CounterContent<'a>> {
-    let index = reloc.relocation.target_symbol as usize;
+fn counter_named_content(obj: &Object, index: usize) -> Option<CounterContent<'_>> {
     let symbol = obj.symbols.get(index)?;
     if symbol.size == 0 {
         return None;
@@ -1033,8 +1092,10 @@ fn content_eq(left: &CounterContent, right: &CounterContent) -> bool {
 enum PoolAnchor<'a> {
     /// Not an anchor; use the relocation's own symbol name.
     No,
-    /// An anchor, and the datum at `anchor + addend` was found.
-    Resolved(&'a str),
+    /// An anchor, and the datum at `anchor + addend` was found: its name, and
+    /// its symbol index (which is what [`counter_named_referents_eq`] reads the
+    /// datum's CONTENT through when the name turns out to be a counter).
+    Resolved(&'a str, usize),
     /// An anchor whose addend lands in no sized symbol: unverifiable.
     Unresolved,
 }
@@ -1056,13 +1117,13 @@ fn resolve_pool_anchor<'a>(obj: &'a Object, reloc: &ResolvedRelocation) -> PoolA
     let Some(address) = reloc.symbol.address.checked_add_signed(reloc.relocation.addend) else {
         return PoolAnchor::Unresolved;
     };
-    match obj.symbols.iter().find(|s| {
+    match obj.symbols.iter().position(|s| {
         s.section == Some(section_index)
             && s.size > 0
             && s.kind != SymbolKind::Section
             && (s.address..s.address + s.size).contains(&address)
     }) {
-        Some(symbol) => PoolAnchor::Resolved(symbol.name.as_str()),
+        Some(index) => PoolAnchor::Resolved(obj.symbols[index].name.as_str(), index),
         None => PoolAnchor::Unresolved,
     }
 }
@@ -1159,15 +1220,30 @@ fn reloc_eq(
         (PoolAnchor::No, PoolAnchor::No) => {}
         (PoolAnchor::Unresolved, _) | (_, PoolAnchor::Unresolved) => return true,
         _ => {
-            let left_name = match left_anchor {
-                PoolAnchor::Resolved(name) => name,
-                _ => left_reloc.symbol.name.as_str(),
+            let (left_name, left_index) = match left_anchor {
+                PoolAnchor::Resolved(name, index) => (name, index),
+                _ => (
+                    left_reloc.symbol.name.as_str(),
+                    left_reloc.relocation.target_symbol as usize,
+                ),
             };
-            let right_name = match right_anchor {
-                PoolAnchor::Resolved(name) => name,
-                _ => right_reloc.symbol.name.as_str(),
+            let (right_name, right_index) = match right_anchor {
+                PoolAnchor::Resolved(name, index) => (name, index),
+                _ => (
+                    right_reloc.symbol.name.as_str(),
+                    right_reloc.relocation.target_symbol as usize,
+                ),
             };
             if left_name == right_name {
+                return true;
+            }
+            // NameCheck: MIXED counter/anchor, verified by CONTENT.
+            //
+            // One side names the datum with its per-TU counter, the other
+            // reaches the very same datum through the section anchor. Both
+            // names are now counters (the anchor has been resolved above), so
+            // neither carries identity and the bytes answer the question.
+            if counter_named_referents_eq(left_obj, right_obj, left_index, right_index) {
                 return true;
             }
             #[cfg(feature = "std")]
@@ -2124,6 +2200,56 @@ mod tests {
         // restores the check, it does not remove it.
         let right = obj_with_pool_anchor("...data.0", 0x20, "sOtherThing", 0x20, 4);
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    /// Write `bytes` at `at` into the data section of an object built by
+    /// `obj_with_pool_anchor`, so a content comparison has something to
+    /// disagree about (the helper's section is otherwise all zeros).
+    #[cfg(feature = "std")]
+    fn write_datum(obj: &mut Object, at: u64, bytes: &[u8]) {
+        let data = &mut obj.sections[1].data.0;
+        data[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_mixed_counter_and_anchor_compares_content() {
+        // The MIXED shape: a datum at offset 0 of `.data`/`.bss` carries BOTH a
+        // counter name and the section anchor, and the two producers disagree
+        // about which to relocate against. Retail names `@145`, we name
+        // `...data.0` + addend. 146 charges over 72 functions on rb3.
+        let left = obj_with_data_reloc("@145", b"json\0", SectionKind::Data, 0);
+        let mut right = obj_with_pool_anchor("...data.0", 0x20, "@375", 0x20, 5);
+        write_datum(&mut right, 0x20, b"json\0");
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // Symmetric: the anchor may be on either side.
+        assert!(reloc_match(&right, &left, FunctionRelocDiffs::NameCheck));
+        // NameOnly has no content check, so it still charges the pair.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+
+        // DIFFERENT content behind the two counters is still charged: resolving
+        // the anchor restores the check, it does not remove it.
+        let mut right = obj_with_pool_anchor("...data.0", 0x20, "@375", 0x20, 5);
+        write_datum(&mut right, 0x20, b"xml\0\0");
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+
+        // The anchor resolving to a REAL name is not a counter pair at all, so
+        // the name check stands and the disagreement is charged.
+        let right = obj_with_pool_anchor("...data.0", 0x20, "json_null_str", 0x20, 5);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_mixed_counter_never_crosses_code_and_data() {
+        // A counter-named FUNCTION against a counter-named DATUM whose bytes
+        // happen to agree (both four zero bytes). Content equality must not be
+        // allowed to credit a call against a data reference: the code/data
+        // guard outranks it.
+        let left = obj_with_reloc_in_section("@13392", 0, ".text");
+        let right = obj_with_pool_anchor("...data.0", 0x20, "@375", 0x20, 4);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        assert!(!reloc_match(&right, &left, FunctionRelocDiffs::NameCheck));
     }
 
     #[cfg(feature = "std")]
