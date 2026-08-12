@@ -35,37 +35,18 @@ use crate::{
     util::output::{OutputFormat, write_output},
 };
 
-/// xxHash3-64 (hex) of the running objdiff-cli executable, computed once.
+/// The identity of the objdiff-cli binary doing the diffing, in the report-cache
+/// key and in the report's provenance. See [`crate::build_id`] for why the hash
+/// of the executable and not the version or the git commit, and for the two
+/// 2026-08-12 measurements that were taken without it.
 ///
-/// This is the build identity that cannot lie. `CARGO_PKG_VERSION` is shared by
-/// hundreds of semantically different builds; the git stamp from `build.rs` can
-/// lag an unstaged edit (see that file). The bytes of the executable cannot: two
-/// runs with the same hash ran the same code, and two runs with different hashes
-/// did not, whatever either one claims about its version.
-///
-/// It is in the report-cache key precisely because of that. Before 2026-08-12
-/// the key was the obj bytes plus the config, guarded by a hand-maintained
-/// `CACHE_LOGIC_VERSION` counter that an author had to remember to bump when
-/// diff semantics changed. On 2026-08-12 an author did not (objdiff 4c38c31 and
-/// f2424d6 changed `FunctionRelocDiffs::NameCheck` in objdiff-core and never
-/// touched this file), and an A/B of the two builds sharing one output path
-/// reported a delta of zero in all six project x ruler cells. The real delta was
-/// +71 complete functions. A counter that must be maintained by hand is not a
-/// cache key; the binary is.
-///
-/// Cost: one read of ~12 MB from page cache plus xxh3, ~2 ms, once per process --
-/// against a report that takes tens of seconds. `None` if the executable cannot
-/// be located or read, which disables the cache entirely rather than falling
-/// back to an unkeyed one.
-fn tool_binary_hash() -> Option<&'static str> {
-    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| {
-        let exe = std::env::current_exe().ok()?;
-        let data = std::fs::read(exe).ok()?;
-        Some(format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&data)))
-    })
-    .as_deref()
-}
+/// It also replaces the hand-maintained `CACHE_LOGIC_VERSION` counter this file
+/// used to carry, which asked an author changing diff semantics anywhere in
+/// objdiff-core to remember to bump a constant in objdiff-cli. Bumped three
+/// times, missed at least once (4c38c31 / f2424d6 changed
+/// `FunctionRelocDiffs::NameCheck` and never opened this file), and that miss is
+/// the +71 complete functions an A/B measured as zero.
+fn tool_binary_hash() -> Option<&'static str> { crate::build_id::binary_hash() }
 
 /// Render an effective [`diff::DiffObjConfig`] as canonically-ordered
 /// `key=value` lines: the ruler, spelled out.
@@ -800,7 +781,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let provenance = ReportProvenance {
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         tool_binary_hash: tool_binary_hash.unwrap_or_default().to_string(),
-        tool_commit: env!("OBJDIFF_GIT_COMMIT").to_string(),
+        tool_commit: crate::build_id::commit().to_string(),
         diff_config: render_diff_config(&build_unit_diff_config(
             &base_diff_config,
             project.options.as_ref(),

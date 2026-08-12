@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod argp_version;
+mod build_id;
 mod cmd;
 mod util;
 mod views;
