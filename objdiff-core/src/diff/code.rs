@@ -14,7 +14,7 @@ use super::{
 };
 use crate::obj::{
     InstructionArg, InstructionArgValue, InstructionRef, Object, ParsedInstruction,
-    ResolvedInstructionRef, ResolvedRelocation, ResolvedSymbol, SymbolKind,
+    ResolvedInstructionRef, ResolvedRelocation, ResolvedSymbol, Section, SectionKind, SymbolKind,
 };
 
 pub fn no_diff_code(
@@ -809,15 +809,37 @@ fn section_base_name(name: &str) -> &str {
     }
 }
 
-/// COMDAT-tolerant section-name comparison used by NameOnly reloc matching.
+/// True when a section holds executable code. Keyed on the reader-supplied
+/// [`SectionKind`], with a name fallback for readers that leave the kind
+/// unknown.
+fn is_code_section(section: &Section) -> bool {
+    section.kind == SectionKind::Code || section_base_name(&section.name) == ".text"
+}
+
+/// COMDAT-tolerant section comparison used by NameOnly/NameCheck reloc matching.
 ///
-/// Like [`section_name_eq`] but compares the COMDAT-group base name (see
-/// [`section_base_name`]) rather than the full section name, so a DEFINED symbol
-/// that the compiler parked in `.text` in one object and `.text$dup` in another
-/// is treated as living in the same logical section. This is only ever paired
-/// with an exact-symbol-name guard (`names_match`), so it cannot credit two
-/// genuinely different callees; it only stops a benign COMDAT-bucket difference
-/// from masking a real, name-verified match.
+/// Like [`section_name_eq`] but tolerant of the two ways the same symbol legally
+/// lands in a differently-named section across two producers of the same object:
+///
+/// 1. **COMDAT bucket.** MSVC parks a DEFINED COMDAT symbol into a `$`-suffixed
+///    bucket of its logical section (`.text$mn`, `.text$dup`, `.rdata$r`, …), so
+///    the very same symbol is in `.text` in one object and `.text$dup` in
+///    another. Compare the base name (see [`section_base_name`]).
+///
+/// 2. **Data placement.** WHICH data section a datum lands in is a producer
+///    choice, not a property of the referent: a compiler puts a zero-initialised
+///    static in `.bss` while a splitter that reconstructs the object from a
+///    linked image emits every writable datum into `.data$dup`, and throw-info
+///    records show up as `.rdata$dup` against `.xdata$x`. Same mangled name, same
+///    datum, different emitter. Charging that difference reports a defect that no
+///    source edit can reach — measured on dc3, it was 1,831 of 1,834 such
+///    charges and it exposed 1,024 functions that have no other disagreement.
+///    So two NON-CODE sections are treated as the same logical section.
+///
+/// The code/data split is still enforced, which is all the guard was ever for:
+/// it exists to stop a name coincidence across genuinely different logical
+/// sections. This is only ever paired with an exact-symbol-name guard
+/// (`names_match`), so it cannot credit two genuinely different callees.
 pub(crate) fn section_name_eq_comdat(
     left_obj: &Object,
     right_obj: &Object,
@@ -827,6 +849,7 @@ pub(crate) fn section_name_eq_comdat(
     left_obj.sections.get(left_section_index).is_some_and(|left_section| {
         right_obj.sections.get(right_section_index).is_some_and(|right_section| {
             section_base_name(&left_section.name) == section_base_name(&right_section.name)
+                || (!is_code_section(left_section) && !is_code_section(right_section))
         })
     })
 }
@@ -1562,13 +1585,20 @@ mod tests {
             }],
             ..Default::default()
         });
-        // section 1: the COMDAT bucket the target definition lives in.
+        // section 1: the COMDAT bucket the target definition lives in. The kind
+        // follows the NAME, the way a real reader reports it, so a `.data`/`.bss`
+        // section in a test is genuinely non-code and the code/data guard is
+        // exercised rather than bypassed.
         obj.sections.push(Section {
             id: format!("{target_section}-0"),
             name: target_section.to_string(),
             address: 0,
             size: 4,
-            kind: SectionKind::Code,
+            kind: match section_base_name(target_section) {
+                ".text" => SectionKind::Code,
+                ".bss" => SectionKind::Bss,
+                _ => SectionKind::Data,
+            },
             data: SectionData(vec![0u8; 4]),
             ..Default::default()
         });
@@ -1876,6 +1906,47 @@ mod tests {
         let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
         let right = obj_with_reloc_in_section("Callee", 0x100, ".text");
         assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_data_placement() {
+        // The dc3 case: a splitter emits every writable datum into `.data$dup`
+        // while the compiler leaves a zero-initialised static in `.bss`. Same
+        // mangled name, same datum -- WHICH data section it lands in is a
+        // property of the emitter, not of the referent.
+        let left = obj_with_reloc_in_section("?gCache@@3PAVFileCache@@A", 0x100, ".data$dup");
+        let right = obj_with_reloc_in_section("?gCache@@3PAVFileCache@@A", 0x100, ".bss");
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // Throw-info records: `.rdata$dup` against `.xdata$x`.
+        let left = obj_with_reloc_in_section("_TI4?AVlength_error@@", 0x100, ".rdata$dup");
+        let right = obj_with_reloc_in_section("_TI4?AVlength_error@@", 0x100, ".xdata$x");
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // Const-vs-mutable placement of the same datum.
+        let left = obj_with_reloc_in_section("sDepthRectDecl", 0x100, ".data$dup");
+        let right = obj_with_reloc_in_section("sDepthRectDecl", 0x100, ".rdata");
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_data_placement_tolerance_is_still_name_gated() {
+        // Two DIFFERENT data symbols in two different data sections stay a
+        // mismatch: placement tolerance never substitutes for the name check.
+        let left = obj_with_reloc_in_section("?gStream@@3PAVBinStream@@A", 0x100, ".data$dup");
+        let right = obj_with_reloc_in_section("?gBinStream@@3PAVBinStream@@A", 0x100, ".bss");
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_code_vs_data_still_diffs() {
+        // The guard the tolerance must NOT dissolve: one side names a function,
+        // the other a datum that happens to share the name.
+        let left = obj_with_reloc_in_section("Callee", 0x100, ".text$dup");
+        let right = obj_with_reloc_in_section("Callee", 0x100, ".data");
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
     }
 
     #[test]
