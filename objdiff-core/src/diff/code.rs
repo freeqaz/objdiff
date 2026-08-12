@@ -1008,6 +1008,13 @@ fn counter_named_data_eq(
 /// FUNCTION is never credited against a counter-named datum, the code/data
 /// section guard still applies, and content that cannot be read on either side
 /// is UNVERIFIABLE rather than wrong (see [`counter_named_data_eq`]).
+///
+/// Measured on rb3: 146 exposed functions -> 75, +71 complete at `name_check`
+/// and none lost, with the `none` ruler byte-identical. The four charges of
+/// this shape that SURVIVE are the check doing its job — `NANDInit` and
+/// `ReportOSInfo` reach an SDK banner string whose build date genuinely differs
+/// (`Dec 11 2009 15:59:08` against `Dec 11 2007 01:35:48`), which is a real
+/// difference in what is referenced and not a spelling of it.
 fn counter_named_referents_eq(
     left_obj: &Object,
     right_obj: &Object,
