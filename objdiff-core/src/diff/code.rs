@@ -923,6 +923,150 @@ fn is_placeholder_symbol_name(name: &str) -> bool {
     })
 }
 
+/// True for a compiler-generated name whose numeric suffix is a per-TU
+/// compilation counter rather than an identity. Metrowerks (mwcc) spells these
+/// `__FUNCTION__$12505`, `__PRETTY_FUNCTION__$27320`, `s_seed$34`, and numbers
+/// its anonymous literal-pool entries `@23858`. Recompiling the same source
+/// renumbers them, so the NAME carries no information — but unlike MSVC's `$L`
+/// code labels these name DATA, so the bytes they point at can be compared
+/// instead. See `counter_named_data_eq`.
+fn is_counter_suffixed_name(name: &str) -> bool {
+    // `@<digits>`: mwcc's anonymous literal pool.
+    if let Some(rest) = name.strip_prefix('@') {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    // `<identifier>$<digits>`: a named datum plus the TU counter that
+    // disambiguates it. Require a non-empty identifier so a bare `$12` (which
+    // `is_compiler_local_label` already owns) does not land here.
+    match name.rsplit_once('$') {
+        Some((head, digits)) => {
+            !head.is_empty()
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && !head.contains('$')
+        }
+        None => false,
+    }
+}
+
+/// NameCheck: both sides name a counter-suffixed datum (see
+/// [`is_counter_suffixed_name`]) AND the two data are byte-identical.
+///
+/// This is a CONTENT check standing in for a name check that cannot work. The
+/// number in `__FUNCTION__$12505` is a compilation-order counter, so comparing
+/// it charges every string literal in a matching function; comparing the string
+/// itself answers the question the name check was asking — is this the same
+/// literal — and answers it more strongly than a name ever could.
+///
+/// Where the content cannot be read the site is UNVERIFIABLE, not wrong, and is
+/// treated the same way NameCheck already treats a missing left relocation or a
+/// placeholder left name: matched. A dtk-split target routinely carries a
+/// truncated `.rodata` whose bytes for a given offset are simply not in the
+/// object, and a `.bss` datum has no bytes anywhere by definition. Neither is
+/// evidence of a different referent, and both sides' names are counters, so
+/// there is nothing left to check.
+fn counter_named_data_eq(
+    left_obj: &Object,
+    right_obj: &Object,
+    left_reloc: &ResolvedRelocation,
+    right_reloc: &ResolvedRelocation,
+) -> bool {
+    if !is_counter_suffixed_name(&left_reloc.symbol.name)
+        || !is_counter_suffixed_name(&right_reloc.symbol.name)
+    {
+        return false;
+    }
+    match (
+        counter_named_content(left_obj, left_reloc),
+        counter_named_content(right_obj, right_reloc),
+    ) {
+        (Some(l), Some(r)) => content_eq(&l, &r),
+        // Unreadable on one or both sides: unverifiable, so not charged.
+        _ => true,
+    }
+}
+
+/// What a counter-named datum holds, for [`counter_named_data_eq`].
+enum CounterContent<'a> {
+    /// A `.bss`/NOBITS datum: `size` bytes of zero, stored nowhere.
+    Zeroed(u64),
+    Bytes(&'a [u8]),
+}
+
+fn counter_named_content<'a>(
+    obj: &'a Object,
+    reloc: &ResolvedRelocation,
+) -> Option<CounterContent<'a>> {
+    let index = reloc.relocation.target_symbol as usize;
+    let symbol = obj.symbols.get(index)?;
+    if symbol.size == 0 {
+        return None;
+    }
+    let section = obj.sections.get(symbol.section?)?;
+    if section.kind == SectionKind::Bss {
+        return Some(CounterContent::Zeroed(symbol.size));
+    }
+    obj.symbol_data(index).map(CounterContent::Bytes)
+}
+
+fn content_eq(left: &CounterContent, right: &CounterContent) -> bool {
+    match (left, right) {
+        (CounterContent::Zeroed(l), CounterContent::Zeroed(r)) => l == r,
+        // One side stores its zeros, the other does not. Same value.
+        (CounterContent::Zeroed(n), CounterContent::Bytes(b))
+        | (CounterContent::Bytes(b), CounterContent::Zeroed(n)) => {
+            b.len() as u64 == *n && b.iter().all(|&byte| byte == 0)
+        }
+        (CounterContent::Bytes(l), CounterContent::Bytes(r)) => l == r,
+    }
+}
+
+/// What a relocation against a zero-sized section/pool ANCHOR actually reaches.
+///
+/// mwcc's small-data addressing relocates against a section anchor and gets to
+/// the datum with an addend; dtk names those anchors `...data.0` / `...bss.0`,
+/// and a dtk-split object names them `_f_data` / `_f_bss`. The anchor names a
+/// SECTION, so comparing anchor spellings answers nothing — but the addend says
+/// which datum, so the real referent can be recovered and compared instead.
+enum PoolAnchor<'a> {
+    /// Not an anchor; use the relocation's own symbol name.
+    No,
+    /// An anchor, and the datum at `anchor + addend` was found.
+    Resolved(&'a str),
+    /// An anchor whose addend lands in no sized symbol: unverifiable.
+    Unresolved,
+}
+
+fn resolve_pool_anchor<'a>(obj: &'a Object, reloc: &ResolvedRelocation) -> PoolAnchor<'a> {
+    if reloc.symbol.size != 0 || reloc.symbol.kind == SymbolKind::Function {
+        return PoolAnchor::No;
+    }
+    let Some(section_index) = reloc.symbol.section else {
+        // Undefined extern, not an anchor: its name is the referent.
+        return PoolAnchor::No;
+    };
+    let Some(section) = obj.sections.get(section_index) else {
+        return PoolAnchor::No;
+    };
+    if is_code_section(section) {
+        return PoolAnchor::No;
+    }
+    let Some(address) = reloc.symbol.address.checked_add_signed(reloc.relocation.addend) else {
+        return PoolAnchor::Unresolved;
+    };
+    match obj.symbols.iter().find(|s| {
+        s.section == Some(section_index)
+            && s.size > 0
+            && s.kind != SymbolKind::Section
+            && (s.address..s.address + s.size).contains(&address)
+    }) {
+        Some(symbol) => PoolAnchor::Resolved(symbol.name.as_str()),
+        None => PoolAnchor::Unresolved,
+    }
+}
+
 /// True for MSVC compiler-internal local labels: `$L18077` (block / jump-table
 /// labels), `$T18082` (SEH scope-table records), `$SG...` etc. The numeric
 /// suffix is a compilation-order counter, NOT a stable identity — the same
@@ -986,6 +1130,54 @@ fn reloc_eq(
             || is_compiler_local_label(&left_reloc.symbol.name))
     {
         return true;
+    }
+
+    // NameCheck: COUNTER-SUFFIXED LITERAL, verified by CONTENT.
+    //
+    // mwcc numbers `__FUNCTION__$<n>` and its anonymous literal pool `@<n>` with
+    // a per-TU counter, so the names disagree whenever anything earlier in the
+    // file moved -- on rb3 that alone accounted for 2,279 of 2,518 exposed
+    // functions. The name is unusable, but the DATA is right there, so compare
+    // that instead. Absent data on either side is not evidence and is charged.
+    if name_check && counter_named_data_eq(left_obj, right_obj, &left_reloc, &right_reloc) {
+        return true;
+    }
+
+    // NameCheck: SECTION/POOL ANCHOR, resolved through the addend.
+    //
+    // mwcc small-data addressing relocates against a zero-sized section anchor
+    // (`...data.0`, `...bss.0`; a dtk-split object spells them `_f_data`) and
+    // reaches the datum with an addend. Comparing anchor spellings measures
+    // nothing, and simply forgiving them would leave the site unchecked, so
+    // resolve each anchor to the sized symbol its addend lands in and compare
+    // THOSE. An anchor whose addend lands in no sized symbol is unverifiable.
+    let left_anchor =
+        if name_check { resolve_pool_anchor(left_obj, &left_reloc) } else { PoolAnchor::No };
+    let right_anchor =
+        if name_check { resolve_pool_anchor(right_obj, &right_reloc) } else { PoolAnchor::No };
+    match (&left_anchor, &right_anchor) {
+        (PoolAnchor::No, PoolAnchor::No) => {}
+        (PoolAnchor::Unresolved, _) | (_, PoolAnchor::Unresolved) => return true,
+        _ => {
+            let left_name = match left_anchor {
+                PoolAnchor::Resolved(name) => name,
+                _ => left_reloc.symbol.name.as_str(),
+            };
+            let right_name = match right_anchor {
+                PoolAnchor::Resolved(name) => name,
+                _ => right_reloc.symbol.name.as_str(),
+            };
+            if left_name == right_name {
+                return true;
+            }
+            #[cfg(feature = "std")]
+            if symbol_equivalences.get(left_name).is_some_and(|g| g.contains(right_name))
+                || symbol_equivalences.get(right_name).is_some_and(|g| g.contains(left_name))
+            {
+                return true;
+            }
+            return false;
+        }
     }
 
     // NameCheck: COFF WEAK-EXTERNAL ALIAS.
@@ -1749,6 +1941,199 @@ mod tests {
     #[cfg(feature = "std")]
     fn resolved_ref_no_reloc(obj: &Object) -> ResolvedInstructionRef<'_> {
         ResolvedInstructionRef { relocation: None, ..resolved_ref(obj) }
+    }
+
+    /// A caller in `.text` whose single relocation points at a DATA symbol named
+    /// `target_name`, holding `data`, in a section of kind `kind`. `Bss` sections
+    /// carry no bytes: the symbol's size comes from `data.len()` regardless, which
+    /// is how a NOBITS datum is described.
+    #[cfg(feature = "std")]
+    fn obj_with_data_reloc(
+        target_name: &str,
+        data: &[u8],
+        kind: SectionKind,
+        addend: i64,
+    ) -> Object {
+        let mut obj = Object::default();
+        obj.sections.push(Section {
+            id: "text".to_string(),
+            name: ".text".to_string(),
+            address: 0,
+            size: 4,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; 4]),
+            relocations: vec![Relocation {
+                flags: RelocationFlags::Coff(1),
+                address: 0,
+                target_symbol: 1,
+                addend,
+            }],
+            ..Default::default()
+        });
+        obj.sections.push(Section {
+            id: "data-0".to_string(),
+            name: if kind == SectionKind::Bss { ".bss" } else { ".data" }.to_string(),
+            address: 0,
+            size: data.len() as u64,
+            kind,
+            data: SectionData(if kind == SectionKind::Bss { Vec::new() } else { data.to_vec() }),
+            ..Default::default()
+        });
+        obj.symbols.push(Symbol {
+            name: "caller".to_string(),
+            address: 0,
+            size: 4,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        });
+        obj.symbols.push(Symbol {
+            name: target_name.to_string(),
+            address: 0,
+            size: data.len() as u64,
+            kind: SymbolKind::Object,
+            section: Some(1),
+            ..Default::default()
+        });
+        obj
+    }
+
+    /// A caller whose relocation points at a zero-sized section ANCHOR named
+    /// `anchor` with `addend`, in a `.data` section that also defines `datum` at
+    /// offset `datum_at` with `datum_size` bytes.
+    #[cfg(feature = "std")]
+    fn obj_with_pool_anchor(
+        anchor: &str,
+        addend: i64,
+        datum: &str,
+        datum_at: u64,
+        datum_size: u64,
+    ) -> Object {
+        let mut obj = Object::default();
+        obj.sections.push(Section {
+            id: "text".to_string(),
+            name: ".text".to_string(),
+            address: 0,
+            size: 4,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; 4]),
+            relocations: vec![Relocation {
+                flags: RelocationFlags::Coff(1),
+                address: 0,
+                target_symbol: 1,
+                addend,
+            }],
+            ..Default::default()
+        });
+        obj.sections.push(Section {
+            id: "data-0".to_string(),
+            name: ".data".to_string(),
+            address: 0,
+            size: 0x100,
+            kind: SectionKind::Data,
+            data: SectionData(vec![0u8; 0x100]),
+            ..Default::default()
+        });
+        obj.symbols.push(Symbol {
+            name: "caller".to_string(),
+            address: 0,
+            size: 4,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        });
+        // symbol 1: the zero-sized anchor at the start of the data section.
+        obj.symbols.push(Symbol {
+            name: anchor.to_string(),
+            address: 0,
+            size: 0,
+            kind: SymbolKind::Unknown,
+            section: Some(1),
+            ..Default::default()
+        });
+        obj.symbols.push(Symbol {
+            name: datum.to_string(),
+            address: datum_at,
+            size: datum_size,
+            kind: SymbolKind::Object,
+            section: Some(1),
+            ..Default::default()
+        });
+        obj
+    }
+
+    #[test]
+    fn test_is_counter_suffixed_name() {
+        assert!(is_counter_suffixed_name("__FUNCTION__$14031"));
+        assert!(is_counter_suffixed_name("__PRETTY_FUNCTION__$27320"));
+        assert!(is_counter_suffixed_name("s_seed$34"));
+        assert!(is_counter_suffixed_name("@23858"));
+        // Not counters: a bare `$`-label (owned by is_compiler_local_label), an
+        // `@`-prefixed name that is not all digits, a name with no suffix, and
+        // MSVC mangling, which is full of `$` but never ends in `$<digits>`.
+        assert!(!is_counter_suffixed_name("$L18077"));
+        assert!(!is_counter_suffixed_name("@LOCAL@random__Fl@s_seed"));
+        assert!(!is_counter_suffixed_name("gConsole"));
+        assert!(!is_counter_suffixed_name("?$S3@?4??FixClassName@DirLoader@@AAA@Z"));
+        assert!(!is_counter_suffixed_name("??_C@_06PFFNFMJI@XDEMOS?$AA@"));
+        assert!(!is_counter_suffixed_name("name$"));
+        assert!(!is_counter_suffixed_name("$12"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_counter_named_literal_compares_content() {
+        // Same string, renumbered by the per-TU counter: MATCH on content.
+        let left = obj_with_data_reloc("__FUNCTION__$14031", b"_M_inc\0", SectionKind::Data, 0);
+        let right = obj_with_data_reloc("__FUNCTION__$43813", b"_M_inc\0", SectionKind::Data, 0);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // NameOnly has no content check, so it still charges the renumbering.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+
+        // DIFFERENT strings behind counter names stay a mismatch. This is the
+        // half that makes the tolerance a check rather than a blanket pass.
+        let right = obj_with_data_reloc("__FUNCTION__$43813", b"_M_dec\0", SectionKind::Data, 0);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_counter_named_bss_compares_size() {
+        // `.bss` stores no bytes, so equal-sized zeroed data is equal data...
+        let left = obj_with_data_reloc("@5042", &[0u8; 12], SectionKind::Bss, 0);
+        let right = obj_with_data_reloc("@2566", &[0u8; 12], SectionKind::Bss, 0);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // ...and a differently-sized datum is not.
+        let right = obj_with_data_reloc("@2566", &[0u8; 8], SectionKind::Bss, 0);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // One side stores its zeros and the other does not: same value.
+        let right = obj_with_data_reloc("@2566", &[0u8; 12], SectionKind::Data, 0);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_pool_anchor_resolves_through_addend() {
+        // Our side reaches `sChinNum` through the section anchor `...bss.0` + 0x20;
+        // the target names it outright. Same datum.
+        let left = obj_with_reloc("sChinNum", 0);
+        let right = obj_with_pool_anchor("...data.0", 0x20, "sChinNum", 0x20, 4);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+
+        // A DIFFERENT datum at that offset is still charged: resolving the anchor
+        // restores the check, it does not remove it.
+        let right = obj_with_pool_anchor("...data.0", 0x20, "sOtherThing", 0x20, 4);
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_unresolvable_pool_anchor_is_unverifiable() {
+        // The addend lands in no sized symbol -- e.g. a pointer walked past the
+        // end of a literal. Nothing to compare, so nothing is charged.
+        let left = obj_with_reloc("sChinNum", 0);
+        let right = obj_with_pool_anchor("...data.0", 0x80, "sChinNum", 0x20, 4);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
     }
 
     #[cfg(feature = "std")]
