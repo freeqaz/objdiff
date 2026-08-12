@@ -1461,7 +1461,20 @@ fn arg_eq(
             InstructionArg::Value(r) => l.loose_eq(r),
             // If relocations are relaxed, match if left is a constant and right is a reloc
             // Useful for instances where the target object is created without relocations
-            InstructionArg::Reloc => diff_config.function_reloc_diffs == FunctionRelocDiffs::None,
+            //
+            // NameCheck: the same rule `reloc_eq` already applies to a missing
+            // left-side relocation, reached by a different path. A dtk-split
+            // target object relocates on a per-site basis with no guarantee of
+            // coverage; where it failed to attribute an address it leaves the
+            // computed constant in the operand (`lis r0, 0x80d1`), so the arch
+            // types the operand as a Value and never reaches `reloc_eq`. There
+            // is no target-side NAME, so the wrong-symbol check NameCheck exists
+            // to perform is vacuous, and charging the site measures dtk's
+            // coverage rather than our source. `name_address` still charges it.
+            InstructionArg::Reloc => matches!(
+                diff_config.function_reloc_diffs,
+                FunctionRelocDiffs::None | FunctionRelocDiffs::NameCheck
+            ),
             _ => false,
         },
         InstructionArg::Reloc => {
@@ -2515,6 +2528,67 @@ mod tests {
         // Our side names a REAL symbol rather than a `$`-label: charged.
         let real = obj_with_interior_ref(f, 0x1934, "?Callee@@QAAXXZ", 0x98, 0, 0);
         assert!(!reloc_match(&dtk, &real, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_unrelocated_target_operand() {
+        // dtk left the computed constant in the operand because it could not
+        // attribute the address (`lis r0, 0x80d1`); we name the datum. The arch
+        // types the target operand as a Value, so this never reaches `reloc_eq`
+        // -- but it is the same "no left-side name to check" case that
+        // `reloc_eq` already forgives under NameCheck.
+        let left = obj_with_reloc("unused", 0);
+        let right = obj_with_reloc("?TheAccomplishmentMgr@@3PAVAccomplishmentManager@@A", 0);
+        let row = InstructionDiffRow::default();
+        let eq = std::collections::HashMap::new();
+        let constant = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
+        let mut check = |left_arg: &InstructionArg, mode| {
+            arg_eq(
+                &left,
+                &right,
+                &row,
+                &row,
+                left_arg,
+                &InstructionArg::Reloc,
+                resolved_ref_no_reloc(&left),
+                resolved_ref(&right),
+                &DiffObjConfig { function_reloc_diffs: mode, ..Default::default() },
+                &eq,
+            )
+        };
+        assert!(check(&constant, FunctionRelocDiffs::None));
+        assert!(check(&constant, FunctionRelocDiffs::NameCheck));
+        // Address-coupled rulers keep charging it: the constant IS the address,
+        // so there it is evidence, not a coverage hole.
+        assert!(!check(&constant, FunctionRelocDiffs::NameOnly));
+        assert!(!check(&constant, FunctionRelocDiffs::NameAddress));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_still_charges_two_differing_constants() {
+        // The tolerance is about a MISSING left name, not about immediates:
+        // two operands that are both plain constants are compared as before.
+        let obj = obj_with_reloc("unused", 0);
+        let row = InstructionDiffRow::default();
+        let eq = std::collections::HashMap::new();
+        let l = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
+        let r = InstructionArg::Value(InstructionArgValue::Unsigned(0x8312));
+        for mode in [FunctionRelocDiffs::None, FunctionRelocDiffs::NameCheck] {
+            assert!(!arg_eq(
+                &obj,
+                &obj,
+                &row,
+                &row,
+                &l,
+                &r,
+                resolved_ref_no_reloc(&obj),
+                resolved_ref_no_reloc(&obj),
+                &DiffObjConfig { function_reloc_diffs: mode, ..Default::default() },
+                &eq,
+            ));
+        }
     }
 
     #[cfg(feature = "std")]
