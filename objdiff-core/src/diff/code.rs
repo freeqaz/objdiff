@@ -1171,6 +1171,68 @@ fn ins_data_literals_eq(
     left_literals == right_literals
 }
 
+/// NameCheck: the MSVC-PPC switch-dispatch base, where the target object has
+/// LOST the addend it needs to say what it points at.
+///
+/// MSVC-PPC compiles a dense `switch` into
+/// `lis/addi r12, <table>` ; `lhzx r0, r12, r0` ; `lis/addi r12, <first case>` ;
+/// `add r12, r12, r0` ; `mtctr` ; `bctr`. The second `lis/addi` pair materializes
+/// an address INTERIOR to the function being compiled — the first case block —
+/// and MSVC names it with a `$LN<n>` local label, whose counter is a
+/// compilation-order artifact (see `is_compiler_local_label`).
+///
+/// A dtk-split target object cannot spell that. dtk's disassembly knows the real
+/// referent (it writes `"?Fn@@..."+0x98`), but its COFF writer can only name a
+/// symbol and drops the addend, so the relocation arrives as
+/// `<enclosing function> + 0`. objdiff then resolves the target's branch
+/// destination to instruction 0 and ours to the real case block, and `arg_eq`
+/// charges `BranchDest 0 != 38` — a difference that exists only because the
+/// addend was thrown away.
+///
+/// Verified on dc3 `SaveLoadManager::GetDialogMsg`: the two `.text` words are
+/// byte-identical (`3d800000` / `398c0000`, immediates zero and linker-filled),
+/// the two 94-entry jump tables are byte-identical, and each side is internally
+/// consistent only at function+0x98 — retail's default arm
+/// (`bgt` at func+0x6c, displacement 0x1868 -> func+0x18d4) minus its table's
+/// default entry (0x183c) is 0x98, which is exactly where our `$LN738` sits.
+/// Both sides denote the SAME linked address.
+///
+/// The tolerance is therefore keyed on dtk's addend-loss signature and nothing
+/// wider:
+///   * ours is a `$`-label with a zero addend, in the same section as, and
+///     inside the extent of, the function being diffed;
+///   * theirs is a zero-addend relocation naming that very function, in that
+///     function's own section.
+/// A wrong callee, a wrong datum, or a reference to any OTHER function is still
+/// charged. What it cannot see — and no reading of the target object can, since
+/// the addend is gone — is our interior offset differing from retail's; that
+/// residual is why this is NameCheck-only and `name_address` still charges it.
+fn interior_self_reference(
+    left_ins: ResolvedInstructionRef,
+    right_ins: ResolvedInstructionRef,
+    left_reloc: &ResolvedRelocation,
+    right_reloc: &ResolvedRelocation,
+) -> bool {
+    // Ours: an MSVC `$` local label, addressed directly, inside this function.
+    if !is_compiler_local_label(&right_reloc.symbol.name)
+        || right_reloc.relocation.addend != 0
+        || right_reloc.symbol.section != Some(right_ins.section_index)
+    {
+        return false;
+    }
+    let right_fn = right_ins.symbol;
+    if right_fn.size == 0
+        || !(right_fn.address..right_fn.address + right_fn.size)
+            .contains(&right_reloc.symbol.address)
+    {
+        return false;
+    }
+    // Theirs: dtk's addend-losing fallback — the enclosing function, addend 0.
+    left_reloc.relocation.addend == 0
+        && left_reloc.symbol.name == left_ins.symbol.name
+        && left_reloc.symbol.section == Some(left_ins.section_index)
+}
+
 fn reloc_eq(
     left_obj: &Object,
     right_obj: &Object,
@@ -1210,6 +1272,13 @@ fn reloc_eq(
         && (is_placeholder_symbol_name(&left_reloc.symbol.name)
             || is_compiler_local_label(&left_reloc.symbol.name))
     {
+        return true;
+    }
+
+    // NameCheck: INTERIOR SELF-REFERENCE (MSVC-PPC switch dispatch base).
+    //
+    // See `interior_self_reference` for the dialect fact and the evidence.
+    if name_check && interior_self_reference(left_ins, right_ins, &left_reloc, &right_reloc) {
         return true;
     }
 
@@ -1392,7 +1461,20 @@ fn arg_eq(
             InstructionArg::Value(r) => l.loose_eq(r),
             // If relocations are relaxed, match if left is a constant and right is a reloc
             // Useful for instances where the target object is created without relocations
-            InstructionArg::Reloc => diff_config.function_reloc_diffs == FunctionRelocDiffs::None,
+            //
+            // NameCheck: the same rule `reloc_eq` already applies to a missing
+            // left-side relocation, reached by a different path. A dtk-split
+            // target object relocates on a per-site basis with no guarantee of
+            // coverage; where it failed to attribute an address it leaves the
+            // computed constant in the operand (`lis r0, 0x80d1`), so the arch
+            // types the operand as a Value and never reaches `reloc_eq`. There
+            // is no target-side NAME, so the wrong-symbol check NameCheck exists
+            // to perform is vacuous, and charging the site measures dtk's
+            // coverage rather than our source. `name_address` still charges it.
+            InstructionArg::Reloc => matches!(
+                diff_config.function_reloc_diffs,
+                FunctionRelocDiffs::None | FunctionRelocDiffs::NameCheck
+            ),
             _ => false,
         },
         InstructionArg::Reloc => {
@@ -2334,6 +2416,179 @@ mod tests {
         assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
         // NameOnly would charge it — placeholder tolerance is NameCheck-specific.
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    /// A function `fn_name` of `fn_size` bytes at address 0 of section "text",
+    /// with one relocation at address 0 pointing at `target_name`, a symbol
+    /// placed at `target_at` in section index `target_section`.
+    ///
+    /// Models both halves of the MSVC-PPC switch-dispatch site: the dtk target
+    /// (`target_name == fn_name`, `target_at == 0`) and ours (`target_name`
+    /// a `$`-label at an interior address).
+    #[cfg(feature = "std")]
+    fn obj_with_interior_ref(
+        fn_name: &str,
+        fn_size: u64,
+        target_name: &str,
+        target_at: u64,
+        target_section: usize,
+        addend: i64,
+    ) -> Object {
+        let mut obj = Object::default();
+        obj.sections.push(Section {
+            id: "text".to_string(),
+            name: "text".to_string(),
+            address: 0,
+            size: fn_size,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; fn_size as usize]),
+            relocations: vec![Relocation {
+                flags: RelocationFlags::Coff(16),
+                address: 0,
+                target_symbol: 1,
+                addend,
+            }],
+            ..Default::default()
+        });
+        // section 1: an unrelated code section, so "same section" is a real test.
+        obj.sections.push(Section {
+            id: "other".to_string(),
+            name: "other".to_string(),
+            address: 0,
+            size: fn_size,
+            kind: SectionKind::Code,
+            data: SectionData(vec![0u8; fn_size as usize]),
+            ..Default::default()
+        });
+        // symbol 0: the function being diffed.
+        obj.symbols.push(Symbol {
+            name: fn_name.to_string(),
+            address: 0,
+            size: fn_size,
+            kind: SymbolKind::Function,
+            section: Some(0),
+            ..Default::default()
+        });
+        // symbol 1: the relocation target.
+        obj.symbols.push(Symbol {
+            name: target_name.to_string(),
+            address: target_at,
+            size: 0,
+            kind: SymbolKind::Unknown,
+            section: Some(target_section),
+            ..Default::default()
+        });
+        obj
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_switch_dispatch_interior_self_ref() {
+        // dc3 SaveLoadManager::GetDialogMsg, reduced. Ours materializes the first
+        // case block as `$LN738` at function+0x98; dtk's writer dropped the
+        // `+0x98` and left `<enclosing function> + 0`. Same linked address, and
+        // the target object no longer says so.
+        let f = "?GetDialogMsg@SaveLoadManager@@QAA?AVDataNode@@XZ";
+        let left = obj_with_interior_ref(f, 0x1934, f, 0, 0, 0);
+        let right = obj_with_interior_ref(f, 0x1934, "$LN738", 0x98, 0, 0);
+        assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
+        // NameCheck-only: NameAddress must keep charging it, because the residual
+        // (our interior offset differing from retail's) is unverifiable, not absent.
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameAddress));
+        assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_interior_self_ref_stays_narrow() {
+        let f = "?GetDialogMsg@SaveLoadManager@@QAA?AVDataNode@@XZ";
+        let dtk = obj_with_interior_ref(f, 0x1934, f, 0, 0, 0);
+
+        // Our `$`-label is in a DIFFERENT section: not an interior reference to
+        // the function being diffed, so the name difference is still charged.
+        let elsewhere = obj_with_interior_ref(f, 0x1934, "$LN738", 0x98, 1, 0);
+        assert!(!reloc_match(&dtk, &elsewhere, FunctionRelocDiffs::NameCheck));
+
+        // Our `$`-label is past the end of the function: likewise charged.
+        let outside = obj_with_interior_ref(f, 0x80, "$LN738", 0x98, 0, 0);
+        assert!(!reloc_match(&dtk, &outside, FunctionRelocDiffs::NameCheck));
+
+        // The target's relocation names some OTHER function, not the one being
+        // diffed. dtk's addend loss can only produce a SELF-reference, so this
+        // is a real wrong-target charge and stays one.
+        let other_fn = obj_with_interior_ref(f, 0x1934, "?Other@@QAAXXZ", 0, 0, 0);
+        let ours = obj_with_interior_ref(f, 0x1934, "$LN738", 0x98, 0, 0);
+        assert!(!reloc_match(&other_fn, &ours, FunctionRelocDiffs::NameCheck));
+
+        // The target carries a NON-ZERO addend: it did not lose the offset, so
+        // there is something to check and we do not forgive it.
+        let with_addend = obj_with_interior_ref(f, 0x1934, f, 0, 0, 0x98);
+        assert!(!reloc_match(&with_addend, &ours, FunctionRelocDiffs::NameCheck));
+
+        // Our side names a REAL symbol rather than a `$`-label: charged.
+        let real = obj_with_interior_ref(f, 0x1934, "?Callee@@QAAXXZ", 0x98, 0, 0);
+        assert!(!reloc_match(&dtk, &real, FunctionRelocDiffs::NameCheck));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_forgives_unrelocated_target_operand() {
+        // dtk left the computed constant in the operand because it could not
+        // attribute the address (`lis r0, 0x80d1`); we name the datum. The arch
+        // types the target operand as a Value, so this never reaches `reloc_eq`
+        // -- but it is the same "no left-side name to check" case that
+        // `reloc_eq` already forgives under NameCheck.
+        let left = obj_with_reloc("unused", 0);
+        let right = obj_with_reloc("?TheAccomplishmentMgr@@3PAVAccomplishmentManager@@A", 0);
+        let row = InstructionDiffRow::default();
+        let eq = std::collections::HashMap::new();
+        let constant = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
+        let mut check = |left_arg: &InstructionArg, mode| {
+            arg_eq(
+                &left,
+                &right,
+                &row,
+                &row,
+                left_arg,
+                &InstructionArg::Reloc,
+                resolved_ref_no_reloc(&left),
+                resolved_ref(&right),
+                &DiffObjConfig { function_reloc_diffs: mode, ..Default::default() },
+                &eq,
+            )
+        };
+        assert!(check(&constant, FunctionRelocDiffs::None));
+        assert!(check(&constant, FunctionRelocDiffs::NameCheck));
+        // Address-coupled rulers keep charging it: the constant IS the address,
+        // so there it is evidence, not a coverage hole.
+        assert!(!check(&constant, FunctionRelocDiffs::NameOnly));
+        assert!(!check(&constant, FunctionRelocDiffs::NameAddress));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_name_check_still_charges_two_differing_constants() {
+        // The tolerance is about a MISSING left name, not about immediates:
+        // two operands that are both plain constants are compared as before.
+        let obj = obj_with_reloc("unused", 0);
+        let row = InstructionDiffRow::default();
+        let eq = std::collections::HashMap::new();
+        let l = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
+        let r = InstructionArg::Value(InstructionArgValue::Unsigned(0x8312));
+        for mode in [FunctionRelocDiffs::None, FunctionRelocDiffs::NameCheck] {
+            assert!(!arg_eq(
+                &obj,
+                &obj,
+                &row,
+                &row,
+                &l,
+                &r,
+                resolved_ref_no_reloc(&obj),
+                resolved_ref_no_reloc(&obj),
+                &DiffObjConfig { function_reloc_diffs: mode, ..Default::default() },
+                &eq,
+            ));
+        }
     }
 
     #[cfg(feature = "std")]
