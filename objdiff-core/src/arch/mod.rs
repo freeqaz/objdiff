@@ -15,7 +15,7 @@ use object::Endian as _;
 
 use crate::{
     diff::{
-        DiffObjConfig, DiffSide,
+        ConfigEnum, DiffObjConfig, DiffSide, PreferredStringEncoding,
         display::{ContextItem, HoverItem, InstructionPart},
     },
     obj::{
@@ -42,15 +42,42 @@ pub mod x86;
 pub const OPCODE_INVALID: u16 = u16::MAX;
 pub const OPCODE_DATA: u16 = u16::MAX - 1;
 
-const SUPPORTED_ENCODINGS: [(&encoding_rs::Encoding, &str); 7] = [
+const SUPPORTED_ENCODINGS_WITH_NULL_TERM: [(&encoding_rs::Encoding, &str); 5] = [
     (encoding_rs::UTF_8, "UTF-8"),
     (encoding_rs::SHIFT_JIS, "Shift JIS"),
-    (encoding_rs::UTF_16BE, "UTF-16BE"),
-    (encoding_rs::UTF_16LE, "UTF-16LE"),
     (encoding_rs::WINDOWS_1252, "Windows-1252"),
     (encoding_rs::EUC_JP, "EUC-JP"),
     (encoding_rs::BIG5, "Big5"),
 ];
+const SUPPORTED_ENCODINGS_NO_NULL_TERM: [(&encoding_rs::Encoding, &str); 2] =
+    [(encoding_rs::UTF_16BE, "UTF-16BE"), (encoding_rs::UTF_16LE, "UTF-16LE")];
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiteralInfo {
+    pub literal: String,
+    pub label_override: Option<String>,
+    pub copy_string: Option<String>,
+    pub hidden: bool, // Only used when the user hasn't set a preferred string encoding
+    pub is_string: bool,
+}
+
+impl LiteralInfo {
+    pub fn hidden(&self, diff_config: Option<&DiffObjConfig>) -> bool {
+        let Some(diff_config) = diff_config else {
+            return self.hidden;
+        };
+        if !self.is_string {
+            return self.hidden;
+        }
+        if diff_config.preferred_string_encoding == PreferredStringEncoding::Auto {
+            return self.hidden;
+        }
+        let Some(ref label) = self.label_override else {
+            return self.hidden;
+        };
+        *label != diff_config.preferred_string_encoding.name()
+    }
+}
 
 /// Represents the type of data associated with an instruction
 #[derive(PartialEq)]
@@ -83,18 +110,14 @@ impl fmt::Display for DataType {
 impl DataType {
     pub fn display_labels(&self, endian: object::Endianness, bytes: &[u8]) -> Vec<String> {
         let mut strs = Vec::new();
-        for (literal, label_override, _) in self.display_literals(endian, bytes) {
-            let label = label_override.unwrap_or_else(|| self.to_string());
-            strs.push(format!("{label}: {literal:?}"))
+        for lit_info in self.display_literals(endian, bytes) {
+            let label = lit_info.label_override.unwrap_or_else(|| self.to_string());
+            strs.push(format!("{}: {:?}", label, lit_info.literal))
         }
         strs
     }
 
-    pub fn display_literals(
-        &self,
-        endian: object::Endianness,
-        bytes: &[u8],
-    ) -> Vec<(String, Option<String>, Option<String>)> {
+    pub fn display_literals(&self, endian: object::Endianness, bytes: &[u8]) -> Vec<LiteralInfo> {
         let mut strs = Vec::new();
         if self.required_len().is_some_and(|l| bytes.len() < l) {
             log::warn!(
@@ -118,86 +141,106 @@ impl DataType {
         match self {
             DataType::Int8 => {
                 let i = i8::from_ne_bytes(bytes.try_into().unwrap());
-                strs.push((format!("{i:#x}"), None, None));
+                strs.push(LiteralInfo { literal: format!("{i:#x}"), ..Default::default() });
 
                 if i < 0 {
-                    strs.push((format!("{:#x}", ReallySigned(i)), None, None));
+                    strs.push(LiteralInfo {
+                        literal: format!("{:#x}", ReallySigned(i)),
+                        ..Default::default()
+                    });
                 }
             }
             DataType::Int16 => {
                 let i = endian.read_i16_bytes(bytes.try_into().unwrap());
-                strs.push((format!("{i:#x}"), None, None));
+                strs.push(LiteralInfo { literal: format!("{i:#x}"), ..Default::default() });
 
                 if i < 0 {
-                    strs.push((format!("{:#x}", ReallySigned(i)), None, None));
+                    strs.push(LiteralInfo {
+                        literal: format!("{:#x}", ReallySigned(i)),
+                        ..Default::default()
+                    });
                 }
             }
             DataType::Int32 => {
                 let i = endian.read_i32_bytes(bytes.try_into().unwrap());
-                strs.push((format!("{i:#x}"), None, None));
+                strs.push(LiteralInfo { literal: format!("{i:#x}"), ..Default::default() });
 
                 if i < 0 {
-                    strs.push((format!("{:#x}", ReallySigned(i)), None, None));
+                    strs.push(LiteralInfo {
+                        literal: format!("{:#x}", ReallySigned(i)),
+                        ..Default::default()
+                    });
                 }
             }
             DataType::Int64 => {
                 let i = endian.read_i64_bytes(bytes.try_into().unwrap());
-                strs.push((format!("{i:#x}"), None, None));
+                strs.push(LiteralInfo { literal: format!("{i:#x}"), ..Default::default() });
 
                 if i < 0 {
-                    strs.push((format!("{:#x}", ReallySigned(i)), None, None));
+                    strs.push(LiteralInfo {
+                        literal: format!("{:#x}", ReallySigned(i)),
+                        ..Default::default()
+                    });
                 }
             }
             DataType::Float => {
                 let bytes: [u8; 4] = bytes.try_into().unwrap();
-                strs.push((
-                    format!(
-                        "{:?}f",
-                        match endian {
-                            object::Endianness::Little => f32::from_le_bytes(bytes),
-                            object::Endianness::Big => f32::from_be_bytes(bytes),
-                        }
-                    ),
-                    None,
-                    None,
-                ));
+                strs.push(LiteralInfo {
+                    literal: format!("{:?}f", match endian {
+                        object::Endianness::Little => f32::from_le_bytes(bytes),
+                        object::Endianness::Big => f32::from_be_bytes(bytes),
+                    }),
+                    ..Default::default()
+                });
             }
             DataType::Double => {
                 let bytes: [u8; 8] = bytes.try_into().unwrap();
-                strs.push((
-                    format!(
-                        "{:?}",
-                        match endian {
-                            object::Endianness::Little => f64::from_le_bytes(bytes),
-                            object::Endianness::Big => f64::from_be_bytes(bytes),
-                        }
-                    ),
-                    None,
-                    None,
-                ));
+                strs.push(LiteralInfo {
+                    literal: format!("{:?}", match endian {
+                        object::Endianness::Little => f64::from_le_bytes(bytes),
+                        object::Endianness::Big => f64::from_be_bytes(bytes),
+                    }),
+                    ..Default::default()
+                });
             }
             DataType::Bytes => {
-                strs.push((format!("{bytes:#?}"), None, None));
+                strs.push(LiteralInfo { literal: format!("{bytes:#?}"), ..Default::default() });
             }
             DataType::String => {
-                // Special case to display (ASCII) as the label for ASCII-only strings.
-                let mut is_ascii = false;
-                if bytes.is_ascii()
-                    && let Ok(str) = str::from_utf8(bytes)
-                {
-                    let trimmed = str.trim_end_matches('\0');
-                    if !trimmed.is_empty() {
-                        let copy_string = escape_special_ascii_characters(trimmed);
-                        strs.push((trimmed.to_string(), Some("ASCII".into()), Some(copy_string)));
-                        is_ascii = true;
+                if let Some(nul_idx) = bytes.iter().position(|&c| c == b'\0') {
+                    let str_bytes = &bytes[..nul_idx];
+                    // Special case to display (ASCII) as the label for ASCII-only strings.
+                    let (cow, _, had_errors) = encoding_rs::UTF_8.decode(str_bytes);
+                    if !had_errors && cow.is_ascii() {
+                        let string = format!("{cow}");
+                        let copy_string = escape_special_ascii_characters(&string);
+                        strs.push(LiteralInfo {
+                            literal: string,
+                            label_override: Some("ASCII".into()),
+                            copy_string: Some(copy_string),
+                            hidden: false,
+                            is_string: true,
+                        });
+                    }
+                    for (encoding, encoding_name) in SUPPORTED_ENCODINGS_WITH_NULL_TERM {
+                        let (cow, _, had_errors) = encoding.decode(str_bytes);
+                        if !had_errors {
+                            let string = format!("{cow}");
+                            let copy_string = escape_special_ascii_characters(&string);
+                            // Avoid showing ASCII-only strings more than once if the encoding is ASCII-compatible.
+                            let hidden = encoding.is_ascii_compatible() && cow.is_ascii();
+                            strs.push(LiteralInfo {
+                                literal: string,
+                                label_override: Some(encoding_name.into()),
+                                copy_string: Some(copy_string),
+                                hidden,
+                                is_string: true,
+                            });
+                        }
                     }
                 }
 
-                for (encoding, encoding_name) in SUPPORTED_ENCODINGS {
-                    // Avoid showing ASCII-only strings more than once if the encoding is ASCII-compatible.
-                    if is_ascii && encoding.is_ascii_compatible() {
-                        continue;
-                    }
+                for (encoding, encoding_name) in SUPPORTED_ENCODINGS_NO_NULL_TERM {
                     let (cow, _, had_errors) = encoding.decode(bytes);
                     if had_errors {
                         continue;
@@ -205,11 +248,13 @@ impl DataType {
                     let trimmed = cow.trim_end_matches('\0');
                     if !trimmed.is_empty() {
                         let copy_string = escape_special_ascii_characters(trimmed);
-                        strs.push((
-                            trimmed.to_string(),
-                            Some(encoding_name.into()),
-                            Some(copy_string),
-                        ));
+                        strs.push(LiteralInfo {
+                            literal: trimmed.to_string(),
+                            label_override: Some(encoding_name.into()),
+                            copy_string: Some(copy_string),
+                            hidden: false,
+                            is_string: true,
+                        });
                     }
                 }
             }

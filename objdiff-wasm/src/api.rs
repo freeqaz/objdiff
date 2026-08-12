@@ -229,7 +229,7 @@ impl GuestDisplay for Component {
         let obj_diff = diff.get::<ResourceObjectDiff>();
         let obj = obj_diff.0.as_ref();
         let symbol_display = from_symbol_ref(symbol_ref);
-        diff::display::symbol_context(obj, symbol_display.symbol as usize)
+        diff::display::symbol_context(obj, symbol_display.symbol)
             .into_iter()
             .map(ContextItem::from)
             .collect()
@@ -241,7 +241,7 @@ impl GuestDisplay for Component {
         let addend = 0; // TODO
         let override_color = None; // TODO: colorize replaced/deleted/inserted relocations
         let symbol_display = from_symbol_ref(symbol_ref);
-        diff::display::symbol_hover(obj, symbol_display.symbol as usize, addend, override_color)
+        diff::display::symbol_hover(obj, symbol_display.symbol, addend, override_color)
             .into_iter()
             .map(HoverItem::from)
             .collect()
@@ -290,7 +290,7 @@ impl GuestDisplay for Component {
                 })];
             }
         };
-        diff::display::instruction_context(obj, resolved, &ins)
+        diff::display::instruction_context(obj, resolved, &ins, &diff_config)
             .into_iter()
             .map(ContextItem::from)
             .collect()
@@ -339,7 +339,7 @@ impl GuestDisplay for Component {
                 })];
             }
         };
-        diff::display::instruction_hover(obj, resolved, &ins)
+        diff::display::instruction_hover(obj, resolved, &ins, &diff_config)
             .into_iter()
             .map(HoverItem::from)
             .collect()
