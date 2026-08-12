@@ -236,6 +236,10 @@ impl Report {
                     units: sub_units,
                     version: self.version,
                     categories: sub_categories,
+                    // A per-category slice was measured by the same instrument as
+                    // the whole, so it carries the same provenance. Its cache_hits
+                    // /cache_misses still describe the whole run, not this slice.
+                    provenance: self.provenance.clone(),
                 },
             ));
         }
