@@ -97,7 +97,7 @@ fn funclet_paired_symbol_is_disclosed_named_control_is_clear() {
 // case-B report-level disclosure.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use objdiff_core::bindings::report::{Measures, ReportItem, ReportUnit, ReportUnitMetadata};
 
@@ -178,7 +178,7 @@ fn caseb_promotion_sets_report_masked_equal_and_counter() {
         },
     ];
 
-    let equivalences: HashMap<String, HashSet<String>> = HashMap::new();
+    let equivalences = obj::map_file::SymbolEquivalences::default();
     // Rule 3 oracle: VA 0x82345678 attributes to the claiming unit's TU ("foo")
     // with similarity >= CASEB_ORACLE_SIM_MIN.
     let mut oracle: diff::VaOracle = HashMap::new();
