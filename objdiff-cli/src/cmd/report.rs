@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufWriter, Read, Write},
     path::PathBuf,
@@ -2079,7 +2079,10 @@ struct AnalyzeQuery {
 #[derive(Serialize)]
 struct AnalyzeSummary {
     total_analyzed: usize,
-    by_verdict: HashMap<String, usize>,
+    /// `BTreeMap`, so the serialized key order is the same on every run. A
+    /// `HashMap` here published `std::collections::HashMap`'s per-instance
+    /// iteration order straight into the JSON.
+    by_verdict: BTreeMap<String, usize>,
 }
 
 /// Results grouped by verdict classification.
@@ -2186,8 +2189,11 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
     let total_to_analyze = candidates.len();
     info!("Analyzing {} functions", total_to_analyze);
 
-    // Group by unit for efficient loading
-    let mut by_unit: HashMap<&str, Vec<(&ReportUnit, &ReportItem)>> = HashMap::new();
+    // Group by unit for efficient loading. `BTreeMap`, not `HashMap`: the loop
+    // below appends its results in this map's iteration order, so a `HashMap`
+    // reordered every bucket of the output on every run of the same binary --
+    // the same leak `diff --batch` had.
+    let mut by_unit: BTreeMap<&str, Vec<(&ReportUnit, &ReportItem)>> = BTreeMap::new();
     for (unit, func) in &candidates {
         by_unit.entry(unit.name.as_str()).or_default().push((*unit, *func));
     }
@@ -2212,7 +2218,7 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
         at_limit: Vec::new(),
         needs_investigation: Vec::new(),
     };
-    let mut verdict_counts: HashMap<String, usize> = HashMap::new();
+    let mut verdict_counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for (unit_name, functions) in by_unit {
         // Find object config
