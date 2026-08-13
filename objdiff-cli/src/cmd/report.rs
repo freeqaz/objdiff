@@ -13,7 +13,8 @@ use globset::GlobBuilder;
 use objdiff_core::{
     bindings::report::{
         ChangeItem, ChangeItemInfo, ChangeUnit, Changes, ChangesInput, Measures, REPORT_VERSION,
-        Report, ReportCategory, ReportItem, ReportItemMetadata, ReportUnit, ReportUnitMetadata,
+        Report, ReportCategory, ReportItem, ReportItemMetadata, ReportProvenance, ReportUnit,
+        ReportUnitMetadata,
     },
     config::{
         ProjectObject, ProjectOptionValue, ProjectOptions, apply_project_options,
@@ -34,6 +35,51 @@ use crate::{
     util::output::{OutputFormat, write_output},
 };
 
+/// The identity of the objdiff-cli binary doing the diffing, in the report-cache
+/// key and in the report's provenance. See [`crate::build_id`] for why the hash
+/// of the executable and not the version or the git commit, and for the two
+/// 2026-08-12 measurements that were taken without it.
+///
+/// It also replaces the hand-maintained `CACHE_LOGIC_VERSION` counter this file
+/// used to carry, which asked an author changing diff semantics anywhere in
+/// objdiff-core to remember to bump a constant in objdiff-cli. Bumped three
+/// times, missed at least once (4c38c31 / f2424d6 changed
+/// `FunctionRelocDiffs::NameCheck` and never opened this file), and that miss is
+/// the +71 complete functions an A/B measured as zero.
+fn tool_binary_hash() -> Option<&'static str> { crate::build_id::binary_hash() }
+
+/// Render an effective [`diff::DiffObjConfig`] as canonically-ordered
+/// `key=value` lines: the ruler, spelled out.
+///
+/// Every property objdiff knows about, in `ConfigPropertyId::variants()` order,
+/// which is generated from config-schema.json and therefore stable within a
+/// build. Two uses, and they want the same thing:
+///   * the report-cache key, where hashing the RESOLVED config rather than the
+///     inputs that produced it (`-c` args plus the `options` blocks) also covers
+///     a change to the report's own `base_diff_config` fallback -- an input that
+///     was previously invisible to the key;
+///   * `ReportProvenance::diff_config`, so a banked report says which ruler
+///     produced it instead of leaving the reader to guess from a filename.
+fn render_diff_config(config: &diff::DiffObjConfig) -> Vec<String> {
+    use objdiff_core::diff::{ConfigEnum, ConfigPropertyId};
+    ConfigPropertyId::variants()
+        .iter()
+        .map(|id| format!("{}={}", id.as_str(), config.get_property_value(*id)))
+        .collect()
+}
+
+/// The inputs shared by every unit in a report: the instrument, and the alias
+/// map. Neither is per-unit, and neither was in the cache key before
+/// 2026-08-12 -- see [`tool_binary_hash`] for the binary, and the `map_file`
+/// handling in [`generate`] for the map.
+struct GlobalCacheKey {
+    /// `None` disables the cache: we could not identify the binary, so we cannot
+    /// promise a cached unit came from this one.
+    tool_binary_hash: Option<&'static str>,
+    /// xxHash3-64 of the map file's bytes, or 0 when the project has no map.
+    map_file_hash: u64,
+}
+
 /// Content-hash based cache for report units. Avoids re-diffing unchanged .obj files.
 /// Cache format: u32 entry count, then for each entry: u64 hash, u32 data_len, data bytes.
 struct ReportCache {
@@ -41,12 +87,19 @@ struct ReportCache {
     path: PathBuf,
     hits: std::sync::atomic::AtomicU32,
     misses: std::sync::atomic::AtomicU32,
+    /// When false, `get` always misses and nothing is written back. Set when the
+    /// binary could not be hashed (we cannot key honestly), when `--no-cache` was
+    /// passed, or under `--deduplicate` (see [`generate`]).
+    enabled: bool,
 }
 
 impl ReportCache {
-    fn load(path: PathBuf) -> Self {
+    /// A disabled cache reads nothing, never hits, and writes nothing back. It is
+    /// not the same as an empty one: an empty cache would still be SAVED at the
+    /// end of the run, leaving a sidecar whose provenance we could not vouch for.
+    fn load(path: PathBuf, enabled: bool) -> Self {
         let mut entries = HashMap::new();
-        if let Ok(data) = std::fs::read(&path) {
+        if let Ok(data) = if enabled { std::fs::read(&path) } else { Ok(Vec::new()) } {
             if data.len() >= 4 {
                 let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
                 let mut pos = 4;
@@ -71,10 +124,15 @@ impl ReportCache {
             path,
             hits: std::sync::atomic::AtomicU32::new(0),
             misses: std::sync::atomic::AtomicU32::new(0),
+            enabled,
         }
     }
 
     fn get(&self, hash: u64) -> Option<ReportUnit> {
+        if !self.enabled {
+            self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
         if let Some(data) = self.entries.get(&hash) {
             if let Ok(unit) = ReportUnit::decode(data.as_slice()) {
                 self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -86,6 +144,12 @@ impl ReportCache {
     }
 
     fn save(&self, new_entries: &HashMap<u64, Vec<u8>>) {
+        // A disabled cache writes nothing. Writing would leave a sidecar seeded by a
+        // run whose key we could not vouch for (`--deduplicate`, or an unidentifiable
+        // binary), which the NEXT run would then serve from.
+        if !self.enabled {
+            return;
+        }
         // Merge old and new entries, new entries override
         let mut merged = self.entries.clone();
         for (k, v) in new_entries {
@@ -101,53 +165,52 @@ impl ReportCache {
         let _ = std::fs::write(&self.path, buf);
     }
 
-    /// Bump whenever the *content* of a cached `ReportUnit` changes for reasons the
-    /// obj bytes + config args cannot express — i.e. whenever this file starts
-    /// emitting a new field or a different value for the same inputs. The cache key
-    /// is otherwise purely content-addressed, so without this a newly-installed
-    /// binary would keep serving units produced by the old one and silently report
-    /// the new fields as zero. Cost of a bump: one full re-diff of the report, no
-    /// change to any measure.
+    /// Hash everything that can change what a cached [`ReportUnit`] would say:
     ///
-    /// 2 — populated `Measures.masked_equal_functions` (funclet over-subscription)
-    ///     and the per-item `ReportItem.masked_equal` bit.
-    /// 3 — WIDENED that disclosure to every funclet byte-signature pairing
-    ///     (`SymbolDiff::masked_equal_symbol`), not just the pass-2b
-    ///     over-subscription subset; and taught `FunctionRelocDiffs::NameCheck` to
-    ///     forgive a COFF weak-external alias. Both change the emitted content for
-    ///     unchanged obj bytes, which is exactly what this counter exists for —
-    ///     WITHOUT the bump a freshly installed binary keeps serving units diffed
-    ///     by the old one and the new disclosure silently reads as the old value.
-    /// 4 — `diff_instructions` no longer drops onto a blind 1:1 pairing merely
-    ///     because the two instruction sequences have EQUAL LENGTH (N insertions
-    ///     plus N deletions preserve length, so that guard was unsound). 508 symbol
-    ///     pairs realign and 257 change `match_percent`, for unchanged obj bytes —
-    ///     precisely the case this counter exists for. Without the bump a mixed
-    ///     report would be served: pre-fix rows from cache, post-fix rows fresh.
-    const CACHE_LOGIC_VERSION: u32 = 4;
-
-    /// Hash a unit's target and base .obj file contents together, plus every input
-    /// that can change the *effective* [`diff::DiffObjConfig`] used to diff it:
-    /// `-c key=value` CLI args, the project-level `options` block, and the unit's own
-    /// `options` block. All three feed [`build_unit_diff_config`], so all three have
-    /// to be in the key or the cache serves a unit diffed under a different config.
+    ///  1. the unit's target and base .obj bytes;
+    ///  2. the RESOLVED effective [`diff::DiffObjConfig`] for this unit, spelled out
+    ///     property by property (see [`render_diff_config`]) — this covers `-c`
+    ///     args, the project `options` block, the unit `options` block AND the
+    ///     report's own `base_diff_config` fallback, all of which layer into it;
+    ///  3. the alias map (`map_file`) that supplies ICF symbol equivalences;
+    ///  4. the identity of the objdiff-cli binary doing the diffing.
     ///
-    /// The option maps are appended ONLY when non-empty, and with separators distinct
-    /// from the CLI-arg separator. That is deliberate: a project that sets no options
-    /// (which today is all of them) produces byte-identical key material to the
-    /// pre-fix version of this function, so existing `.cache` files stay valid and
-    /// nobody eats a full re-diff — or a changed number — for a fix they did not opt
-    /// into. Distinct separators keep `-c foo=bar` from colliding with an `options`
-    /// entry `foo: bar`, which layer in a different order and can differ in effect.
+    /// (3) and (4) are the 2026-08-12 fix. Neither was in the key before, and both
+    /// gaps had fired on the same day:
+    ///
+    ///   * a lane re-ran into one `-o` after changing only `symbol_aliases.json`
+    ///     (and thus the rendered map): 2,224 cache hits and a report byte-identical
+    ///     to the baseline, for a map carrying 340 more names. A +143-function
+    ///     change measured as +0.
+    ///   * an A/B of two objdiff builds sharing one output path returned identical
+    ///     numbers in all six project x ruler cells. The real delta was +71 complete
+    ///     functions.
+    ///
+    /// The exposure runs in the worst direction: a cached report cannot show a LOST
+    /// function, so a guard reading one always says "intact".
+    ///
+    /// (4) also replaces the hand-maintained `CACHE_LOGIC_VERSION` counter this
+    /// function used to carry, which asked an author changing diff semantics
+    /// anywhere in objdiff-core to remember to bump a constant in objdiff-cli. It
+    /// was bumped three times and missed at least once (4c38c31 / f2424d6 changed
+    /// `FunctionRelocDiffs::NameCheck` and never touched this file), which is the
+    /// +71 above. The binary hash subsumes it and cannot be forgotten.
+    ///
+    /// This DOES invalidate every `.cache` file written before the change, costing
+    /// one full re-diff each. The property it gives up — "a project that sets no
+    /// options keeps its old key" — is exactly the property that let a stale cache
+    /// survive a semantic change, so giving it up is the point rather than a cost.
     fn hash_unit(
         object: &ObjectConfig,
-        config_args: &[String],
-        project_options: Option<&ProjectOptions>,
-        unit_options: Option<&ProjectOptions>,
+        effective_config: &diff::DiffObjConfig,
+        global: &GlobalCacheKey,
     ) -> u64 {
         use xxhash_rust::xxh3::xxh3_64;
         let mut combined = Vec::new();
-        combined.extend_from_slice(&Self::CACHE_LOGIC_VERSION.to_le_bytes());
+        if let Some(hash) = global.tool_binary_hash {
+            combined.extend_from_slice(hash.as_bytes());
+        }
+        combined.extend_from_slice(&global.map_file_hash.to_le_bytes());
         if let Some(p) = &object.target_path {
             if let Ok(data) = std::fs::read(p.as_str()) {
                 combined.extend_from_slice(&data);
@@ -159,33 +222,14 @@ impl ReportCache {
                 combined.extend_from_slice(&data);
             }
         }
-        // Include config args in hash so different report configs get different caches
-        for arg in config_args {
+        // The resolved config, not the arguments that produced it: two spellings that
+        // resolve to the same ruler are the same cache entry, and a change to the
+        // report's base fallback is a different one.
+        for property in render_diff_config(effective_config) {
             combined.push(0xFE);
-            combined.extend_from_slice(arg.as_bytes());
+            combined.extend_from_slice(property.as_bytes());
         }
-        // Project-level options (0xFD) then unit-level options (0xFC). `ProjectOptions`
-        // is a BTreeMap, so iteration order is canonical and the key is stable across
-        // runs regardless of how the JSON happened to be written.
-        Self::hash_options(&mut combined, 0xFD, project_options);
-        Self::hash_options(&mut combined, 0xFC, unit_options);
         xxh3_64(&combined)
-    }
-
-    /// Append `options` to `combined` under `separator`, or nothing at all if the map
-    /// is absent or empty (see [`Self::hash_unit`] for why "nothing at all" matters).
-    fn hash_options(combined: &mut Vec<u8>, separator: u8, options: Option<&ProjectOptions>) {
-        let Some(options) = options else { return };
-        for (key, value) in options.iter() {
-            combined.push(separator);
-            combined.extend_from_slice(key.as_bytes());
-            combined.push(b'=');
-            match value {
-                ProjectOptionValue::Bool(true) => combined.extend_from_slice(b"true"),
-                ProjectOptionValue::Bool(false) => combined.extend_from_slice(b"false"),
-                ProjectOptionValue::String(value) => combined.extend_from_slice(value.as_bytes()),
-            }
-        }
     }
 }
 
@@ -248,6 +292,13 @@ pub struct GenerateArgs {
     /// source TU (Rule 3). Without it the pass would mis-attribute STL template
     /// folds; the pass refuses to run if this is absent.
     global_byte_eq_oracle: Option<Utf8PlatformPathBuf>,
+    #[argp(switch)]
+    /// Diff every unit fresh: do not read the <output>.cache sidecar and do not
+    /// write it back. The cache key covers the obj bytes, the resolved diff config,
+    /// the alias map and this binary's own hash, so a hit is sound; use this when
+    /// you want that belief measured rather than assumed, or when an input objdiff
+    /// cannot see (a compiler wrapper, a generated header) may have moved.
+    no_cache: bool,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -500,13 +551,23 @@ fn generate(args: GenerateArgs) -> Result<()> {
         if args.deduplicate { 1 } else { rayon::current_num_threads() }
     );
 
-    // Load map file for ICF symbol equivalences
+    // Load map file for ICF symbol equivalences.
+    //
+    // Read to memory first and hash the bytes: the map is an INPUT TO THE SCORE
+    // (it supplies the symbol equivalences that decide which target symbol a base
+    // symbol may pair with), so it belongs in the report-cache key and in the
+    // report's provenance. Hashing costs nothing worth measuring — the file has to
+    // be read either way, and xxh3 over the ~1-3 MB of map dc3/rb3-xenon carry is
+    // dwarfed by the regex parse that follows, let alone by the diff.
+    let mut map_file_hash = 0u64;
+    let mut map_file_entries = 0u32;
     let mapping_config = if let Some(map_file) = &project.map_file {
         let map_path = project_dir.join(map_file.with_platform_encoding());
-        let file = std::fs::File::open(map_path.as_str())
+        let data = std::fs::read(map_path.as_str())
             .with_context(|| format!("Failed to open map file: {}", map_path))?;
-        let reader = std::io::BufReader::new(file);
-        let equivalences = objdiff_core::obj::map_file::parse_msvc_map(reader);
+        map_file_hash = xxhash_rust::xxh3::xxh3_64(&data);
+        let equivalences = objdiff_core::obj::map_file::parse_msvc_map(std::io::Cursor::new(&data));
+        map_file_entries = equivalences.len() as u32;
         info!("Loaded {} ICF equivalence entries from {}", equivalences.len(), map_path);
         diff::MappingConfig { symbol_equivalences: equivalences, ..Default::default() }
     } else {
@@ -514,8 +575,8 @@ fn generate(args: GenerateArgs) -> Result<()> {
     };
 
     // Load content-hash based cache for incremental report generation.
-    // Cache key = xxHash3 of target+base .obj file contents + config args + the
-    // project/unit `options` blocks (see `ReportCache::hash_unit`).
+    // Cache key = xxHash3 of this binary's hash + the map file's hash + target/base
+    // .obj bytes + the resolved effective diff config (see `ReportCache::hash_unit`).
     let cache_path = args
         .output
         .as_ref()
@@ -525,7 +586,25 @@ fn generate(args: GenerateArgs) -> Result<()> {
             p
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".objdiff_report_cache"));
-    let cache = ReportCache::load(cache_path);
+    let tool_binary_hash = tool_binary_hash();
+    if tool_binary_hash.is_none() {
+        warn!(
+            "Could not hash the objdiff-cli executable; report cache disabled for this run. \
+             A cache entry that cannot name the binary that produced it is not safe to serve."
+        );
+    }
+    // `--deduplicate` makes a unit's emitted functions depend on every unit diffed
+    // before it (`existing_functions` suppresses a repeat of a global/weak symbol),
+    // and that history is not — and cannot reasonably be — part of a per-unit key.
+    // A cache hit under `-d` also skips the bookkeeping, so it corrupts the units
+    // that follow as well. Refuse the cache rather than serve an order-dependent
+    // answer from it.
+    if args.deduplicate && !args.no_cache {
+        warn!("--deduplicate makes each unit depend on the ones before it; report cache disabled");
+    }
+    let cache_enabled = !args.no_cache && !args.deduplicate && tool_binary_hash.is_some();
+    let cache = ReportCache::load(cache_path, cache_enabled);
+    let global_cache_key = GlobalCacheKey { tool_binary_hash, map_file_hash };
     let new_cache_entries: Mutex<HashMap<u64, Vec<u8>>> = Mutex::new(HashMap::new());
 
     let start = Instant::now();
@@ -541,12 +620,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
                 unit_options,
                 &args.config,
             )?;
-            let hash = ReportCache::hash_unit(
-                object,
-                &args.config,
-                project.options.as_ref(),
-                unit_options,
-            );
+            let hash = ReportCache::hash_unit(object, &diff_config, &global_cache_key);
             if let Some(cached_unit) = cache.get(hash) {
                 units.push(cached_unit);
             } else if let Some(unit) = report_object(
@@ -565,21 +639,20 @@ fn generate(args: GenerateArgs) -> Result<()> {
             .par_iter()
             .map(|(object, unit_idx)| {
                 let unit_options = project_units.get(*unit_idx).and_then(ProjectObject::options);
-                let hash = ReportCache::hash_unit(
-                    object,
-                    &args.config,
-                    project.options.as_ref(),
-                    unit_options,
-                );
-                if let Some(cached_unit) = cache.get(hash) {
-                    return Ok(Some(cached_unit));
-                }
+                // Resolve the config BEFORE the cache lookup: it is part of the key
+                // now, because the key hashes the resolved ruler rather than the
+                // arguments that produced it. Resolving is a clone plus a handful of
+                // property writes — nothing next to reading the two objs.
                 let diff_config = build_unit_diff_config(
                     &base_diff_config,
                     project.options.as_ref(),
                     unit_options,
                     &args.config,
                 )?;
+                let hash = ReportCache::hash_unit(object, &diff_config, &global_cache_key);
+                if let Some(cached_unit) = cache.get(hash) {
+                    return Ok(Some(cached_unit));
+                }
                 let result =
                     report_object(object, &diff_config, None, Some(&mapping_config))?;
                 if let Some(ref unit) = result {
@@ -596,6 +669,22 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let misses = cache.misses.load(std::sync::atomic::Ordering::Relaxed);
     if hits + misses > 0 {
         info!("Report cache: {} hits, {} misses", hits, misses);
+    }
+    // Announce a report in which nothing was recomputed. This is SOUND — the key
+    // now covers the objs, the resolved ruler, the alias map and this binary — so
+    // it is not an error and the run is not refused: refusing would refuse the
+    // correct no-op, which is the case the cache exists for. But "the numbers did
+    // not move" and "nothing was measured" look identical downstream, and a caller
+    // that expected its edit to be visible here has learned something. The same
+    // counts ride along in the report's provenance, so a consumer does not have to
+    // scrape this line.
+    if hits > 0 && misses == 0 {
+        warn!(
+            "Every unit in this report came from the cache at {}; nothing was re-diffed. \
+             The key covers the objs, the resolved config, the map file and this binary, \
+             so this means those are all unchanged. Pass --no-cache to measure instead.",
+            cache.path.display()
+        );
     }
 
     // Save updated cache
@@ -685,8 +774,42 @@ fn generate(args: GenerateArgs) -> Result<()> {
             measures: Some(Default::default()),
         });
     }
-    let mut report =
-        Report { measures: Some(measures), units, version: REPORT_VERSION, categories };
+    // Which ruler produced these numbers. Descriptive only: nothing below reads it,
+    // no measure depends on it. `diff_config` is the PROJECT-level effective config
+    // — the layering is per-unit, so a unit with its own `options` block can differ,
+    // which is what `units_with_option_overrides` discloses.
+    let provenance = ReportProvenance {
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        tool_binary_hash: tool_binary_hash.unwrap_or_default().to_string(),
+        tool_commit: crate::build_id::commit().to_string(),
+        diff_config: render_diff_config(&build_unit_diff_config(
+            &base_diff_config,
+            project.options.as_ref(),
+            None,
+            &args.config,
+        )?),
+        config_args: args.config.clone(),
+        units_with_option_overrides: project_units
+            .iter()
+            .filter(|u| ProjectObject::options(u).is_some_and(|o| !o.is_empty()))
+            .count() as u32,
+        map_file: project.map_file.as_ref().map(|p| p.to_string()).unwrap_or_default(),
+        map_file_hash: if project.map_file.is_some() {
+            format!("{map_file_hash:016x}")
+        } else {
+            String::new()
+        },
+        map_file_entries,
+        cache_hits: hits,
+        cache_misses: misses,
+    };
+    let mut report = Report {
+        measures: Some(measures),
+        units,
+        version: REPORT_VERSION,
+        categories,
+        provenance: Some(provenance),
+    };
     report.calculate_progress_categories();
     let duration = start.elapsed();
     info!("Report generated in {}.{:03}s", duration.as_secs(), duration.subsec_millis());
@@ -2610,55 +2733,186 @@ mod tests {
 
     // ── Report cache key.
     //
-    // The options blocks feed the effective diff config, so they must feed the cache
-    // key too — otherwise adding `options` to objdiff.json is silently a no-op for as
-    // long as the previous `.cache` file survives. That was the actual bug: the
-    // layering above already existed and worked, but a second run over the same output
-    // path served the pre-option units back out of cache.
+    // Every input that can change what a cached unit says has to be in the key, or a
+    // rerun over the same output path answers the previous question. Three classes
+    // have actually bitten, in this order:
+    //
+    //   * the `options` blocks (fixed earlier): adding `options` to objdiff.json was
+    //     silently a no-op for as long as the `.cache` file survived;
+    //   * the ALIAS MAP (2026-08-12): a lane changed only `symbol_aliases.json`,
+    //     re-ran into the same `-o`, and got 2,224 cache hits and a byte-identical
+    //     report for a map with 340 more names in it — a +143-function change
+    //     measured as +0;
+    //   * the BINARY (2026-08-12): two objdiff builds A/B'd through one output path
+    //     agreed to the last decimal in all six project x ruler cells. The real
+    //     delta was +71 complete functions.
+    //
+    // The failure is always in the same direction — a cached report reproduces the
+    // previous answer, so it cannot show a LOSS, and a guard reading one reports
+    // "intact" no matter what happened.
 
-    #[test]
-    fn test_hash_unit_key_unchanged_when_no_options_are_set() {
-        let object = ObjectConfig::default();
-        let empty = ProjectOptions::new();
-        let none = ReportCache::hash_unit(&object, &[], None, None);
-        // Present-but-empty must not invalidate either.
-        assert_eq!(none, ReportCache::hash_unit(&object, &[], Some(&empty), Some(&empty)));
-        // This is the literal key material the pre-fix hash_unit built, so existing
-        // caches for projects that set no options stay valid.
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&ReportCache::CACHE_LOGIC_VERSION.to_le_bytes());
-        expected.push(0xFF);
-        assert_eq!(none, xxhash_rust::xxh3::xxh3_64(&expected));
+    fn key_config(properties: &[&str]) -> diff::DiffObjConfig {
+        let base = report_base_diff_config();
+        build_unit_diff_config(&base, None, None, &cli_args(properties)).unwrap()
+    }
+
+    fn key_global() -> GlobalCacheKey {
+        GlobalCacheKey { tool_binary_hash: Some("0123456789abcdef"), map_file_hash: 0 }
     }
 
     #[test]
-    fn test_hash_unit_key_changes_when_options_are_set() {
+    fn test_hash_unit_key_changes_with_the_effective_ruler() {
         let object = ObjectConfig::default();
-        let baseline = ReportCache::hash_unit(&object, &[], None, None);
-        let opts = options(&[("functionRelocDiffs", "name_only")]);
-        let with_project = ReportCache::hash_unit(&object, &[], Some(&opts), None);
-        let with_unit = ReportCache::hash_unit(&object, &[], None, Some(&opts));
-        assert_ne!(baseline, with_project, "project options must be in the cache key");
-        assert_ne!(baseline, with_unit, "unit options must be in the cache key");
-        // Project-level and unit-level are distinct scopes and must not alias.
-        assert_ne!(with_project, with_unit);
-        // Nor may an option alias the equivalent `-c` arg, which layers later.
-        let cli = cli_args(&["functionRelocDiffs=name_only"]);
-        assert_ne!(with_project, ReportCache::hash_unit(&object, &cli, None, None));
-        // Different values give different keys; equal values give equal keys.
-        let other = options(&[("functionRelocDiffs", "name_check")]);
-        assert_ne!(with_project, ReportCache::hash_unit(&object, &[], Some(&other), None));
-        assert_eq!(with_project, ReportCache::hash_unit(&object, &[], Some(&opts.clone()), None));
+        let global = key_global();
+        let none = ReportCache::hash_unit(&object, &key_config(&["functionRelocDiffs=none"]), &global);
+        let name_check =
+            ReportCache::hash_unit(&object, &key_config(&["functionRelocDiffs=name_check"]), &global);
+        assert_ne!(none, name_check, "the ruler must be in the cache key");
+        // Same resolved config, same key — the key is a function of the config, not
+        // of the object identity that carried it.
+        assert_eq!(
+            none,
+            ReportCache::hash_unit(&object, &key_config(&["functionRelocDiffs=none"]), &global)
+        );
+        // Non-ruler properties count too: anything that reaches `diff_objs` can move
+        // a number.
+        assert_ne!(
+            none,
+            ReportCache::hash_unit(
+                &object,
+                &key_config(&["functionRelocDiffs=none", "combineTextSections=false"]),
+                &global
+            )
+        );
+    }
+
+    #[test]
+    fn test_hash_unit_key_changes_with_the_alias_map() {
+        // The 2026-08-12 map failure. The map supplies ICF symbol equivalences, which
+        // decide which symbols may pair, so it moves scores.
+        let object = ObjectConfig::default();
+        let config = key_config(&[]);
+        let a = ReportCache::hash_unit(
+            &object,
+            &config,
+            &GlobalCacheKey { tool_binary_hash: Some("aa"), map_file_hash: 1 },
+        );
+        let b = ReportCache::hash_unit(
+            &object,
+            &config,
+            &GlobalCacheKey { tool_binary_hash: Some("aa"), map_file_hash: 2 },
+        );
+        assert_ne!(a, b, "the map file's content must be in the cache key");
+    }
+
+    #[test]
+    fn test_hash_unit_key_changes_with_the_binary() {
+        // The 2026-08-12 cross-build failure, and the reason the hand-maintained
+        // CACHE_LOGIC_VERSION counter is gone: the semantic change that this missed
+        // was made in objdiff-core, by an author who never opened this file.
+        let object = ObjectConfig::default();
+        let config = key_config(&[]);
+        let a = ReportCache::hash_unit(
+            &object,
+            &config,
+            &GlobalCacheKey { tool_binary_hash: Some("aa"), map_file_hash: 0 },
+        );
+        let b = ReportCache::hash_unit(
+            &object,
+            &config,
+            &GlobalCacheKey { tool_binary_hash: Some("bb"), map_file_hash: 0 },
+        );
+        assert_ne!(a, b, "the objdiff binary's identity must be in the cache key");
+    }
+
+    #[test]
+    fn test_layered_spellings_that_resolve_to_one_ruler_share_a_key() {
+        // A deliberate consequence of keying on the RESOLVED config rather than on the
+        // inputs that produced it: `-c functionRelocDiffs=name_only` and an
+        // `options: {functionRelocDiffs: name_only}` block describe the same diff, so
+        // they are the same cache entry. The old key held them apart, which was safe
+        // but wrong-headed — it could not have held apart a change to the report's own
+        // base fallback, which this does.
+        let object = ObjectConfig::default();
+        let global = key_global();
+        let base = report_base_diff_config();
+        let via_cli =
+            build_unit_diff_config(&base, None, None, &cli_args(&["functionRelocDiffs=name_only"]))
+                .unwrap();
+        let via_project = build_unit_diff_config(
+            &base,
+            Some(&options(&[("functionRelocDiffs", "name_only")])),
+            None,
+            &[],
+        )
+        .unwrap();
+        let via_unit = build_unit_diff_config(
+            &base,
+            None,
+            Some(&options(&[("functionRelocDiffs", "name_only")])),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            ReportCache::hash_unit(&object, &via_cli, &global),
+            ReportCache::hash_unit(&object, &via_project, &global)
+        );
+        assert_eq!(
+            ReportCache::hash_unit(&object, &via_cli, &global),
+            ReportCache::hash_unit(&object, &via_unit, &global)
+        );
     }
 
     #[test]
     fn test_hash_unit_key_distinguishes_bool_option_values() {
         let object = ObjectConfig::default();
-        let on = bool_options(&[("combineTextSections", true)]);
-        let off = bool_options(&[("combineTextSections", false)]);
+        let global = key_global();
+        let base = report_base_diff_config();
+        let on = build_unit_diff_config(
+            &base,
+            Some(&bool_options(&[("combineTextSections", true)])),
+            None,
+            &[],
+        )
+        .unwrap();
+        let off = build_unit_diff_config(
+            &base,
+            Some(&bool_options(&[("combineTextSections", false)])),
+            None,
+            &[],
+        )
+        .unwrap();
         assert_ne!(
-            ReportCache::hash_unit(&object, &[], Some(&on), None),
-            ReportCache::hash_unit(&object, &[], Some(&off), None)
+            ReportCache::hash_unit(&object, &on, &global),
+            ReportCache::hash_unit(&object, &off, &global)
         );
+    }
+
+    #[test]
+    fn test_render_diff_config_covers_every_property_in_a_stable_order() {
+        use objdiff_core::diff::{ConfigEnum, ConfigPropertyId};
+        let rendered = render_diff_config(&report_base_diff_config());
+        // One line per property objdiff knows about: a property added to the schema is
+        // in the cache key and in the report's provenance without anyone remembering.
+        assert_eq!(rendered.len(), ConfigPropertyId::variants().len());
+        assert!(rendered.iter().all(|line| line.contains('=')));
+        // The four report base values, spelled.
+        assert!(rendered.contains(&"functionRelocDiffs=none".to_string()));
+        assert!(rendered.contains(&"combineDataSections=true".to_string()));
+        assert!(rendered.contains(&"combineTextSections=true".to_string()));
+        assert!(rendered.contains(&"ppc.calculatePoolRelocations=false".to_string()));
+        // Order is the generated variant order, not a hash-map walk: report bytes are
+        // compared for equality by several tools, so this must not shuffle run to run.
+        assert_eq!(rendered, render_diff_config(&report_base_diff_config()));
+    }
+
+    #[test]
+    fn test_tool_binary_hash_is_stable_and_hex() {
+        // It hashes /proc/self/exe (the test binary here), so it must at least be
+        // present and stable within a process.
+        let hash = tool_binary_hash().expect("the test binary must be readable");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(Some(hash), tool_binary_hash());
     }
 }

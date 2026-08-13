@@ -12,6 +12,78 @@ message Report {
   uint32 version = 3;
   // Progress categories
   repeated ReportCategory categories = 4;
+  // Which RULER produced these numbers. Optional and purely descriptive: it
+  // changes no measure. Absent on every report generated before 2026-08-12 and
+  // on reports produced by anything other than `objdiff-cli report generate`.
+  // See ReportProvenance.
+  optional ReportProvenance provenance = 5;
+}
+
+// The identity of the measuring instrument that produced a report.
+//
+// A progress report is a MEASUREMENT, and until this message existed it did not
+// say what took it. Two failures on 2026-08-12 came from exactly that gap: an
+// A/B of two objdiff builds that returned identical numbers in all six
+// project x ruler cells (the two arms shared one report cache, and the binary
+// is not part of the cache key -- the real delta was +71 complete functions),
+// and a run that changed only the alias map and measured +0 against a map
+// carrying 340 more names (+143 functions). Neither report could be told apart
+// from a correct one after the fact, because neither carried the identity of
+// the ruler that produced it. This message makes every report self-describing:
+// two reports that disagree can be checked for whether they were even measured
+// with the same instrument.
+//
+// Deliberately contains NO timestamp and no hostname. Report bytes are compared
+// for equality by several tools here; a clock in the report would make every
+// report differ from every other and destroy that. Everything in here changes
+// only when something that can change a NUMBER changes.
+message ReportProvenance {
+  // objdiff's own crate version, e.g. "4.2.3". Coarse: many semantically
+  // different builds share it.
+  string tool_version = 1;
+  // xxHash3-64 (hex) of the objdiff-cli executable that produced the report.
+  // This is the AUTHORITATIVE identity -- it distinguishes builds that
+  // `tool_version` and even `tool_commit` cannot (a dirty tree, a different
+  // feature set, a different compiler). Empty if the executable could not be
+  // read, in which case the report cache was disabled for that run.
+  string tool_binary_hash = 2;
+  // Git commit the source tree was on when objdiff-cli's build script last ran,
+  // with a "-dirty" suffix if the tree had uncommitted tracked changes then.
+  // ADVISORY ONLY: cargo may not re-run the build script for every source edit,
+  // so this can lag the binary. `tool_binary_hash` cannot. Empty if the build
+  // happened outside a git checkout.
+  string tool_commit = 3;
+  // The project-level EFFECTIVE diff config, one "key=value" per property, in
+  // objdiff's canonical property order: the report's base config with the
+  // project's `options` block and then `-c key=value` applied. This is the
+  // ruler. Note a unit's own `options` block can still override it per unit;
+  // `units_with_option_overrides` says whether any did.
+  repeated string diff_config = 4;
+  // The `-c key=value` arguments as passed on the command line, verbatim.
+  repeated string config_args = 5;
+  // Number of units carrying their own `options` block, i.e. units whose
+  // effective config may differ from `diff_config`. 0 for every project here.
+  uint32 units_with_option_overrides = 6;
+  // The project's `map_file` as spelled in objdiff.json, or empty if none.
+  string map_file = 7;
+  // xxHash3-64 (hex) of the map file's bytes. The map supplies ICF symbol
+  // equivalences, so it moves scores; a report that does not name it cannot be
+  // told apart from one measured against a different map.
+  string map_file_hash = 8;
+  // Number of symbol-equivalence entries parsed out of the map file.
+  uint32 map_file_entries = 9;
+  // Report-cache accounting for this run: units served from the `<output>.cache`
+  // sidecar, and units diffed fresh. hits+misses is the unit count.
+  // `cache_misses == 0 && cache_hits > 0` means NOTHING in this report was
+  // recomputed. That is sound as long as the cache key covers every input --
+  // which is what `tool_binary_hash` and `map_file_hash` are doing in the key --
+  // but a consumer that wants to grade a run on freshly computed numbers can
+  // check it here instead of scraping stderr.
+  // (proto3 JSON omits zero-valued scalars, so a fully-cached run writes
+  // `cache_hits` and no `cache_misses`, and a fully-fresh run the reverse.
+  // Read a missing counter as 0, not as "unknown".)
+  uint32 cache_hits = 10;
+  uint32 cache_misses = 11;
 }
 
 // Progress info for a report or unit

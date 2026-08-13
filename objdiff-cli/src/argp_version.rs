@@ -32,10 +32,13 @@ where
         match Version::from_args(command_name, args) {
             Ok(v) => {
                 if v.version {
+                    // Version, git commit and the hash of these very bytes.
+                    // A bare crate version cannot tell two builds apart, and
+                    // telling two builds apart is the whole problem (see
+                    // crate::build_id).
                     println!(
-                        "{} {}",
-                        command_name.first().unwrap_or(&""),
-                        env!("CARGO_PKG_VERSION"),
+                        "{}",
+                        crate::build_id::version_line(command_name.first().unwrap_or(&""))
                     );
                     std::process::exit(0);
                 } else {
