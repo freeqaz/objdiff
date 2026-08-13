@@ -36,16 +36,14 @@ const MIN_REGISTER_SWAP_OCCURRENCES: usize = 3;
 /// operand order closed nine volatile FPR swaps by hand
 /// (`RndText::SizeCheck`).
 fn is_callee_saved_register(reg: &str) -> bool {
-    if let Some(num_str) = reg.strip_prefix('r') {
-        if let Ok(n) = num_str.parse::<u32>() {
-            return n >= 13 && n <= 31;
+    if let Some(num_str) = reg.strip_prefix('r')
+        && let Ok(n) = num_str.parse::<u32>() {
+            return (13..=31).contains(&n);
         }
-    }
-    if let Some(num_str) = reg.strip_prefix('f') {
-        if let Ok(n) = num_str.parse::<u32>() {
-            return n >= 14 && n <= 31;
+    if let Some(num_str) = reg.strip_prefix('f')
+        && let Ok(n) = num_str.parse::<u32>() {
+            return (14..=31).contains(&n);
         }
-    }
     false
 }
 
@@ -60,11 +58,10 @@ fn is_callee_saved_register(reg: &str) -> bool {
 /// Ordering by number rather than lexicographically also puts `f9` before
 /// `f10`, which is what a reader expects.
 fn register_sort_key(reg: &str) -> (u8, u32, &str) {
-    if let (Some(class), Some(rest)) = (reg.as_bytes().first(), reg.get(1..)) {
-        if let Ok(number) = rest.parse::<u32>() {
+    if let (Some(class), Some(rest)) = (reg.as_bytes().first(), reg.get(1..))
+        && let Ok(number) = rest.parse::<u32>() {
             return (*class, number, reg);
         }
-    }
     // Not `<class><number>`: sort after everything recognisable, by name.
     (u8::MAX, u32::MAX, reg)
 }
@@ -925,11 +922,10 @@ pub struct CallCountDiff {
 fn bl_target_name(info: &InstructionInfo) -> Option<String> {
     // Prefer typed_args[0] if it carries a Symbol — these are populated by
     // build_instruction_info from relocation data and resolve through ICF merges.
-    if let Some(typed_args) = &info.typed_args {
-        if let Some(super::diff::TypedArg::Symbol(sym)) = typed_args.first() {
+    if let Some(typed_args) = &info.typed_args
+        && let Some(super::diff::TypedArg::Symbol(sym)) = typed_args.first() {
             return Some(sym.clone());
         }
-    }
     // Fall back to the raw rendered args string.
     info.args.as_deref().map(|a| a.trim().to_string())
 }
@@ -944,20 +940,16 @@ pub fn compute_call_diff(instructions: &[InstructionDiffOutput]) -> Option<CallD
         if let Some(target) = &instr.target
             && target.opcode == "bl"
             && let Some(name) = bl_target_name(target)
-        {
-            if !MERGED_FUNC_RE.is_match(&name) {
+            && !MERGED_FUNC_RE.is_match(&name) {
                 *target_calls.entry(name).or_insert(0) += 1;
             }
-        }
         // Check base side for bl calls
         if let Some(base) = &instr.base
             && base.opcode == "bl"
             && let Some(name) = bl_target_name(base)
-        {
-            if !MERGED_FUNC_RE.is_match(&name) {
+            && !MERGED_FUNC_RE.is_match(&name) {
                 *base_calls.entry(name).or_insert(0) += 1;
             }
-        }
     }
 
     let mut target_only = Vec::new();
@@ -2087,15 +2079,13 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
             // Check if same template with different type args
             if let (Some(t_base), Some(b_base)) =
                 (msvc_template_base(t_args), msvc_template_base(b_args))
-            {
-                if t_base == b_base {
+                && t_base == b_base {
                     icf_template_count += 1;
                     *merged_calls
                         .entry(format!("ICF:{} (template merge)", t_base))
                         .or_insert(0) += 1;
                     continue;
                 }
-            }
 
             // General ICF: bl/b to completely different symbols.
             // At least one side must be a proper function name (not a label
@@ -2103,10 +2093,10 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
             // with identical machine code.
             let t_is_func = t_args.starts_with('?')
                 || t_args.starts_with('_')
-                || t_args.chars().next().map_or(false, |c| c.is_ascii_alphabetic());
+                || t_args.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
             let b_is_func = b_args.starts_with('?')
                 || b_args.starts_with('_')
-                || b_args.chars().next().map_or(false, |c| c.is_ascii_alphabetic());
+                || b_args.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
             if t_is_func && b_is_func {
                 icf_template_count += 1;
                 *merged_calls
@@ -2981,8 +2971,8 @@ pub fn detect_dead_store_elimination(instructions: &[InstructionDiffOutput]) -> 
 
     while i < instructions.len() {
         // Look for two consecutive inserts: li rN, 0x0 then stw rN, offset(rFP)
-        if instructions[i].match_type == "insert" {
-            if let Some(base_i) = &instructions[i].base
+        if instructions[i].match_type == "insert"
+            && let Some(base_i) = &instructions[i].base
                 && base_i.opcode == "li"
                 && base_i.args.as_deref().unwrap_or("").contains("0x0")
             {
@@ -2997,7 +2987,6 @@ pub fn detect_dead_store_elimination(instructions: &[InstructionDiffOutput]) -> 
                     continue;
                 }
             }
-        }
         i += 1;
     }
 
@@ -3034,21 +3023,17 @@ pub fn detect_prologue_mismatch(instructions: &[InstructionDiffOutput]) -> Optio
         }
         // Try typed_args first: stwu has args [reg, displacement, base_reg]
         // The displacement is args[1] and is a negative Signed value.
-        if let Some(typed_args) = &side.typed_args {
-            if typed_args.len() >= 2 {
-                if let Some(v) = typed_args[1].as_i64() {
-                    if v < 0 {
+        if let Some(typed_args) = &side.typed_args
+            && typed_args.len() >= 2
+                && let Some(v) = typed_args[1].as_i64()
+                    && v < 0 {
                         return Some((-v) as u32);
                     }
-                }
-            }
-        }
         // Fallback: parse the raw args string "r1, -N(r1)"
-        if let Some(args) = &side.args {
-            if let Some(cap) = STWU_FRAME_RE.captures(args.trim()) {
+        if let Some(args) = &side.args
+            && let Some(cap) = STWU_FRAME_RE.captures(args.trim()) {
                 return cap.get(1).and_then(|m| m.as_str().parse().ok());
             }
-        }
         None
     };
 
@@ -3056,16 +3041,14 @@ pub fn detect_prologue_mismatch(instructions: &[InstructionDiffOutput]) -> Optio
     let mut target_frame_size: Option<u32> = None;
     let mut base_frame_size: Option<u32> = None;
     for instr in &prologue {
-        if let Some(t) = &instr.target {
-            if target_frame_size.is_none() {
+        if let Some(t) = &instr.target
+            && target_frame_size.is_none() {
                 target_frame_size = extract_frame_size(t);
             }
-        }
-        if let Some(b) = &instr.base {
-            if base_frame_size.is_none() {
+        if let Some(b) = &instr.base
+            && base_frame_size.is_none() {
                 base_frame_size = extract_frame_size(b);
             }
-        }
     }
 
     // Now find the __savegprlr/__savefpr register mismatch.
@@ -3667,13 +3650,11 @@ pub fn detect_fsel_ternary(instructions: &[InstructionDiffOutput]) -> Option<Pat
         let Some(target) = &instr.target else { continue };
         if target.opcode == "fsel" {
             // Check for previous fneg or fsubs
-            if i > 0 {
-                if let Some(prev) = &instructions[i - 1].target {
-                    if matches!(prev.opcode.as_str(), "fneg" | "fsubs") {
+            if i > 0
+                && let Some(prev) = &instructions[i - 1].target
+                    && matches!(prev.opcode.as_str(), "fneg" | "fsubs") {
                         count += 1;
                     }
-                }
-            }
         }
     }
 
@@ -3704,13 +3685,11 @@ pub fn detect_float_to_int_to_float(instructions: &[InstructionDiffOutput]) -> O
         let Some(target) = &instr.target else { continue };
         if target.opcode == "fctiwz" {
             // Check for following stfd or fmr
-            if i + 1 < instructions.len() {
-                if let Some(next) = &instructions[i + 1].target {
-                    if matches!(next.opcode.as_str(), "stfd" | "fmr") {
+            if i + 1 < instructions.len()
+                && let Some(next) = &instructions[i + 1].target
+                    && matches!(next.opcode.as_str(), "stfd" | "fmr") {
                         count += 1;
                     }
-                }
-            }
         }
     }
 
@@ -4040,11 +4019,9 @@ pub fn compute_verdict(
                     pattern_names.join(", ")
                 ),
                 factors,
-                recommendation: format!(
-                    "Run the source permuter on this function (~250 builds). \
+                recommendation: "Run the source permuter on this function (~250 builds). \
                      If no improvement after a full sweep, mark at_limit. Do NOT accept \
-                     before running the permuter — these patterns are typically permuter-class."
-                ),
+                     before running the permuter — these patterns are typically permuter-class.".to_string(),
                 suggestions: vec![Suggestion {
                     action: "Run the source permuter on this function/unit before accepting.".to_string(),
                     doc_url: doc_url(DocLink::PermuterRoi),
@@ -4240,8 +4217,8 @@ pub fn compute_verdict(
             .patterns
             .iter()
             .find(|p| p.pattern == PatternType::MakeStringTemplateMismatch);
-        if let Some(pat) = ms_pattern {
-            if let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pat.details {
+        if let Some(pat) = ms_pattern
+            && let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pat.details {
                 let all_file = mismatches
                     .iter()
                     .all(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength));
@@ -4273,7 +4250,6 @@ pub fn compute_verdict(
                     };
                 }
             }
-        }
     }
 
     // Check for float precision mismatches (likely fixable)

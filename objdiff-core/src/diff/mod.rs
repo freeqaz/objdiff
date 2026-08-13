@@ -953,7 +953,7 @@ pub(crate) fn named_symbol_signature(obj: &Object, sym_idx: usize) -> Option<Nam
     }
     // Sort by offset so the descriptor order is canonical (section.relocations is
     // already address-sorted in practice, but make it explicit).
-    relocs.sort_by(|a, b| a.off_from_sym.cmp(&b.off_from_sym));
+    relocs.sort_by_key(|a| a.off_from_sym);
     Some(NamedSig { masked_bytes, relocs })
 }
 
@@ -1304,7 +1304,7 @@ pub fn reconcile_global_byte_matches(
             // Rule 3 to exercise the byte-equality+injectivity transport end-to-end.
             // NEVER use for a real measurement (produces the documented STL-fold
             // inflation). Default (unset) enforces the oracle gate.
-            if !std::env::var("OBJDIFF_CASEB_UNSAFE_NO_ORACLE").is_ok() {
+            if std::env::var("OBJDIFF_CASEB_UNSAFE_NO_ORACLE").is_err() {
                 let Some((oracle_tu, sim)) = oracle.get(&va) else { continue };
                 if *sim < CASEB_ORACLE_SIM_MIN {
                     continue;

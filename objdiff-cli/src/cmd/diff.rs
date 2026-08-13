@@ -1369,29 +1369,27 @@ fn run_batch(args: Args) -> Result<()> {
     // Target index: mangled name → unit
     let mut target_mangled_index: HashMap<String, String> = HashMap::new();
     for (unit_name, (obj_config, _)) in &object_configs {
-        if let Some(target_path) = obj_config.target_path.as_deref() {
-            if let Ok(syms) = obj::read::list_function_symbols(target_path.as_ref()) {
+        if let Some(target_path) = obj_config.target_path.as_deref()
+            && let Ok(syms) = obj::read::list_function_symbols(target_path.as_ref()) {
                 for sym in syms {
                     target_mangled_index
                         .entry(sym)
                         .or_insert_with(|| unit_name.clone());
                 }
             }
-        }
     }
 
     // Base index for cross-unit COMDAT fallback
     let mut base_symbol_index: HashMap<String, String> = HashMap::new();
     for (unit_name, (obj_config, _)) in &object_configs {
-        if let Some(base_path) = obj_config.base_path.as_deref() {
-            if let Ok(syms) = obj::read::list_function_symbols(base_path.as_ref()) {
+        if let Some(base_path) = obj_config.base_path.as_deref()
+            && let Ok(syms) = obj::read::list_function_symbols(base_path.as_ref()) {
                 for sym in syms {
                     base_symbol_index
                         .entry(sym)
                         .or_insert_with(|| unit_name.clone());
                 }
             }
-        }
     }
 
     eprintln!(
@@ -1604,11 +1602,11 @@ fn run_batch(args: Args) -> Result<()> {
                 // Cross-unit COMDAT fallback
                 if base_size == 0 && name_target_idx.is_some() {
                     let fallback = base_symbol_index.get(symbol_name.as_str());
-                    if let Some(fallback_unit) = fallback {
-                        if fallback_unit != unit_name {
-                            if let Some((fallback_config, _)) = object_configs.get(fallback_unit) {
-                                if let Some(fallback_base_path) = fallback_config.base_path.as_deref() {
-                                    if let Ok(fb_obj) = obj::read::read(fallback_base_path.as_ref(), &diff_config, DiffSide::Base) {
+                    if let Some(fallback_unit) = fallback
+                        && fallback_unit != unit_name
+                            && let Some((fallback_config, _)) = object_configs.get(fallback_unit)
+                                && let Some(fallback_base_path) = fallback_config.base_path.as_deref()
+                                    && let Ok(fb_obj) = obj::read::read(fallback_base_path.as_ref(), &diff_config, DiffSide::Base) {
                                         let fb_diff = diff_objs(
                                             target_obj.as_ref(), Some(&fb_obj),
                                             None, &diff_config, &mapping_config,
@@ -1679,10 +1677,6 @@ fn run_batch(args: Args) -> Result<()> {
                                             continue;
                                         }
                                     }
-                                }
-                            }
-                        }
-                    }
                 }
 
                 // Normal path
@@ -1760,7 +1754,7 @@ fn run_batch(args: Args) -> Result<()> {
             }
 
             let done = units_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 100 == 0 {
+            if done.is_multiple_of(100) {
                 eprintln!("  [{}/{}] units processed", done, units_total);
             }
 
@@ -1859,15 +1853,14 @@ fn build_data_diff(
                 mismatch_byte_count += seg.size;
             }
             let kind = data_diff_kind_str(seg.kind);
-            if let Some(last) = segments.last_mut() {
-                if last.kind == kind {
+            if let Some(last) = segments.last_mut()
+                && last.kind == kind {
                     last.size += seg.size;
                     seg_bytes.last_mut().unwrap().extend_from_slice(&seg.data);
                     other_seg_bytes.last_mut().unwrap().extend_from_slice(other_data);
                     offset += seg.size;
                     continue;
                 }
-            }
             segments.push(DataSegmentOutput {
                 offset,
                 size: seg.size,
