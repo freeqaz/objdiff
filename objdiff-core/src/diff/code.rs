@@ -61,10 +61,7 @@ pub fn diff_code(
     left_symbol_idx: usize,
     right_symbol_idx: usize,
     diff_config: &DiffObjConfig,
-    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
-        alloc::string::String,
-        std::collections::HashSet<alloc::string::String>,
-    >,
+    #[cfg(feature = "std")] symbol_equivalences: &crate::obj::map_file::SymbolEquivalences,
 ) -> Result<(SymbolDiff, SymbolDiff)> {
     let left_symbol = &left_obj.symbols[left_symbol_idx];
     let right_symbol = &right_obj.symbols[right_symbol_idx];
@@ -459,10 +456,7 @@ fn detect_fp_anchor_compensation(
     left_rows: &[InstructionDiffRow],
     right_rows: &[InstructionDiffRow],
     diff_config: &DiffObjConfig,
-    symbol_equivalences: &std::collections::HashMap<
-        alloc::string::String,
-        std::collections::HashSet<alloc::string::String>,
-    >,
+    symbol_equivalences: &crate::obj::map_file::SymbolEquivalences,
 ) -> BTreeSet<usize> {
     let empty = BTreeSet::new();
     // Cheap pre-screen: the fast path already handled byte-identical functions,
@@ -1241,10 +1235,7 @@ fn reloc_eq(
     left_ins: ResolvedInstructionRef,
     right_ins: ResolvedInstructionRef,
     diff_config: &DiffObjConfig,
-    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
-        alloc::string::String,
-        std::collections::HashSet<alloc::string::String>,
-    >,
+    #[cfg(feature = "std")] symbol_equivalences: &crate::obj::map_file::SymbolEquivalences,
 ) -> bool {
     let relax_reloc_diffs = diff_config.function_reloc_diffs == FunctionRelocDiffs::None;
     let name_check = diff_config.function_reloc_diffs == FunctionRelocDiffs::NameCheck;
@@ -1332,9 +1323,7 @@ fn reloc_eq(
                 return true;
             }
             #[cfg(feature = "std")]
-            if symbol_equivalences.get(left_name).is_some_and(|g| g.contains(right_name))
-                || symbol_equivalences.get(right_name).is_some_and(|g| g.contains(left_name))
-            {
+            if symbol_equivalences.aliases(left_name, right_name) {
                 return true;
             }
             return false;
@@ -1376,12 +1365,7 @@ fn reloc_eq(
     let names_match = left_reloc.symbol.name == right_reloc.symbol.name || {
         #[cfg(feature = "std")]
         {
-            symbol_equivalences
-                .get(&left_reloc.symbol.name)
-                .is_some_and(|group| group.contains(&right_reloc.symbol.name))
-                || symbol_equivalences
-                    .get(&right_reloc.symbol.name)
-                    .is_some_and(|group| group.contains(&left_reloc.symbol.name))
+            symbol_equivalences.aliases(&left_reloc.symbol.name, &right_reloc.symbol.name)
         }
         #[cfg(not(feature = "std"))]
         false
@@ -1447,10 +1431,7 @@ fn arg_eq(
     left_ins: ResolvedInstructionRef,
     right_ins: ResolvedInstructionRef,
     diff_config: &DiffObjConfig,
-    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
-        alloc::string::String,
-        std::collections::HashSet<alloc::string::String>,
-    >,
+    #[cfg(feature = "std")] symbol_equivalences: &crate::obj::map_file::SymbolEquivalences,
 ) -> bool {
     match left_arg {
         InstructionArg::Value(l) => match right_arg {
@@ -1569,10 +1550,7 @@ fn diff_instruction(
     right_row: &InstructionDiffRow,
     diff_config: &DiffObjConfig,
     state: &mut InstructionDiffState,
-    #[cfg(feature = "std")] symbol_equivalences: &std::collections::HashMap<
-        alloc::string::String,
-        std::collections::HashSet<alloc::string::String>,
-    >,
+    #[cfg(feature = "std")] symbol_equivalences: &crate::obj::map_file::SymbolEquivalences,
 ) -> Result<InstructionDiffResult> {
     let (l, r) = match (l, r) {
         (Some(l), Some(r)) => (l, r),
@@ -2015,7 +1993,7 @@ mod tests {
             resolved_ref(left),
             resolved_ref(right),
             &cfg,
-            &std::collections::HashMap::new(),
+            &crate::obj::map_file::SymbolEquivalences::default(),
         )
     }
 
@@ -2372,7 +2350,7 @@ mod tests {
             function_reloc_diffs: FunctionRelocDiffs::NameOnly,
             ..Default::default()
         };
-        let eq = std::collections::HashMap::new();
+        let eq = crate::obj::map_file::SymbolEquivalences::default();
         // Left (target) side has NO relocation, right (base) does: unverifiable
         // under NameCheck -> MATCH; NameOnly treats it as a diff (the reason
         // NameOnly alone is not deployable against dtk-split targets).
@@ -2537,7 +2515,7 @@ mod tests {
         let left = obj_with_reloc("unused", 0);
         let right = obj_with_reloc("?TheAccomplishmentMgr@@3PAVAccomplishmentManager@@A", 0);
         let row = InstructionDiffRow::default();
-        let eq = std::collections::HashMap::new();
+        let eq = crate::obj::map_file::SymbolEquivalences::default();
         let constant = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
         let check = |left_arg: &InstructionArg, mode| {
             arg_eq(
@@ -2568,7 +2546,7 @@ mod tests {
         // two operands that are both plain constants are compared as before.
         let obj = obj_with_reloc("unused", 0);
         let row = InstructionDiffRow::default();
-        let eq = std::collections::HashMap::new();
+        let eq = crate::obj::map_file::SymbolEquivalences::default();
         let l = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
         let r = InstructionArg::Value(InstructionArgValue::Unsigned(0x8312));
         for mode in [FunctionRelocDiffs::None, FunctionRelocDiffs::NameCheck] {

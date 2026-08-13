@@ -561,7 +561,7 @@ fn generate_mapping_symbols(
         let (left_diff, right_diff) = match base_section_kind {
             SectionKind::Code => {
                 #[cfg(feature = "std")]
-                let empty_equivalences = HashMap::new();
+                let empty_equivalences = crate::obj::map_file::SymbolEquivalences::default();
                 diff_code(
                     left_obj,
                     right_obj,
@@ -622,11 +622,12 @@ pub struct MappingConfig {
     pub selecting_left: Option<String>,
     /// The left object symbol name that we're selecting a right symbol for
     pub selecting_right: Option<String>,
-    /// ICF merged symbol equivalence groups.
-    /// Maps each symbol name to the set of names it's equivalent to.
+    /// ICF symbol-equivalence relation ("may name A stand in for name B?"),
+    /// parsed from the project's `map_file`. See
+    /// [`crate::obj::map_file::SymbolEquivalences`] for its exact semantics.
     #[cfg(feature = "std")]
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub symbol_equivalences: HashMap<String, HashSet<String>>,
+    pub symbol_equivalences: crate::obj::map_file::SymbolEquivalences,
 }
 
 fn apply_symbol_mappings(
@@ -957,30 +958,21 @@ pub(crate) fn named_symbol_signature(obj: &Object, sym_idx: usize) -> Option<Nam
     Some(NamedSig { masked_bytes, relocs })
 }
 
-/// Canonical reloc-target name through the ICF equivalence map: pick the
-/// lexicographically smallest member of the symbol's equivalence group (so an
-/// ICF-folded base callee compares equal to its named sibling). If the symbol is
-/// not in any group it maps to itself.
-fn canonical_reloc_name<'a>(
-    name: &'a str,
-    equivalences: &'a HashMap<String, HashSet<String>>,
-) -> &'a str {
-    match equivalences.get(name) {
-        Some(group) => group.iter().map(|s| s.as_str()).min().unwrap_or(name),
-        None => name,
-    }
-}
-
-/// Canonicalize a `NamedSig`'s reloc-target names through the ICF equivalence map.
-/// Returns a key suitable for cross-unit comparison.
-fn canonicalize_sig(sig: &NamedSig, equivalences: &HashMap<String, HashSet<String>>) -> NamedSig {
+/// Canonicalize a `NamedSig`'s reloc-target names through the ICF equivalence
+/// relation (see `SymbolEquivalences::canonical` for the exact semantics and
+/// the documented imprecision of representative-keying over a non-transitive
+/// relation). Returns a key suitable for cross-unit comparison.
+fn canonicalize_sig(
+    sig: &NamedSig,
+    equivalences: &crate::obj::map_file::SymbolEquivalences,
+) -> NamedSig {
     let relocs = sig
         .relocs
         .iter()
         .map(|r| RelocDesc {
             off_from_sym: r.off_from_sym,
             flags: r.flags,
-            target_name: canonical_reloc_name(&r.target_name, equivalences).to_string(),
+            target_name: equivalences.canonical(&r.target_name).to_string(),
             addend: r.addend,
         })
         .collect();
@@ -1082,7 +1074,7 @@ pub const CASEB_ORACLE_SIM_MIN: f32 = 0.5;
 pub fn reconcile_global_byte_matches(
     units: &mut [crate::bindings::report::ReportUnit],
     unit_objs: &[UnitObjs],
-    equivalences: &HashMap<String, HashSet<String>>,
+    equivalences: &crate::obj::map_file::SymbolEquivalences,
     oracle: &VaOracle,
 ) -> Vec<GlobalPromotion> {
     use crate::bindings::report::Measures;
