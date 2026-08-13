@@ -1329,18 +1329,54 @@ fn explain_report_parse_failure(err: anyhow::Error, data: &[u8]) -> anyhow::Erro
     err.context(hint)
 }
 
+/// Top-level keys belonging to objdiff's PROJECT config (`objdiff.json`), which is
+/// never a report.
+///
+/// This is the near-miss that matters: the two files sit side by side in every repo
+/// objdiff diffs, they are both JSON, and they share a `units` key whose value is an
+/// array in both — so a project config pointed at a report-reading flag looks
+/// exactly like a report to any shape check. `units` is therefore NOT in this list.
+/// It is the collision, not the tell.
+///
+/// From `objdiff_core::config::ProjectConfig`, minus `units`. A field added there
+/// and not here costs a wrong error message, nothing more.
+const PROJECT_CONFIG_ONLY_KEYS: [&str; 12] = [
+    "min_version",
+    "custom_make",
+    "custom_args",
+    "target_dir",
+    "base_dir",
+    "build_base",
+    "build_target",
+    "watch_patterns",
+    "ignore_patterns",
+    "progress_categories",
+    "options",
+    "map_file",
+];
+
 /// Whether a JSON document is recognisably an objdiff report, for the purpose of
 /// blaming a version skew for its refusal.
 ///
-/// One top-level key this binary knows, CARRYING A VALUE OF THE RIGHT SHAPE, is
-/// enough — a report from the future may have renamed or dropped any single one of
-/// them, so requiring more would fail exactly when the hint is wanted. The shape
-/// check is what keeps the name alone from deciding: `{"name": "objdiff.json",
-/// "units": 3}` has a `units`, and is not a report.
+/// Two questions, in order. Does it carry a key that rules a report OUT — the
+/// `objdiff.json` vocabulary above? Then no, whatever else it has. Otherwise, does
+/// it carry one DISTINCTIVE report key with a value of the right shape?
 ///
-/// Heuristic, and deliberately only used to pick which error text to print. It never
-/// admits or rejects a report — `Report::parse` did that before we were called.
+/// One key is deliberately enough: a report from the future may have renamed or
+/// dropped any single one of them, and requiring two would withhold the hint exactly
+/// when it is wanted. Four qualify, so any one rename still leaves three.
+///
+/// `version` is not among them, and that is the point. It is the most common key in
+/// any JSON config ever written — `{"version": 3, "services": {…}}` is a
+/// docker-compose file, and it was being told to upgrade its objdiff-cli. A document
+/// whose only objdiff-shaped evidence is `version` is not evidence.
+///
+/// Heuristic, and only ever used to pick which error text to print. It never admits
+/// or rejects a report — `Report::parse` did that before we were called.
 fn looks_like_a_report(document: &serde_json::Value) -> bool {
+    if PROJECT_CONFIG_ONLY_KEYS.iter().any(|key| document.get(key).is_some()) {
+        return false;
+    }
     let has = |key: &str, shaped: fn(&serde_json::Value) -> bool| {
         document.get(key).is_some_and(shaped)
     };
@@ -1348,10 +1384,6 @@ fn looks_like_a_report(document: &serde_json::Value) -> bool {
         || has("provenance", serde_json::Value::is_object)
         || has("units", serde_json::Value::is_array)
         || has("categories", serde_json::Value::is_array)
-        // pbjson accepts a uint32 as either a number or a decimal string.
-        || has("version", |v| {
-            v.is_number() || v.as_str().is_some_and(|s| s.parse::<u64>().is_ok())
-        })
 }
 
 /// Whatever the `provenance` block will admit about the objdiff-cli that wrote a
@@ -3171,10 +3203,27 @@ mod tests {
     fn test_parse_report_does_not_diagnose_a_skew_for_a_document_that_is_not_a_report() {
         for not_a_report in [
             r#"{"foo": 1}"#,
-            // A `units` key, but a report's `units` is a list. The name alone must
-            // not decide, or every config file with a colliding key gets diagnosed.
-            r#"{"name": "objdiff.json", "units": 3}"#,
-            r#"{"version": "1.2.3-beta", "dependencies": {}}"#, // package.json, not a report
+            // The near-miss, in its REAL shape. objdiff.json sits beside the report
+            // in every repo objdiff diffs and its top-level `units` is an ARRAY, so
+            // no shape check on `units` alone can tell them apart -- an earlier
+            // version of this test used `"units": 3` and passed while the real file
+            // failed. `min_version` unknown-fields first, so this is the message a
+            // user pointing `report summary` at their project config actually gets.
+            r#"{
+                "min_version": "2.0.0-beta.5",
+                "custom_make": "ninja",
+                "build_target": false,
+                "watch_patterns": ["*.c", "*.h"],
+                "units": [{"name": "main", "target_path": "a.o", "base_path": "b.o"}],
+                "progress_categories": [{"id": "dol", "name": "DOL"}],
+                "options": {"functionRelocDiffs": "none"}
+            }"#,
+            // Same class, different vocabulary: `version` is the most common key in
+            // any JSON config ever written and is not evidence of anything.
+            r#"{"version": 3, "services": {"web": {"image": "nginx"}}}"#,
+            r#"{"version": "1.2.3-beta", "dependencies": {}}"#, // package.json
+            // A `units` that is not a list: the key name alone must not decide.
+            r#"{"name": "some-tool.json", "units": 3}"#,
             // (`{}` is not in this list: every Report field is optional, so an empty
             // object parses as an empty report and never reaches an error at all.)
         ] {
@@ -3185,14 +3234,39 @@ mod tests {
         }
     }
 
-    /// ...but a document carrying any key this binary knows is a report, and still
-    /// gets diagnosed. This is the boundary the test above must not overshoot.
+    /// ...but a document carrying any ONE distinctive report key is a report, and
+    /// still gets diagnosed. This is the boundary the test above must not overshoot,
+    /// and the property that keeps the hint working for a future report that renamed
+    /// something: four keys qualify, so any one rename still leaves three.
     #[test]
-    fn test_parse_report_diagnoses_a_skew_from_any_one_known_key() {
-        for known in ["\"measures\": {}", "\"units\": []", "\"version\": 2", "\"categories\": []"] {
+    fn test_parse_report_diagnoses_a_skew_from_any_one_distinctive_key() {
+        for known in ["\"measures\": {}", "\"units\": []", "\"categories\": []", "\"provenance\": {}"]
+        {
             let doc = format!("{{{known}, \"something_a_later_objdiff_added\": 1}}");
             let rendered = format!("{:#}", parse_report(doc.as_bytes()).unwrap_err());
             assert!(rendered.contains("newer objdiff-cli"), "{doc} -> {rendered}");
         }
+        // `version` is deliberately NOT one of them -- see the docker-compose case
+        // above. A document whose only report-shaped key is `version` gets the raw
+        // serde error.
+        let version_only = r#"{"version": 2, "something_a_later_objdiff_added": 1}"#;
+        let rendered = format!("{:#}", parse_report(version_only.as_bytes()).unwrap_err());
+        assert!(!rendered.contains("newer objdiff-cli"), "{rendered}");
+    }
+
+    /// The veto is scoped to keys that are project-config-ONLY. A real report that
+    /// happens to be diagnosed must still be diagnosed, and `units` -- the key both
+    /// files share -- must never be treated as a veto.
+    #[test]
+    fn test_parse_report_veto_does_not_swallow_a_real_report() {
+        let rendered =
+            format!("{:#}", parse_report(current_report_json().replace(
+                "\"version\": 2,",
+                "\"version\": 2, \"something_a_later_objdiff_added\": 1,",
+            ).as_bytes()).unwrap_err());
+        assert!(rendered.contains("newer objdiff-cli"), "{rendered}");
+        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"units"), "units is the collision, not the tell");
+        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"measures"));
+        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"provenance"));
     }
 }
