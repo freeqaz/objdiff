@@ -1378,11 +1378,12 @@ pub fn reconcile_global_byte_matches(
             measures.masked_equal_functions += 1;
             recalc_unit_measure_percents(measures);
         } else {
-            let mut m = Measures::default();
-            m.matched_functions = 1;
-            m.matched_code = d.size;
-            m.masked_equal_functions = 1;
-            unit.measures = Some(m);
+            unit.measures = Some(Measures {
+                matched_functions: 1,
+                matched_code: d.size,
+                masked_equal_functions: 1,
+                ..Default::default()
+            });
         }
         promotions.push(GlobalPromotion {
             unit_name: unit.name.clone(),

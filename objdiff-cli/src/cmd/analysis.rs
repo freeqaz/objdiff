@@ -2115,7 +2115,7 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
     // Convert to sorted vec for consistent output
     let mut merged_functions: Vec<MergedFunctionCount> =
         merged_calls.into_iter().map(|(name, count)| MergedFunctionCount { name, count }).collect();
-    merged_functions.sort_by(|a, b| b.count.cmp(&a.count));
+    merged_functions.sort_by_key(|f| std::cmp::Reverse(f.count));
 
     Some(Pattern {
         pattern: PatternType::LinkerMerged,

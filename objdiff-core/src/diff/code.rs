@@ -1202,6 +1202,7 @@ fn ins_data_literals_eq(
 ///     inside the extent of, the function being diffed;
 ///   * theirs is a zero-addend relocation naming that very function, in that
 ///     function's own section.
+///
 /// A wrong callee, a wrong datum, or a reference to any OTHER function is still
 /// charged. What it cannot see — and no reading of the target object can, since
 /// the addend is gone — is our interior offset differing from retail's; that
