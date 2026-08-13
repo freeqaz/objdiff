@@ -491,7 +491,8 @@ pub struct Args {
     /// Include fixability verdict (implies --analyze)
     verdict: bool,
     #[argp(switch)]
-    /// Rebuild object file before diffing (runs ninja)
+    /// Rebuild object file before diffing (runs the project's custom_make, or
+    /// ninja)
     build: bool,
     #[argp(switch)]
     /// Perform full project build instead of incremental (requires --build)
@@ -757,42 +758,112 @@ pub fn run(args: Args) -> Result<()> {
 
     let output_format = DiffOutputFormat::from_option(args.format.as_deref())?;
 
-    // Run ninja build if requested (builds the base/decompiled object, not the target/reference)
+    // Run the build if requested (builds the base/decompiled object, not the
+    // target/reference).
+    //
+    // This honours the project's `custom_make`/`custom_args`, like every other
+    // build path in objdiff. It used to hardcode `Command::new("ninja")`, which
+    // silently bypassed wrappers projects rely on -- notably `tools/ninja-locked`
+    // in the rb3/rb3-xenon decomps, whose whole purpose is to serialize
+    // concurrent ninja invocations in one build directory (concurrent ninja
+    // there corrupts `.ninja_log`/`.ninja_deps`). Those projects set
+    // `custom_make` and reasonably believed it applied.
+    //
+    // `--build` is a fork-only feature; upstream has no such flag and no
+    // `Command::new` in this crate. `objdiff_core::build::run_make` has honoured
+    // `custom_make` all along, and this crate's own TUI path builds a
+    // `BuildConfig` from `project_config.custom_make` -- the one-shot path
+    // simply never reached for it. So this is an oversight in a fork commit,
+    // not an upstream design decision.
+    //
+    // The build still STREAMS to the terminal rather than going through
+    // `run_make`, which captures into a `BuildStatus`; `--build`'s output has
+    // always been inherited and callers parse the JSON on stdout, so capturing
+    // would be a behavioural change beyond the defect being fixed.
     if args.build {
         if let Some(base) = &base_path {
+            let make = project_config
+                .as_ref()
+                .and_then(|c| c.custom_make.as_deref())
+                .unwrap_or("ninja");
+            let make_args: &[String] = project_config
+                .as_ref()
+                .and_then(|c| c.custom_args.as_deref())
+                .unwrap_or(&[]);
+
+            let build_command = |target: Option<&str>| -> Result<()> {
+                let mut command = Command::new(make);
+                command.args(make_args);
+                if let Some(t) = target {
+                    command.arg(t);
+                }
+                // Run in the project directory. Without this the build ran in
+                // the CALLER's cwd against a target belonging to the project --
+                // latent today only because every in-repo call site already
+                // passes cwd=repo_root.
+                if let Some(dir) = &project_dir {
+                    command.current_dir(dir);
+                }
+                let status = command
+                    .status()
+                    .with_context(|| format!("Failed to run build command `{}`", make))?;
+                if !status.success() {
+                    match target {
+                        Some(t) => bail!("Incremental build failed for {}", t),
+                        None => bail!("Full build failed"),
+                    }
+                }
+                Ok(())
+            };
+
             // Determine build mode: incremental (default) or full
             let use_incremental = !args.full_build;
 
             if use_incremental {
-                // Incremental build: target specific .obj file
-                // Convert absolute paths to relative for ninja compatibility
-                let build_target = if base.is_absolute() {
-                    // Try to make it relative to current directory
-                    std::path::Path::new(base.as_str())
-                        .strip_prefix(std::env::current_dir()?)
+                // Incremental build: target specific .obj file.
+                // Rewrite the path to one relative to the project dir, which is
+                // where the build runs -- ninja matches targets against the
+                // paths its manifest declares, so an absolute or caller-relative
+                // spelling is an `unknown target`.
+                //
+                // `base` is built by joining the project dir, so its spelling
+                // follows `--project`: absolute for `-p /abs/proj`, but
+                // caller-cwd-relative for `-p proj`. Resolve BOTH against the
+                // caller's cwd before stripping, so the emitted target is
+                // project-dir-relative either way. Handling only the absolute
+                // case would leave `-p proj` emitting `proj/obj/base.o` to a
+                // command that has already chdir'd into `proj`.
+                let build_target = {
+                    let cwd = std::env::current_dir()?;
+                    let absolutize = |p: &std::path::Path| -> std::path::PathBuf {
+                        if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+                    };
+                    let rel_to = match &project_dir {
+                        Some(dir) => absolutize(std::path::Path::new(dir.as_str())),
+                        // No project: the build inherits the caller's cwd, so
+                        // that is what the target is relative to.
+                        None => cwd.clone(),
+                    };
+                    absolutize(std::path::Path::new(base.as_str()))
+                        .strip_prefix(&rel_to)
                         .map(|p| p.to_string_lossy().into_owned())
+                        // Reachable two ways: the project's own config spells an
+                        // absolute out-of-tree target/base path (`Path::join`
+                        // REPLACES rather than appends when its argument is
+                        // absolute, so such a path never sits under the project
+                        // dir), and --target/--base mode, where there is no
+                        // project dir to be relative to. Either way the spelling
+                        // the config or the caller gave is the right thing to
+                        // hand the build; do not invent one.
                         .unwrap_or_else(|_| base.to_string())
-                } else {
-                    base.to_string()
                 };
 
                 eprintln!("Building incremental: {}", build_target);
-                let status = Command::new("ninja")
-                    .arg(&build_target)
-                    .status()
-                    .context("Failed to run ninja")?;
-
-                if !status.success() {
-                    bail!("Incremental build failed for {}", build_target);
-                }
+                build_command(Some(&build_target))?;
             } else {
                 // Full build: build entire project
                 eprintln!("Building full project (--full-build specified)...");
-                let status = Command::new("ninja").status().context("Failed to run ninja")?;
-
-                if !status.success() {
-                    bail!("Full build failed");
-                }
+                build_command(None)?;
             }
         } else {
             bail!("--build requires a base path (use -p with a project that has base_path set)");
