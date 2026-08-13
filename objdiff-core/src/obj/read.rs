@@ -188,7 +188,9 @@ fn map_symbol(
 fn map_symbols(
     arch: &dyn Arch,
     obj_file: &object::File,
-    sections: &[Section],
+    // Unused since 3a024eb moved size inference out of this function; kept so the
+    // signature still lines up with upstream's.
+    _sections: &[Section],
     section_indices: &[usize],
     split_meta: Option<&SplitMeta>,
     config: &DiffObjConfig,
