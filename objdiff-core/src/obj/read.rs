@@ -1262,9 +1262,10 @@ pub fn list_function_symbols(obj_path: &std::path::Path) -> Result<Vec<String>> 
             continue;
         }
         if let Ok(name) = symbol.name()
-            && !name.is_empty() {
-                names.push(name.to_string());
-            }
+            && !name.is_empty()
+        {
+            names.push(name.to_string());
+        }
     }
     Ok(names)
 }

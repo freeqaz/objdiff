@@ -100,24 +100,25 @@ impl ReportCache {
     fn load(path: PathBuf, enabled: bool) -> Self {
         let mut entries = HashMap::new();
         if let Ok(data) = if enabled { std::fs::read(&path) } else { Ok(Vec::new()) }
-            && data.len() >= 4 {
-                let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                let mut pos = 4;
-                for _ in 0..count {
-                    if pos + 12 > data.len() {
-                        break;
-                    }
-                    let hash = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                    let data_len =
-                        u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap()) as usize;
-                    pos += 12;
-                    if pos + data_len > data.len() {
-                        break;
-                    }
-                    entries.insert(hash, data[pos..pos + data_len].to_vec());
-                    pos += data_len;
+            && data.len() >= 4
+        {
+            let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+            let mut pos = 4;
+            for _ in 0..count {
+                if pos + 12 > data.len() {
+                    break;
                 }
+                let hash = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let data_len =
+                    u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap()) as usize;
+                pos += 12;
+                if pos + data_len > data.len() {
+                    break;
+                }
+                entries.insert(hash, data[pos..pos + data_len].to_vec());
+                pos += data_len;
             }
+        }
         ReportCache {
             entries,
             path,
@@ -133,10 +134,11 @@ impl ReportCache {
             return None;
         }
         if let Some(data) = self.entries.get(&hash)
-            && let Ok(unit) = ReportUnit::decode(data.as_slice()) {
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(unit);
-            }
+            && let Ok(unit) = ReportUnit::decode(data.as_slice())
+        {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(unit);
+        }
         self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         None
     }
@@ -210,14 +212,16 @@ impl ReportCache {
         }
         combined.extend_from_slice(&global.map_file_hash.to_le_bytes());
         if let Some(p) = &object.target_path
-            && let Ok(data) = std::fs::read(p.as_str()) {
-                combined.extend_from_slice(&data);
-            }
+            && let Ok(data) = std::fs::read(p.as_str())
+        {
+            combined.extend_from_slice(&data);
+        }
         combined.push(0xFF); // separator
         if let Some(p) = &object.base_path
-            && let Ok(data) = std::fs::read(p.as_str()) {
-                combined.extend_from_slice(&data);
-            }
+            && let Ok(data) = std::fs::read(p.as_str())
+        {
+            combined.extend_from_slice(&data);
+        }
         // The resolved config, not the arguments that produced it: two spellings that
         // resolve to the same ruler are the same cache entry, and a change to the
         // report's base fallback is a different one.

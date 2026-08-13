@@ -933,9 +933,11 @@ fn is_placeholder_symbol_name(name: &str) -> bool {
 fn is_counter_suffixed_name(name: &str) -> bool {
     // `@<digits>`: mwcc's anonymous literal pool.
     if let Some(rest) = name.strip_prefix('@')
-        && !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-            return true;
-        }
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
     // `<identifier>$<digits>`: a named datum plus the TU counter that
     // disambiguates it. Require a non-empty identifier so a bare `$12` (which
     // `is_compiler_local_label` already owns) does not land here.
@@ -1311,17 +1313,11 @@ fn reloc_eq(
         _ => {
             let (left_name, left_index) = match left_anchor {
                 PoolAnchor::Resolved(name, index) => (name, index),
-                _ => (
-                    left_reloc.symbol.name.as_str(),
-                    left_reloc.relocation.target_symbol,
-                ),
+                _ => (left_reloc.symbol.name.as_str(), left_reloc.relocation.target_symbol),
             };
             let (right_name, right_index) = match right_anchor {
                 PoolAnchor::Resolved(name, index) => (name, index),
-                _ => (
-                    right_reloc.symbol.name.as_str(),
-                    right_reloc.relocation.target_symbol,
-                ),
+                _ => (right_reloc.symbol.name.as_str(), right_reloc.relocation.target_symbol),
             };
             if left_name == right_name {
                 return true;
