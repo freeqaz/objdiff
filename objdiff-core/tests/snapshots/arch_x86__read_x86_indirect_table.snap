@@ -1,6 +1,5 @@
 ---
 source: objdiff-core/tests/arch_x86.rs
-assertion_line: 118
 expression: obj
 ---
 Object {
@@ -1127,4 +1126,5 @@ Object {
     path: None,
     timestamp: None,
     flow_analysis_results: {},
+    weak_external_defaults: {},
 }
