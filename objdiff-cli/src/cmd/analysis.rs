@@ -49,6 +49,18 @@ fn is_callee_saved_register(reg: &str) -> bool {
     false
 }
 
+/// Highest-count key of a count map, ties broken by the key itself.
+///
+/// `Iterator::max_by_key` returns the LAST maximum in iteration order, and over
+/// a `HashMap` that order is per-instance random — so on a tie this picked a
+/// different opcode pair on every run of the same binary. The witness was a
+/// dc3-decomp control-flow row whose verdict suggestion alternated between
+/// `2 replacement(s) (bl↔beq)` and `2 replacement(s) (addi↔bne)`, 11/15 vs
+/// 4/15 over one binary, on a 1↔1 count tie.
+fn dominant_key(counts: &HashMap<String, usize>) -> Option<&str> {
+    counts.iter().max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0))).map(|(k, _)| k.as_str())
+}
+
 /// Total-order key for a PowerPC register name, by class then number.
 ///
 /// Used to break ties in count-ordered summaries. Without an explicit
@@ -569,16 +581,16 @@ impl Pattern {
                 let mut parts = Vec::new();
                 if inversions > 0 {
                     // Find dominant inversion type
-                    let dominant = inversion_types.iter().max_by_key(|(_, c)| *c);
-                    if let Some((typ, _)) = dominant {
+                    let dominant = dominant_key(&inversion_types);
+                    if let Some(typ) = dominant {
                         parts.push(format!("{} condition inversion(s) ({})", inversions, typ));
                     } else {
                         parts.push(format!("{} condition inversion(s)", inversions));
                     }
                 }
                 if replacements > 0 {
-                    let dominant = replacement_types.iter().max_by_key(|(_, c)| *c);
-                    if let Some((typ, _)) = dominant {
+                    let dominant = dominant_key(&replacement_types);
+                    if let Some(typ) = dominant {
                         parts.push(format!("{} replacement(s) ({})", replacements, typ));
                     } else {
                         parts.push(format!("{} replacement(s)", replacements));
@@ -2117,10 +2129,17 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
 
     let total_count: usize = merged_calls.values().sum();
 
-    // Convert to sorted vec for consistent output
+    // Count descending, then by name. The count key alone was NOT enough for
+    // "consistent output", which is what the comment here used to claim: the
+    // vec is built by draining a `HashMap`, `sort_by_key` is stable, so equal
+    // counts kept the hasher's order — and `std::collections::HashMap` reseeds
+    // per instance. Merged-call counts are overwhelmingly 1, so ties are the
+    // common case, not the corner: on a 1500-symbol rb3-xenon batch this list
+    // reordered on 16 of the 19 rows that differed between two runs of one
+    // binary, and `summarize()` publishes its head into the verdict text.
     let mut merged_functions: Vec<MergedFunctionCount> =
         merged_calls.into_iter().map(|(name, count)| MergedFunctionCount { name, count }).collect();
-    merged_functions.sort_by_key(|f| std::cmp::Reverse(f.count));
+    merged_functions.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
 
     Some(Pattern {
         pattern: PatternType::LinkerMerged,
@@ -4894,6 +4913,97 @@ mod tests {
                 format!("f2↔f8: {reps}"),
                 format!("f11↔f3: {reps}"),
             ]
+        );
+    }
+
+    /// The CONTROL_FLOW summary's "dominated by" opcode pair must not depend on
+    /// `HashMap` iteration order.
+    ///
+    /// `summarize()` counted opcode pairs into a `HashMap` and took
+    /// `max_by_key`, which returns the LAST maximum in iteration order. On a
+    /// tie that is a coin flip per process. It reaches the caller: this
+    /// `one_line` is published verbatim as `verdict.suggestions[0].action`, so
+    /// a dc3-decomp row alternated between `2 replacement(s) (bl↔beq)` and
+    /// `2 replacement(s) (addi↔bne)`, 11 vs 4 over 15 runs of one binary.
+    ///
+    /// Run it many times in one process to make the old failure deterministic —
+    /// each `detect_control_flow` + `summarize()` pair builds fresh `HashMap`s
+    /// with fresh seeds.
+    #[test]
+    fn test_control_flow_summary_is_deterministic_under_ties() {
+        // Four distinct replacement pairs, one occurrence each: nothing but the
+        // tie-break can pick a winner.
+        let instructions = vec![
+            make_instr(0, "replace", Some("bl"), None, Some("beq"), None),
+            make_instr(1, "replace", Some("addi"), None, Some("bne"), None),
+            make_instr(2, "replace", Some("stw"), None, Some("blt"), None),
+            make_instr(3, "replace", Some("b"), None, Some("bgt"), None),
+            // ... and two tied condition inversions.
+            make_instr(4, "diff_op", Some("beq"), None, Some("bne"), None),
+            make_instr(5, "diff_op", Some("blt"), None, Some("bge"), None),
+        ];
+
+        let render = || {
+            detect_control_flow(&instructions).expect("should detect control flow").summarize()
+        };
+        let expected = render();
+        for _ in 0..256 {
+            assert_eq!(
+                render().one_line,
+                expected.one_line,
+                "CONTROL_FLOW summary varied between runs"
+            );
+        }
+        // The tie-break is the pair string itself, ascending, so the winner is
+        // the lexicographically smallest of the tied pairs: `addi↔bne` among
+        // the four replacements, `beq↔bne` among the two inversions.
+        assert_eq!(
+            expected.one_line,
+            "2 condition inversion(s) (beq↔bne), 4 replacement(s) (addi↔bne)"
+        );
+    }
+
+    /// The LINKER_MERGED detail list must not depend on `HashMap` iteration
+    /// order.
+    ///
+    /// `detect_linker_merged` counts call targets into a `HashMap`, drains it
+    /// into a vec and sorted by count alone. `sort_by_key` is stable, so equal
+    /// counts kept the hasher's order — and merged-call counts are almost
+    /// always 1, so the tie is the normal case. The comment on that sort said
+    /// "for consistent output" and was false: on a 1500-symbol rb3-xenon batch
+    /// this list reordered on 16 of the 19 rows that differed between runs of
+    /// one binary, and `summarize()` puts its head into the verdict text.
+    #[test]
+    fn test_linker_merged_details_are_deterministic_under_ties() {
+        // Four distinct merged targets, one call each.
+        // All four match MERGED_FUNC_RE, so all four land in the map with a
+        // count of 1 and only the tie-break can order them.
+        let names = ["merged_9", "??_Ezeta@@UAAPAXI@Z", "merged_1", "OnlyReturns"];
+        let instructions: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                make_instr(i, "diff_arg", Some("bl"), Some(n), Some("bl"), Some("?other@@YAXXZ"))
+            })
+            .collect();
+
+        let render = || {
+            let pattern = detect_linker_merged(&instructions).expect("should detect merged calls");
+            match pattern.details {
+                PatternDetails::MergedFunctions { merged_functions } => {
+                    merged_functions.into_iter().map(|f| f.name).collect::<Vec<_>>()
+                }
+                other => panic!("unexpected details: {other:?}"),
+            }
+        };
+        let expected = render();
+        for _ in 0..256 {
+            assert_eq!(render(), expected, "LINKER_MERGED detail order varied between runs");
+        }
+        // All counts are 1, so the order is purely the name tie-break.
+        assert_eq!(
+            expected,
+            vec!["??_Ezeta@@UAAPAXI@Z", "OnlyReturns", "merged_1", "merged_9"]
         );
     }
 

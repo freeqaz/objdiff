@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{BufRead, BufWriter, Write, stdout},
     mem,
@@ -1288,6 +1288,57 @@ fn run_json(
     Ok(())
 }
 
+/// Unit names in project-declared order, paired with their project index.
+///
+/// Batch mode indexes its object configs by unit name in a `HashMap`, and
+/// `std::collections::HashMap` reseeds its hasher per instance. Anything that
+/// iterated that map to make a decision — building a first-wins symbol index,
+/// taking the first demangled match, scheduling the parallel walk — made a
+/// different decision on every run of the same binary. Ordering by the project
+/// index restores the order the units are declared in, which is the order
+/// `report generate` uses and the order they appear on the link line.
+///
+/// The map is keyed by unit name, so a name declared twice has already
+/// collapsed to a single entry before this sees it; the surviving index is what
+/// gets ordered.
+fn units_in_project_order<T>(configs: &HashMap<String, (T, usize)>) -> Vec<(usize, &str)> {
+    let mut ordered: Vec<(usize, &str)> =
+        configs.iter().map(|(name, (_, idx))| (*idx, name.as_str())).collect();
+    ordered.sort_unstable();
+    ordered
+}
+
+/// Pick the unit a requested symbol should be diffed in.
+///
+/// `target_units` and `base_units` are the unit positions (ascending, in
+/// project-declared order) whose target / base object defines the symbol. Both
+/// lists are routinely longer than one entry: a COMDAT — an inline function, a
+/// template instantiation, a vtable thunk — is emitted into every translation
+/// unit that uses it.
+///
+/// Rule 1: prefer a unit that defines the symbol on BOTH sides. That is the
+/// same-translation-unit pairing the diff is meant to make. A unit that defines
+/// it only on the target side is not an equally good answer — the row falls
+/// through to the cross-unit COMDAT fallback, which diffs this target object
+/// against some *other* unit's base object and scores lower for reasons that
+/// have nothing to do with the source.
+///
+/// Rule 2: otherwise the first candidate in project-declared order.
+///
+/// Rule 1 is a measurement-quality rule, not a score-maximizing one: it chooses
+/// between *pairings*, never between bodies, and it does not consult any score.
+/// Where several target objects hold genuinely different bodies under one name
+/// — an ICF alias collision baked into the extracted target objects — no rule
+/// here can recover the right one; the ambiguity is upstream in the alias map,
+/// and all this promises is the same answer every run.
+fn resolve_symbol_unit(target_units: &[u32], base_units: Option<&[u32]>) -> Option<u32> {
+    target_units
+        .iter()
+        .copied()
+        .find(|pos| base_units.is_some_and(|base| base.binary_search(pos).is_ok()))
+        .or_else(|| target_units.first().copied())
+}
+
 fn run_batch(args: Args) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
@@ -1362,33 +1413,59 @@ fn run_batch(args: Args) -> Result<()> {
         );
     }
 
+    // Every symbol → unit decision below is ordered by this list, never by
+    // `object_configs` iteration. `object_configs` is a `HashMap`, and
+    // `std::collections::HashMap` reseeds its hasher per instance, so a
+    // first-wins index built by iterating it picks a different unit on every
+    // run of the same binary against the same objects. That is not cosmetic:
+    // the chosen unit selects which pair of .obj files gets diffed, so
+    // `raw_match_percent` changed between runs (measured on rb3-xenon:
+    // `??$PropSync@VEventTrigger@@…` scored 100.0 under `default/GemTrackDir`
+    // and 99.5098 under `default/EventTrigger`, 8/15 vs 7/15 over one binary).
+    //
+    // The order of record is the project-declared unit order — the same order
+    // `report generate` walks, and the order the units appear on the link
+    // line. `object_configs` is keyed by unit name, so a name declared twice
+    // collapses to one entry; the surviving index is what this orders by.
+    // Positions in this vec (`pos` below) are used as compact unit handles.
+    let units_in_order = units_in_project_order(&object_configs);
+
     // Build symbol indexes: open each .obj file ONCE, extract all text symbols.
     // This replaces the O(symbols × units) scan with O(units + symbols) lookups.
     let index_start = std::time::Instant::now();
 
-    // Target index: mangled name → unit
-    let mut target_mangled_index: HashMap<String, String> = HashMap::new();
-    for (unit_name, (obj_config, _)) in &object_configs {
-        if let Some(target_path) = obj_config.target_path.as_deref()
-            && let Ok(syms) = obj::read::list_function_symbols(target_path.as_ref())
-        {
-            for sym in syms {
-                target_mangled_index.entry(sym).or_insert_with(|| unit_name.clone());
+    // symbol name → every unit position that defines it, ascending. A COMDAT
+    // (inline function, template instantiation, vtable thunk) is defined in
+    // every translation unit that uses it, so these lists are routinely longer
+    // than one entry — 7 of 69,428 target symbols and 51,334 of 161,021 base
+    // symbols on rb3-xenon. Keeping the whole candidate list rather than a
+    // first-wins winner is what lets the resolver below prefer a unit where
+    // both sides define the symbol.
+    let index_side = |target_side: bool| {
+        let mut index: HashMap<String, Vec<u32>> = HashMap::new();
+        for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
+            let Some((obj_config, _)) = object_configs.get(*unit_name) else { continue };
+            let path = if target_side {
+                obj_config.target_path.as_deref()
+            } else {
+                obj_config.base_path.as_deref()
+            };
+            if let Some(path) = path
+                && let Ok(syms) = obj::read::list_function_symbols(path.as_ref())
+            {
+                for sym in syms {
+                    let entry: &mut Vec<u32> = index.entry(sym).or_default();
+                    // Ascending by construction: units are visited in order.
+                    if entry.last() != Some(&(pos as u32)) {
+                        entry.push(pos as u32);
+                    }
+                }
             }
         }
-    }
-
-    // Base index for cross-unit COMDAT fallback
-    let mut base_symbol_index: HashMap<String, String> = HashMap::new();
-    for (unit_name, (obj_config, _)) in &object_configs {
-        if let Some(base_path) = obj_config.base_path.as_deref()
-            && let Ok(syms) = obj::read::list_function_symbols(base_path.as_ref())
-        {
-            for sym in syms {
-                base_symbol_index.entry(sym).or_insert_with(|| unit_name.clone());
-            }
-        }
-    }
+        index
+    };
+    let target_mangled_index = index_side(true);
+    let base_symbol_index = index_side(false);
 
     eprintln!(
         "Symbol index built in {:.1}s: {} target mangled, {} base",
@@ -1414,31 +1491,74 @@ fn run_batch(args: Args) -> Result<()> {
     }
     eprintln!("Batch mode: {} symbols to process", symbols.len());
 
-    // Resolve each symbol to its unit via O(1) HashMap lookups
-    let mut by_unit: HashMap<String, Vec<String>> = HashMap::new();
+    // Resolve each symbol to its unit via O(1) HashMap lookups.
+    //
+    // `by_unit` is keyed by unit position, not name, so the parallel walk below
+    // and therefore the order of the emitted rows follow project-declared unit
+    // order. A `HashMap` here made the row order of the whole batch differ on
+    // every run (15 distinct orders over 15 runs of one binary).
+    let mut by_unit: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     let mut not_found: Vec<String> = Vec::new();
 
     for symbol in &symbols {
-        if let Some(unit) = target_mangled_index.get(symbol.as_str()) {
-            by_unit.entry(unit.clone()).or_default().push(symbol.clone());
-        } else {
-            // Demangled fallback: scan target .obj files for demangled match
-            let mut found = false;
-            for (unit_name, (obj_config, _)) in &object_configs {
-                if let Some(target_path) = obj_config.target_path.as_deref() {
-                    let matches = obj::read::match_symbol_by_query(
-                        target_path.as_ref(), symbol, &lookup_config,
-                    ).unwrap_or_default();
-                    if matches.len() == 1 {
-                        by_unit.entry(unit_name.clone()).or_default().push(symbol.clone());
-                        found = true;
-                        break;
-                    }
+        if let Some(candidates) = target_mangled_index.get(symbol.as_str()) {
+            // A COMDAT is defined in several target objects at once, so this is
+            // a choice, and the choice moves the score: it decides which
+            // (target.obj, base.obj) pair gets diffed.
+            //
+            // Rule 1 — prefer a unit whose BASE object also defines the symbol.
+            // That is the same-translation-unit pairing the diff is meant to
+            // make. The alternative is not an equally good answer: with no base
+            // definition in the resolved unit the row falls through to the
+            // cross-unit COMDAT fallback below, which diffs this target object
+            // against an unrelated unit's base object and scores lower for
+            // reasons that have nothing to do with the source. Measured on
+            // rb3-xenon, `??$PropSync@VEventTrigger@@…` is byte-identical in
+            // both target objects (sha256 4af97026e5ccc52b, 204 bytes in both
+            // EventTrigger.obj and GemTrackDir.obj) and defined in the base
+            // build only in GemTrackDir — so the target bytes being scored are
+            // the same either way and only the pairing differs. This rule is
+            // therefore a measurement-quality rule, not a score-maximizing one:
+            // it never compares a *different* body, it only refuses a
+            // cross-object pairing when a same-object one exists.
+            //
+            // Rule 2 — otherwise the first candidate in project-declared order.
+            // When several target objects define one name with *different*
+            // bodies (7 names on rb3-xenon; `?Null@Symbol@@QBA_NXZ` has three
+            // genuinely different 28-byte bodies across ADSR/FilePath/
+            // MetaMusic, an ICF alias collision baked into the extracted target
+            // objects) there is no answer the CLI can derive — the ambiguity is
+            // upstream, in the alias map. All it can promise is the same answer
+            // every run.
+            let pos = resolve_symbol_unit(
+                candidates,
+                base_symbol_index.get(symbol.as_str()).map(Vec::as_slice),
+            );
+            if let Some(pos) = pos {
+                by_unit.entry(pos).or_default().push(symbol.clone());
+                continue;
+            }
+        }
+        // Demangled fallback: scan target .obj files for demangled match.
+        // Project-declared order again — this loop takes the first hit, and
+        // over `object_configs` that first hit was whichever unit the hasher
+        // happened to visit first.
+        let mut found = false;
+        for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
+            let Some((obj_config, _)) = object_configs.get(*unit_name) else { continue };
+            if let Some(target_path) = obj_config.target_path.as_deref() {
+                let matches =
+                    obj::read::match_symbol_by_query(target_path.as_ref(), symbol, &lookup_config)
+                        .unwrap_or_default();
+                if matches.len() == 1 {
+                    by_unit.entry(pos as u32).or_default().push(symbol.clone());
+                    found = true;
+                    break;
                 }
             }
-            if !found {
-                not_found.push(symbol.clone());
-            }
+        }
+        if !found {
+            not_found.push(symbol.clone());
         }
     }
 
@@ -1468,8 +1588,9 @@ fn run_batch(args: Args) -> Result<()> {
 
     let unit_results: Vec<Result<Vec<String>>> = by_unit
         .par_iter()
-        .map(|(unit_name, unit_symbols)| -> Result<Vec<String>> {
+        .map(|(unit_pos, unit_symbols)| -> Result<Vec<String>> {
             let mut lines: Vec<String> = Vec::new();
+            let unit_name = units_in_order[*unit_pos as usize].1;
 
             let Some((object_config, unit_idx)) = object_configs.get(unit_name) else {
                 for symbol in unit_symbols {
@@ -1597,9 +1718,20 @@ fn run_batch(args: Args) -> Result<()> {
                         (tsi, Some(symbol_idx), ts, bs)
                     };
 
-                // Cross-unit COMDAT fallback
+                // Cross-unit COMDAT fallback.
+                //
+                // Reached when the resolved unit's base object has no copy of
+                // the symbol at all. The candidates are our own build's copies
+                // of one COMDAT in different translation units; the linker keeps
+                // exactly one of them and we have no way to know which, so this
+                // really is a tie and the honest fix is a documented total
+                // order. That order is project-declared unit order — `.first()`
+                // on an ascending candidate list — not `HashMap` iteration.
                 if base_size == 0 && name_target_idx.is_some() {
-                    let fallback = base_symbol_index.get(symbol_name.as_str());
+                    let fallback = base_symbol_index
+                        .get(symbol_name.as_str())
+                        .and_then(|units| units.first())
+                        .map(|pos| units_in_order[*pos as usize].1);
                     if let Some(fallback_unit) = fallback
                         && fallback_unit != unit_name
                         && let Some((fallback_config, _)) = object_configs.get(fallback_unit)
@@ -1681,7 +1813,7 @@ fn run_batch(args: Args) -> Result<()> {
                             let output = DiffOutput {
                                 symbol: symbol_name.clone(),
                                 demangled: symbol.demangled_name.clone(),
-                                unit: Some(unit_name.clone()),
+                                unit: Some(unit_name.to_string()),
                                 target_size,
                                 base_size: fb_bs,
                                 fuzzy_match_percent: fb_norm,
@@ -1757,7 +1889,7 @@ fn run_batch(args: Args) -> Result<()> {
                 let output = DiffOutput {
                     symbol: symbol_name.clone(),
                     demangled: symbol.demangled_name.clone(),
-                    unit: Some(unit_name.clone()),
+                    unit: Some(unit_name.to_string()),
                     target_size,
                     base_size,
                     fuzzy_match_percent: normalized_match_percent,
@@ -3251,6 +3383,75 @@ fn run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Batch-mode unit resolution determinism
+    // =========================================================================
+
+    /// The order batch mode walks its units in must not come out of a
+    /// `HashMap`.
+    ///
+    /// `run_batch` indexes object configs by unit name in a `HashMap`, and
+    /// `std::collections::HashMap` reseeds per instance. Every decision that
+    /// iterated that map — first-wins symbol index, first demangled match, the
+    /// rayon walk that fixes row order — therefore came out differently on
+    /// every run of the SAME binary against the SAME objects. Measured on
+    /// rb3-xenon: 15 runs, 15 distinct row orders, and scores that moved with
+    /// the unit choice.
+    ///
+    /// Build a fresh map (fresh seed) on every iteration so the old failure is
+    /// deterministic, the way the map-file parser's determinism test does.
+    #[test]
+    fn test_units_in_project_order_is_deterministic() {
+        let names: Vec<String> = (0..64).map(|i| format!("default/unit_{i:02}")).collect();
+        let build = || {
+            // Insert in an order unrelated to the project index, so anything
+            // that leaks insertion or hash order shows up.
+            let mut configs: HashMap<String, ((), usize)> = HashMap::new();
+            for (idx, name) in names.iter().enumerate() {
+                configs.insert(name.clone(), ((), names.len() - 1 - idx));
+            }
+            units_in_project_order(&configs)
+                .into_iter()
+                .map(|(idx, name)| (idx, name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let expected = build();
+        for _ in 0..256 {
+            assert_eq!(build(), expected, "unit order varied between runs");
+        }
+        // Project-declared index order, not name order and not hash order.
+        assert_eq!(expected[0], (0, "default/unit_63".to_string()));
+        assert_eq!(expected[63], (63, "default/unit_00".to_string()));
+    }
+
+    /// A COMDAT defined in several target objects is a choice, and the choice
+    /// decides which pair of objects gets diffed — so it decides the score.
+    /// Prefer the unit that defines the symbol on both sides.
+    #[test]
+    fn test_resolve_symbol_unit_prefers_a_unit_defined_on_both_sides() {
+        // Target units 3 and 7; only 7 has a base definition. Answer: 7, even
+        // though 3 comes first in project order. Picking 3 would send the row
+        // through the cross-unit COMDAT fallback, which diffs this target
+        // object against unit 7's base object -- a pairing that scores lower
+        // for reasons unrelated to the source. Witnessed on rb3-xenon as
+        // `??$PropSync@VEventTrigger@@...`: 100.0 under `default/GemTrackDir`
+        // (both sides define it) vs 99.5098 under `default/EventTrigger`
+        // (fallback), with byte-identical target bodies in both objects.
+        assert_eq!(resolve_symbol_unit(&[3, 7], Some(&[7, 9])), Some(7));
+        // Earliest of several both-sides candidates.
+        assert_eq!(resolve_symbol_unit(&[3, 7, 9], Some(&[7, 9])), Some(7));
+    }
+
+    /// With no both-sides candidate the tie is genuine, and the documented
+    /// total order is project-declared unit order.
+    #[test]
+    fn test_resolve_symbol_unit_falls_back_to_project_order() {
+        assert_eq!(resolve_symbol_unit(&[3, 7], Some(&[9])), Some(3));
+        assert_eq!(resolve_symbol_unit(&[3, 7], None), Some(3));
+        assert_eq!(resolve_symbol_unit(&[5], None), Some(5));
+        assert_eq!(resolve_symbol_unit(&[], Some(&[1])), None);
+    }
 
     fn make_test_instr(
         index: usize,
