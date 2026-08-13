@@ -587,10 +587,16 @@ fn generate(args: GenerateArgs) -> Result<()> {
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".objdiff_report_cache"));
     let tool_binary_hash = tool_binary_hash();
-    if tool_binary_hash.is_none() {
+    // Say it only when it is news. Under `--no-cache` the cache was already off by
+    // request, and announcing that it is "disabled for this run" would blame a
+    // failed hash for the user's own flag — and would put a line about a hash
+    // failure in front of every consumer that scrapes this stream, on runs where
+    // nothing went wrong.
+    if tool_binary_hash.is_none() && !args.no_cache {
         warn!(
             "Could not hash the objdiff-cli executable; report cache disabled for this run. \
-             A cache entry that cannot name the binary that produced it is not safe to serve."
+             A cache entry that cannot name the binary that produced it is not safe to serve. \
+             Nothing else changes: every unit is diffed fresh."
         );
     }
     // `--deduplicate` makes a unit's emitted functions depend on every unit diffed
