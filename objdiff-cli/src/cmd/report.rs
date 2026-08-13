@@ -2583,6 +2583,8 @@ fn write_trending_output(
 
 #[cfg(test)]
 mod tests {
+    use objdiff_core::config::ProjectOptionValue;
+
     use super::*;
 
     #[test]

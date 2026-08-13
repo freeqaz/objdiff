@@ -2543,7 +2543,7 @@ mod tests {
         let row = InstructionDiffRow::default();
         let eq = std::collections::HashMap::new();
         let constant = InstructionArg::Value(InstructionArgValue::Unsigned(0x8311));
-        let mut check = |left_arg: &InstructionArg, mode| {
+        let check = |left_arg: &InstructionArg, mode| {
             arg_eq(
                 &left,
                 &right,
