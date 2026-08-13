@@ -17,7 +17,7 @@ use objdiff_core::{
         ReportUnitMetadata,
     },
     config::{
-        ProjectObject, ProjectOptionValue, ProjectOptions, apply_project_options,
+        ProjectObject, ProjectOptions, apply_project_options,
         path::platform_path,
     },
     diff,
