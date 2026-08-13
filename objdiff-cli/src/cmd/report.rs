@@ -587,16 +587,34 @@ fn generate(args: GenerateArgs) -> Result<()> {
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".objdiff_report_cache"));
     let tool_binary_hash = tool_binary_hash();
-    // Say it only when it is news. Under `--no-cache` the cache was already off by
-    // request, and announcing that it is "disabled for this run" would blame a
-    // failed hash for the user's own flag — and would put a line about a hash
-    // failure in front of every consumer that scrapes this stream, on runs where
-    // nothing went wrong.
+    // Two separate consequences of one failure, and they are not the same warning.
+    //
+    // The first is about IDENTITY and is unconditional. `tool_binary_hash` is what
+    // the proto calls the authoritative identity of the ruler — the one thing that
+    // distinguishes builds `tool_version` and `tool_commit` cannot — and a report
+    // written without it carries no such key at all, since proto3 JSON omits the
+    // empty string. That is a property of the report, permanent, and true whatever
+    // the user asked for the cache. `--no-cache` must not silence it: the two-line
+    // repro is an executable that is `chmod 111` (exec works, `fs::read` does not),
+    // and before this the whole run said nothing.
+    if tool_binary_hash.is_none() {
+        warn!(
+            "Could not hash the objdiff-cli executable, so this report's provenance will \
+             carry no tool_binary_hash. That hash is the authoritative identity of the \
+             binary that measured this report -- tool_version and tool_commit cannot tell \
+             two builds apart -- so this report cannot be compared with another one by \
+             instrument."
+        );
+    }
+    // The second is about the CACHE, and only makes sense when the user did not
+    // already turn it off. Under `--no-cache` it would blame a failed hash for the
+    // user's own flag, and would put a line about a hash failure in front of every
+    // consumer that scrapes this stream on a run where nothing went wrong.
     if tool_binary_hash.is_none() && !args.no_cache {
         warn!(
-            "Could not hash the objdiff-cli executable; report cache disabled for this run. \
-             A cache entry that cannot name the binary that produced it is not safe to serve. \
-             Nothing else changes: every unit is diffed fresh."
+            "Report cache disabled for this run as a result. A cache entry that cannot name \
+             the binary that produced it is not safe to serve. Nothing else changes: every \
+             unit is diffed fresh."
         );
     }
     // `--deduplicate` makes a unit's emitted functions depend on every unit diffed
