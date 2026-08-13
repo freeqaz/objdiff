@@ -1287,44 +1287,88 @@ fn explain_report_parse_failure(err: anyhow::Error, data: &[u8]) -> anyhow::Erro
     if !err.chain().any(|c| c.to_string().contains("unknown field")) {
         return err;
     }
-    let mut hint = String::from(
-        "this report has a field this objdiff-cli does not know about, so it was probably \
-         written by a newer objdiff-cli",
-    );
-    match report_writer_identity(data) {
-        Some(writer) => hint.push_str(&format!(" -- the report's provenance says {writer}")),
-        None => hint.push_str(" (it carries no provenance block, so it cannot say which)"),
+    // "unknown field" is not enough on its own to conclude version skew, because
+    // every JSON document that is not a report at all fails exactly the same way:
+    // the strict pass rejects its first key, `LegacyReport` then fails on missing
+    // fields, and the strict error is what propagates. `{"foo": 1}` was being told
+    // to upgrade objdiff-cli. Require the document to be recognisably a report --
+    // at least one key this binary DOES know -- before diagnosing a skew; otherwise
+    // let the raw serde error stand, which for a not-a-report is already the more
+    // useful message.
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return err;
+    };
+    if !looks_like_a_report(&document) {
+        return err;
     }
-    hint.push_str(&format!(
-        "; this one is {}. Rebuild/upgrade this objdiff-cli, or regenerate the report with this \
-         binary",
+    let hint = format!(
+        "this report has a field this objdiff-cli does not know about, so it was probably \
+         written by a newer objdiff-cli -- {}; this one is {}. Rebuild/upgrade this \
+         objdiff-cli, or regenerate the report with this binary",
+        describe_report_writer(&document),
         crate::build_id::version_line("objdiff-cli")
-    ));
+    );
     err.context(hint)
+}
+
+/// Whether a JSON document is recognisably an objdiff report, for the purpose of
+/// blaming a version skew for its refusal.
+///
+/// One top-level key this binary knows, CARRYING A VALUE OF THE RIGHT SHAPE, is
+/// enough — a report from the future may have renamed or dropped any single one of
+/// them, so requiring more would fail exactly when the hint is wanted. The shape
+/// check is what keeps the name alone from deciding: `{"name": "objdiff.json",
+/// "units": 3}` has a `units`, and is not a report.
+///
+/// Heuristic, and deliberately only used to pick which error text to print. It never
+/// admits or rejects a report — `Report::parse` did that before we were called.
+fn looks_like_a_report(document: &serde_json::Value) -> bool {
+    let has = |key: &str, shaped: fn(&serde_json::Value) -> bool| {
+        document.get(key).is_some_and(shaped)
+    };
+    has("measures", serde_json::Value::is_object)
+        || has("provenance", serde_json::Value::is_object)
+        || has("units", serde_json::Value::is_array)
+        || has("categories", serde_json::Value::is_array)
+        // pbjson accepts a uint32 as either a number or a decimal string.
+        || has("version", |v| {
+            v.is_number() || v.as_str().is_some_and(|s| s.parse::<u64>().is_ok())
+        })
 }
 
 /// Whatever the `provenance` block will admit about the objdiff-cli that wrote a
 /// report, read out of JSON this binary cannot fully deserialize.
 ///
+/// Three answers, and they are different: the block names its writer, the block is
+/// there but names nobody (a build outside a git checkout writes empty strings, and
+/// proto3 JSON then omits the keys), or there is no block at all (the writer
+/// predates provenance, or was not objdiff-cli). Saying "no provenance block" for
+/// the middle case sends the reader looking for something that is right there.
+///
 /// Accepts both spellings of each key: objdiff writes proto field names
 /// (`preserve_proto_field_names`), but pbjson emits and accepts camelCase too, and a
 /// report that has been through another JSON tool may carry either.
-fn report_writer_identity(data: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
-    let provenance = value.get("provenance")?;
-    let field = |snake: &str, camel: &str| -> Option<String> {
+fn describe_report_writer(document: &serde_json::Value) -> String {
+    let Some(provenance) = document.get("provenance") else {
+        return "it carries no provenance block, so it cannot name its writer".to_string();
+    };
+    let field = |snake: &str, camel: &str| -> Option<&str> {
         provenance
             .get(snake)
             .or_else(|| provenance.get(camel))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
     };
     match (field("tool_version", "toolVersion"), field("tool_commit", "toolCommit")) {
-        (Some(version), Some(commit)) => Some(format!("tool_version {version} ({commit})")),
-        (Some(version), None) => Some(format!("tool_version {version}")),
-        (None, Some(commit)) => Some(format!("tool_commit {commit}")),
-        (None, None) => None,
+        (Some(version), Some(commit)) => {
+            format!("the report's provenance says tool_version {version} ({commit})")
+        }
+        (Some(version), None) => format!("the report's provenance says tool_version {version}"),
+        (None, Some(commit)) => format!("the report's provenance says tool_commit {commit}"),
+        (None, None) => {
+            "its provenance block does not identify its writer (no tool_version, no tool_commit)"
+                .to_string()
+        }
     }
 }
 
@@ -3083,5 +3127,54 @@ mod tests {
         // Malformed JSON is a syntax error, not a skew: no hint.
         let rendered = format!("{:#}", parse_report(b"{\"version\":").unwrap_err());
         assert!(!rendered.contains("newer objdiff-cli"), "{rendered}");
+    }
+
+    /// A provenance block that names nobody -- what a build outside a git checkout
+    /// writes, since proto3 JSON omits the empty strings -- must not be described as
+    /// a missing block. It is right there, and it is empty.
+    #[test]
+    fn test_parse_report_distinguishes_an_anonymous_provenance_from_a_missing_one() {
+        let anonymous = r#"{
+            "version": 2, "units": [],
+            "provenance": {"cache_hits": 3},
+            "something_a_later_objdiff_added": 1
+        }"#;
+        let rendered = format!("{:#}", parse_report(anonymous.as_bytes()).unwrap_err());
+        assert!(rendered.contains("does not identify its writer"), "{rendered}");
+        assert!(!rendered.contains("no provenance block"), "{rendered}");
+    }
+
+    /// JSON that is not a report at all fails identically -- the strict pass rejects
+    /// its first key, `LegacyReport` then fails on missing fields, and the strict
+    /// "unknown field" error is what propagates. Telling that user to upgrade
+    /// objdiff-cli is a wrong answer delivered confidently, so the hint stays out of
+    /// it and the raw serde error stands.
+    #[test]
+    fn test_parse_report_does_not_diagnose_a_skew_for_a_document_that_is_not_a_report() {
+        for not_a_report in [
+            r#"{"foo": 1}"#,
+            // A `units` key, but a report's `units` is a list. The name alone must
+            // not decide, or every config file with a colliding key gets diagnosed.
+            r#"{"name": "objdiff.json", "units": 3}"#,
+            r#"{"version": "1.2.3-beta", "dependencies": {}}"#, // package.json, not a report
+            // (`{}` is not in this list: every Report field is optional, so an empty
+            // object parses as an empty report and never reaches an error at all.)
+        ] {
+            let err = parse_report(not_a_report.as_bytes()).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(!rendered.contains("newer objdiff-cli"), "{not_a_report} -> {rendered}");
+            assert!(!rendered.contains("Rebuild/upgrade"), "{not_a_report} -> {rendered}");
+        }
+    }
+
+    /// ...but a document carrying any key this binary knows is a report, and still
+    /// gets diagnosed. This is the boundary the test above must not overshoot.
+    #[test]
+    fn test_parse_report_diagnoses_a_skew_from_any_one_known_key() {
+        for known in ["\"measures\": {}", "\"units\": []", "\"version\": 2", "\"categories\": []"] {
+            let doc = format!("{{{known}, \"something_a_later_objdiff_added\": 1}}");
+            let rendered = format!("{:#}", parse_report(doc.as_bytes()).unwrap_err());
+            assert!(rendered.contains("newer objdiff-cli"), "{doc} -> {rendered}");
+        }
     }
 }
