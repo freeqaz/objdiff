@@ -164,7 +164,7 @@ message Measures {
   // changes, that is a BUG. See the per-item `ReportItem.masked_equal` bit and
   // docs/decomp/identity-transfer.md.
   //
-  //     matched_functions - masked_equal_functions  =  a CONSERVATIVE FLOOR
+  //   matched_functions - masked_equal_functions  =  a CONSERVATIVE FLOOR
   //
   // Read it as a floor and nothing more. It is NOT "the number of real matches":
   // source 0 subtracts credit that our compiler genuinely supplied, so the true
@@ -172,8 +172,8 @@ message Measures {
   // quote the floor as if it were an estimate of the truth, and do not quote
   // `matched_functions` as if the attribution were verified. Two different
   // questions:
-  //     "did we emit this many matching bodies?"      -> matched_functions
-  //     "how many are name-verified, row by row?"     -> >= the floor
+  //   "did we emit this many matching bodies?"      -> matched_functions
+  //   "how many are name-verified, row by row?"     -> >= the floor
   //
   // There is deliberately no byte-side counterpart field: the byte figure is
   // derivable from the report itself as the sum of `size` over `functions` items
