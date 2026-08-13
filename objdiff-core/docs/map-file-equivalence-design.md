@@ -98,23 +98,46 @@ today's scores:
   survivor, survivors never reused). 638,357 co-occurring pairs; **0** pairs
   where first-wins and union disagree on `aliases` — every folded↔survivor
   pair is rescued by the survivor's own single-group entry via the symmetric
-  lookup. An accident of the star shape, not a property of first-wins.
+  lookup. That rescue is *provable* from a generator invariant, not luck:
+  every co-occurring pair contains its group's survivor, and survivors are
+  single-address (measured: survivors also folded in another group — 0 on
+  both repos; adversarial review shuffled group order 200× per map, 0
+  divergence, worst case 0 dropped pairs). But it is a **data invariant no
+  generator checks** — nothing in either repo's tooling enforces it, so it
+  is one `symbol_aliases.json` edit from breaking, silently.
+  `test_line_order_is_not_evidence` and
+  `test_pair_asserted_only_in_a_late_group_still_aliases` guard a shape
+  neither generator can currently emit.
 - dc3 `build/373307D9/icf_aliases.map`: 2,056 groups, 8,703 names, **0**
   names at >1 address (closure classes = a true partition). 599,914 pairs, 0
   disagreements; every design under consideration is identical here.
 - The `canonical` labelings DO differ on rb3-xenon (389 of 6,920 names;
   first-wins' labeling conflates 4,990 pairs union's does not, union's 389
   first-wins' does not — both artifacts of representative-keying over a
-  non-transitive relation). This reaches only the opt-in case-B pass, which
-  is oracle-gated; the default `report generate` path never calls
-  `canonical`.
+  non-transitive relation). The safety-relevant split of those numbers
+  (adversarial review): **spurious** keying collisions — unasserted pairs
+  conflated — are SET-IDENTICAL under both designs (3,651 pairs, symmetric
+  difference 0), so union adds *zero* new fabrication risk; what changes is
+  **misses** of asserted pairs (union 7,035 vs first-wins 2,434), a pure
+  recall reduction in the opt-in case-B index — strictly the safe
+  direction. This reaches only the case-B pass, which is oracle-gated; the
+  default `report generate` path never calls `canonical`.
 - Report-level verification (fresh release binaries — main at `9f6c6c3`,
   this branch at its first commit of this design — one `-o` per binary,
   `--no-cache`, `.cache` sidecars removed, rb3-xenon and dc3 at both
   `functionRelocDiffs=none` and `name_check`): all eight report bodies are
   **exactly equal** between the two binaries; the only differing fields are
-  `provenance.tool_binary_hash` and `provenance.tool_commit`. Headline
-  numbers (identical main vs lane in every arm):
+  `provenance.tool_binary_hash` and `provenance.tool_commit`. Read the
+  table honestly: it is **4 arms of signal plus 4 controls**. At
+  `functionRelocDiffs=none`, `reloc_eq` returns at
+  `if relax_reloc_diffs { return true; }` *before* either `aliases()` call,
+  and `canonical()` is unreachable without `--global-byte-eq` — so on the
+  default report path under `none`, `SymbolEquivalences` is never consulted
+  at all (proved by a control assertion in the real path during adversarial
+  review); the two `none` arms would match even if `aliases()` returned
+  garbage. The controls are still worth running: they prove the type change
+  touches nothing outside the name-checking rulers. Headline numbers
+  (identical main vs lane in every arm):
 
   | arm | matched_code | matched_code% | matched_fns | complete_code |
   |---|---|---|---|---|
