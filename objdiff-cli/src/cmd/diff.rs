@@ -1369,13 +1369,11 @@ fn run_batch(args: Args) -> Result<()> {
     // Target index: mangled name → unit
     let mut target_mangled_index: HashMap<String, String> = HashMap::new();
     for (unit_name, (obj_config, _)) in &object_configs {
-        if let Some(target_path) = obj_config.target_path.as_deref() {
-            if let Ok(syms) = obj::read::list_function_symbols(target_path.as_ref()) {
-                for sym in syms {
-                    target_mangled_index
-                        .entry(sym)
-                        .or_insert_with(|| unit_name.clone());
-                }
+        if let Some(target_path) = obj_config.target_path.as_deref()
+            && let Ok(syms) = obj::read::list_function_symbols(target_path.as_ref())
+        {
+            for sym in syms {
+                target_mangled_index.entry(sym).or_insert_with(|| unit_name.clone());
             }
         }
     }
@@ -1383,13 +1381,11 @@ fn run_batch(args: Args) -> Result<()> {
     // Base index for cross-unit COMDAT fallback
     let mut base_symbol_index: HashMap<String, String> = HashMap::new();
     for (unit_name, (obj_config, _)) in &object_configs {
-        if let Some(base_path) = obj_config.base_path.as_deref() {
-            if let Ok(syms) = obj::read::list_function_symbols(base_path.as_ref()) {
-                for sym in syms {
-                    base_symbol_index
-                        .entry(sym)
-                        .or_insert_with(|| unit_name.clone());
-                }
+        if let Some(base_path) = obj_config.base_path.as_deref()
+            && let Ok(syms) = obj::read::list_function_symbols(base_path.as_ref())
+        {
+            for sym in syms {
+                base_symbol_index.entry(sym).or_insert_with(|| unit_name.clone());
             }
         }
     }
@@ -1604,83 +1600,111 @@ fn run_batch(args: Args) -> Result<()> {
                 // Cross-unit COMDAT fallback
                 if base_size == 0 && name_target_idx.is_some() {
                     let fallback = base_symbol_index.get(symbol_name.as_str());
-                    if let Some(fallback_unit) = fallback {
-                        if fallback_unit != unit_name {
-                            if let Some((fallback_config, _)) = object_configs.get(fallback_unit) {
-                                if let Some(fallback_base_path) = fallback_config.base_path.as_deref() {
-                                    if let Ok(fb_obj) = obj::read::read(fallback_base_path.as_ref(), &diff_config, DiffSide::Base) {
-                                        let fb_diff = diff_objs(
-                                            target_obj.as_ref(), Some(&fb_obj),
-                                            None, &diff_config, &mapping_config,
-                                        )?;
-                                        let fb_sd = &fb_diff.left.as_ref().unwrap().symbols[symbol_idx];
-                                        let fb_bsi = fb_sd.target_symbol;
-                                        let fb_bs = fb_bsi.map(|i| fb_obj.symbols[i].size).unwrap_or(0);
+                    if let Some(fallback_unit) = fallback
+                        && fallback_unit != unit_name
+                        && let Some((fallback_config, _)) = object_configs.get(fallback_unit)
+                        && let Some(fallback_base_path) = fallback_config.base_path.as_deref()
+                        && let Ok(fb_obj) = obj::read::read(
+                            fallback_base_path.as_ref(),
+                            &diff_config,
+                            DiffSide::Base,
+                        )
+                    {
+                        let fb_diff = diff_objs(
+                            target_obj.as_ref(),
+                            Some(&fb_obj),
+                            None,
+                            &diff_config,
+                            &mapping_config,
+                        )?;
+                        let fb_sd = &fb_diff.left.as_ref().unwrap().symbols[symbol_idx];
+                        let fb_bsi = fb_sd.target_symbol;
+                        let fb_bs = fb_bsi.map(|i| fb_obj.symbols[i].size).unwrap_or(0);
 
-                                        if fb_bs > 0 {
-                                            let fb_alt_cfg = {
-                                                let mut c = diff_config.clone();
-                                                match c.function_reloc_diffs {
-                                                    diff::FunctionRelocDiffs::NameAddress =>
-                                                        c.function_reloc_diffs = diff::FunctionRelocDiffs::DataValue,
-                                                    _ =>
-                                                        c.function_reloc_diffs = diff::FunctionRelocDiffs::NameAddress,
-                                                }
-                                                c
-                                            };
-                                            let fb_alt = diff_objs(
-                                                target_obj.as_ref(), Some(&fb_obj),
-                                                None, &fb_alt_cfg, &mapping_config,
-                                            )?;
-                                            let fb_instrs = build_instruction_diffs(
-                                                target_obj.as_ref(), Some(&fb_obj),
-                                                fb_diff.left.as_ref(), fb_diff.right.as_ref(),
-                                                Some(symbol_idx), fb_bsi, &diff_config,
-                                            )?;
-                                            let fb_summary = InstructionSummary::from_instructions(&fb_instrs);
-                                            let fb_analysis = super::analysis::analyze_instructions(&fb_instrs);
-                                            let fb_verdict = super::analysis::compute_verdict(
-                                                &fb_summary, &fb_analysis, fb_sd.match_percent, fb_bs, target_size,
-                                            );
-                                            let (fb_norm, fb_raw) = match diff_config.function_reloc_diffs {
-                                                diff::FunctionRelocDiffs::NameAddress => (
-                                                    fb_alt.left.as_ref().and_then(|d| d.symbols.get(symbol_idx)).and_then(|s| s.match_percent),
-                                                    fb_sd.match_percent,
-                                                ),
-                                                _ => (
-                                                    fb_sd.match_percent,
-                                                    fb_alt.left.as_ref().and_then(|d| d.symbols.get(symbol_idx)).and_then(|s| s.match_percent),
-                                                ),
-                                            };
-                                            let output = DiffOutput {
-                                                symbol: symbol_name.clone(),
-                                                demangled: symbol.demangled_name.clone(),
-                                                unit: Some(unit_name.clone()),
-                                                target_size,
-                                                base_size: fb_bs,
-                                                fuzzy_match_percent: fb_norm,
-                                                normalized_match_percent: fb_norm,
-                                                raw_match_percent: fb_raw,
-                                                diff_score: fb_sd.diff_score.map(|(s, m)| DiffScoreOutput { score: s, max_score: m }),
-                                                build_status: None,
-                                                instruction_summary: Some(fb_summary),
-                                                analysis: Some(fb_analysis),
-                                                verdict: Some(fb_verdict),
-                                                call_diff: None,
-                                                insert_delete_clusters: None,
-                                                diff_regions: None,
-                                                instructions: None,
-                                                masked_equal_rows: fb_sd.masked_equal_rows,
-                                                reloc_ignored_rows: fb_sd.reloc_ignored_rows,
-                                                masked_equal_symbol: fb_sd.masked_equal_symbol,
-                                                data_diff: None,
-                                            };
-                                            lines.push(serde_json::to_string(&output)?);
-                                            continue;
-                                        }
+                        if fb_bs > 0 {
+                            let fb_alt_cfg = {
+                                let mut c = diff_config.clone();
+                                match c.function_reloc_diffs {
+                                    diff::FunctionRelocDiffs::NameAddress => {
+                                        c.function_reloc_diffs = diff::FunctionRelocDiffs::DataValue
+                                    }
+                                    _ => {
+                                        c.function_reloc_diffs =
+                                            diff::FunctionRelocDiffs::NameAddress
                                     }
                                 }
-                            }
+                                c
+                            };
+                            let fb_alt = diff_objs(
+                                target_obj.as_ref(),
+                                Some(&fb_obj),
+                                None,
+                                &fb_alt_cfg,
+                                &mapping_config,
+                            )?;
+                            let fb_instrs = build_instruction_diffs(
+                                target_obj.as_ref(),
+                                Some(&fb_obj),
+                                fb_diff.left.as_ref(),
+                                fb_diff.right.as_ref(),
+                                Some(symbol_idx),
+                                fb_bsi,
+                                &diff_config,
+                            )?;
+                            let fb_summary = InstructionSummary::from_instructions(&fb_instrs);
+                            let fb_analysis = super::analysis::analyze_instructions(&fb_instrs);
+                            let fb_verdict = super::analysis::compute_verdict(
+                                &fb_summary,
+                                &fb_analysis,
+                                fb_sd.match_percent,
+                                fb_bs,
+                                target_size,
+                            );
+                            let (fb_norm, fb_raw) = match diff_config.function_reloc_diffs {
+                                diff::FunctionRelocDiffs::NameAddress => (
+                                    fb_alt
+                                        .left
+                                        .as_ref()
+                                        .and_then(|d| d.symbols.get(symbol_idx))
+                                        .and_then(|s| s.match_percent),
+                                    fb_sd.match_percent,
+                                ),
+                                _ => (
+                                    fb_sd.match_percent,
+                                    fb_alt
+                                        .left
+                                        .as_ref()
+                                        .and_then(|d| d.symbols.get(symbol_idx))
+                                        .and_then(|s| s.match_percent),
+                                ),
+                            };
+                            let output = DiffOutput {
+                                symbol: symbol_name.clone(),
+                                demangled: symbol.demangled_name.clone(),
+                                unit: Some(unit_name.clone()),
+                                target_size,
+                                base_size: fb_bs,
+                                fuzzy_match_percent: fb_norm,
+                                normalized_match_percent: fb_norm,
+                                raw_match_percent: fb_raw,
+                                diff_score: fb_sd
+                                    .diff_score
+                                    .map(|(s, m)| DiffScoreOutput { score: s, max_score: m }),
+                                build_status: None,
+                                instruction_summary: Some(fb_summary),
+                                analysis: Some(fb_analysis),
+                                verdict: Some(fb_verdict),
+                                call_diff: None,
+                                insert_delete_clusters: None,
+                                diff_regions: None,
+                                instructions: None,
+                                masked_equal_rows: fb_sd.masked_equal_rows,
+                                reloc_ignored_rows: fb_sd.reloc_ignored_rows,
+                                masked_equal_symbol: fb_sd.masked_equal_symbol,
+                                data_diff: None,
+                            };
+                            lines.push(serde_json::to_string(&output)?);
+                            continue;
                         }
                     }
                 }
@@ -1760,7 +1784,7 @@ fn run_batch(args: Args) -> Result<()> {
             }
 
             let done = units_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 100 == 0 {
+            if done.is_multiple_of(100) {
                 eprintln!("  [{}/{}] units processed", done, units_total);
             }
 
@@ -1859,14 +1883,14 @@ fn build_data_diff(
                 mismatch_byte_count += seg.size;
             }
             let kind = data_diff_kind_str(seg.kind);
-            if let Some(last) = segments.last_mut() {
-                if last.kind == kind {
-                    last.size += seg.size;
-                    seg_bytes.last_mut().unwrap().extend_from_slice(&seg.data);
-                    other_seg_bytes.last_mut().unwrap().extend_from_slice(other_data);
-                    offset += seg.size;
-                    continue;
-                }
+            if let Some(last) = segments.last_mut()
+                && last.kind == kind
+            {
+                last.size += seg.size;
+                seg_bytes.last_mut().unwrap().extend_from_slice(&seg.data);
+                other_seg_bytes.last_mut().unwrap().extend_from_slice(other_data);
+                offset += seg.size;
+                continue;
             }
             segments.push(DataSegmentOutput {
                 offset,

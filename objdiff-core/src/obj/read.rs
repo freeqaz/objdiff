@@ -1261,10 +1261,10 @@ pub fn list_function_symbols(obj_path: &std::path::Path) -> Result<Vec<String>> 
         if symbol.is_undefined() {
             continue;
         }
-        if let Ok(name) = symbol.name() {
-            if !name.is_empty() {
-                names.push(name.to_string());
-            }
+        if let Ok(name) = symbol.name()
+            && !name.is_empty()
+        {
+            names.push(name.to_string());
         }
     }
     Ok(names)

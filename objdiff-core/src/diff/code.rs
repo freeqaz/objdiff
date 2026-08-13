@@ -932,10 +932,11 @@ fn is_placeholder_symbol_name(name: &str) -> bool {
 /// instead. See `counter_named_data_eq`.
 fn is_counter_suffixed_name(name: &str) -> bool {
     // `@<digits>`: mwcc's anonymous literal pool.
-    if let Some(rest) = name.strip_prefix('@') {
-        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-            return true;
-        }
+    if let Some(rest) = name.strip_prefix('@')
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
     }
     // `<identifier>$<digits>`: a named datum plus the TU counter that
     // disambiguates it. Require a non-empty identifier so a bare `$12` (which
@@ -979,8 +980,8 @@ fn counter_named_data_eq(
         return false;
     }
     match (
-        counter_named_content(left_obj, left_reloc.relocation.target_symbol as usize),
-        counter_named_content(right_obj, right_reloc.relocation.target_symbol as usize),
+        counter_named_content(left_obj, left_reloc.relocation.target_symbol),
+        counter_named_content(right_obj, right_reloc.relocation.target_symbol),
     ) {
         (Some(l), Some(r)) => content_eq(&l, &r),
         // Unreadable on one or both sides: unverifiable, so not charged.
@@ -1203,6 +1204,7 @@ fn ins_data_literals_eq(
 ///     inside the extent of, the function being diffed;
 ///   * theirs is a zero-addend relocation naming that very function, in that
 ///     function's own section.
+///
 /// A wrong callee, a wrong datum, or a reference to any OTHER function is still
 /// charged. What it cannot see — and no reading of the target object can, since
 /// the addend is gone — is our interior offset differing from retail's; that
@@ -1311,17 +1313,11 @@ fn reloc_eq(
         _ => {
             let (left_name, left_index) = match left_anchor {
                 PoolAnchor::Resolved(name, index) => (name, index),
-                _ => (
-                    left_reloc.symbol.name.as_str(),
-                    left_reloc.relocation.target_symbol as usize,
-                ),
+                _ => (left_reloc.symbol.name.as_str(), left_reloc.relocation.target_symbol),
             };
             let (right_name, right_index) = match right_anchor {
                 PoolAnchor::Resolved(name, index) => (name, index),
-                _ => (
-                    right_reloc.symbol.name.as_str(),
-                    right_reloc.relocation.target_symbol as usize,
-                ),
+                _ => (right_reloc.symbol.name.as_str(), right_reloc.relocation.target_symbol),
             };
             if left_name == right_name {
                 return true;
