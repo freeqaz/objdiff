@@ -28,10 +28,10 @@ fn main() {
             println!("cargo:rerun-if-changed={p}");
         }
     }
-    if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(p) = git(&["rev-parse", "--git-path", &head_ref]) {
-            println!("cargo:rerun-if-changed={p}");
-        }
+    if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(p) = git(&["rev-parse", "--git-path", &head_ref])
+    {
+        println!("cargo:rerun-if-changed={p}");
     }
 
     let commit = match git(&["rev-parse", "--short=12", "HEAD"]) {

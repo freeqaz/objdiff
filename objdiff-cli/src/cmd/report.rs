@@ -587,10 +587,34 @@ fn generate(args: GenerateArgs) -> Result<()> {
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".objdiff_report_cache"));
     let tool_binary_hash = tool_binary_hash();
+    // Two separate consequences of one failure, and they are not the same warning.
+    //
+    // The first is about IDENTITY and is unconditional. `tool_binary_hash` is what
+    // the proto calls the authoritative identity of the ruler — the one thing that
+    // distinguishes builds `tool_version` and `tool_commit` cannot — and a report
+    // written without it carries no such key at all, since proto3 JSON omits the
+    // empty string. That is a property of the report, permanent, and true whatever
+    // the user asked for the cache. `--no-cache` must not silence it: the two-line
+    // repro is an executable that is `chmod 111` (exec works, `fs::read` does not),
+    // and before this the whole run said nothing.
     if tool_binary_hash.is_none() {
         warn!(
-            "Could not hash the objdiff-cli executable; report cache disabled for this run. \
-             A cache entry that cannot name the binary that produced it is not safe to serve."
+            "Could not hash the objdiff-cli executable, so this report's provenance will \
+             carry no tool_binary_hash. That hash is the authoritative identity of the \
+             binary that measured this report -- tool_version and tool_commit cannot tell \
+             two builds apart -- so this report cannot be compared with another one by \
+             instrument."
+        );
+    }
+    // The second is about the CACHE, and only makes sense when the user did not
+    // already turn it off. Under `--no-cache` it would blame a failed hash for the
+    // user's own flag, and would put a line about a hash failure in front of every
+    // consumer that scrapes this stream on a run where nothing went wrong.
+    if tool_binary_hash.is_none() && !args.no_cache {
+        warn!(
+            "Report cache disabled for this run as a result. A cache entry that cannot name \
+             the binary that produced it is not safe to serve. Nothing else changes: every \
+             unit is diffed fresh."
         );
     }
     // `--deduplicate` makes a unit's emitted functions depend on every unit diffed
@@ -1247,12 +1271,155 @@ fn read_report(path: &Utf8PlatformPath) -> Result<Report> {
     if path == Utf8PlatformPath::new("-") {
         let mut data = vec![];
         std::io::stdin().read_to_end(&mut data)?;
-        return Report::parse(&data).with_context(|| "Failed to load report from stdin");
+        return parse_report(&data).with_context(|| "Failed to load report from stdin");
     }
     let file = File::open(path).with_context(|| format!("Failed to open {path}"))?;
     let mmap =
         unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("Failed to map {path}"))?;
-    Report::parse(mmap.as_ref()).with_context(|| format!("Failed to load report {path}"))
+    parse_report(mmap.as_ref()).with_context(|| format!("Failed to load report {path}"))
+}
+
+/// [`Report::parse`], with a failure a human can act on.
+///
+/// Every consumer of a report reaches it through `read_report` (`changes`, `summary`,
+/// `query`, `function`, `analyze`, `trending`), so all six get the same diagnosis.
+fn parse_report(data: &[u8]) -> Result<Report> {
+    Report::parse(data).map_err(|e| explain_report_parse_failure(e, data))
+}
+
+/// Turn `unknown field 'x', expected one of ...` into the sentence that explains it.
+///
+/// Report JSON is deserialized with `deny_unknown_fields`, so a report written by a
+/// NEWER objdiff-cli than this one fails naming a field the reader has never heard
+/// of, and saying nothing about why it is there. The cause is almost always a version
+/// skew between the binary that wrote the report and the binary reading it, and the
+/// report itself can usually say so: `provenance` records the writer's version and
+/// commit. Read that block LENIENTLY (`serde_json::Value`) -- the strict deserializer
+/// has just refused this document, and asking it again would fail the same way.
+///
+/// Decorates a failure and nothing else. By the time this is called,
+/// [`Report::parse`] has already tried binary protobuf, strict JSON, and the
+/// legacy-JSON fallback; a legacy report reaches `Ok` through `LegacyReport` and
+/// never arrives here, even though its strict pass also failed on an unknown field.
+fn explain_report_parse_failure(err: anyhow::Error, data: &[u8]) -> anyhow::Error {
+    if !err.chain().any(|c| c.to_string().contains("unknown field")) {
+        return err;
+    }
+    // "unknown field" is not enough on its own to conclude version skew, because
+    // every JSON document that is not a report at all fails exactly the same way:
+    // the strict pass rejects its first key, `LegacyReport` then fails on missing
+    // fields, and the strict error is what propagates. `{"foo": 1}` was being told
+    // to upgrade objdiff-cli. Require the document to be recognisably a report --
+    // at least one key this binary DOES know -- before diagnosing a skew; otherwise
+    // let the raw serde error stand, which for a not-a-report is already the more
+    // useful message.
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return err;
+    };
+    if !looks_like_a_report(&document) {
+        return err;
+    }
+    let hint = format!(
+        "this report has a field this objdiff-cli does not know about, so it was probably \
+         written by a newer objdiff-cli -- {}; this one is {}. Rebuild/upgrade this \
+         objdiff-cli, or regenerate the report with this binary",
+        describe_report_writer(&document),
+        crate::build_id::version_line("objdiff-cli")
+    );
+    err.context(hint)
+}
+
+/// Top-level keys belonging to objdiff's PROJECT config (`objdiff.json`), which is
+/// never a report.
+///
+/// This is the near-miss that matters: the two files sit side by side in every repo
+/// objdiff diffs, they are both JSON, and they share a `units` key whose value is an
+/// array in both — so a project config pointed at a report-reading flag looks
+/// exactly like a report to any shape check. `units` is therefore NOT in this list.
+/// It is the collision, not the tell.
+///
+/// From `objdiff_core::config::ProjectConfig`, minus `units`. A field added there
+/// and not here costs a wrong error message, nothing more.
+const PROJECT_CONFIG_ONLY_KEYS: [&str; 12] = [
+    "min_version",
+    "custom_make",
+    "custom_args",
+    "target_dir",
+    "base_dir",
+    "build_base",
+    "build_target",
+    "watch_patterns",
+    "ignore_patterns",
+    "progress_categories",
+    "options",
+    "map_file",
+];
+
+/// Whether a JSON document is recognisably an objdiff report, for the purpose of
+/// blaming a version skew for its refusal.
+///
+/// Two questions, in order. Does it carry a key that rules a report OUT — the
+/// `objdiff.json` vocabulary above? Then no, whatever else it has. Otherwise, does
+/// it carry one DISTINCTIVE report key with a value of the right shape?
+///
+/// One key is deliberately enough: a report from the future may have renamed or
+/// dropped any single one of them, and requiring two would withhold the hint exactly
+/// when it is wanted. Four qualify, so any one rename still leaves three.
+///
+/// `version` is not among them, and that is the point. It is the most common key in
+/// any JSON config ever written — `{"version": 3, "services": {…}}` is a
+/// docker-compose file, and it was being told to upgrade its objdiff-cli. A document
+/// whose only objdiff-shaped evidence is `version` is not evidence.
+///
+/// Heuristic, and only ever used to pick which error text to print. It never admits
+/// or rejects a report — `Report::parse` did that before we were called.
+fn looks_like_a_report(document: &serde_json::Value) -> bool {
+    if PROJECT_CONFIG_ONLY_KEYS.iter().any(|key| document.get(key).is_some()) {
+        return false;
+    }
+    let has = |key: &str, shaped: fn(&serde_json::Value) -> bool| {
+        document.get(key).is_some_and(shaped)
+    };
+    has("measures", serde_json::Value::is_object)
+        || has("provenance", serde_json::Value::is_object)
+        || has("units", serde_json::Value::is_array)
+        || has("categories", serde_json::Value::is_array)
+}
+
+/// Whatever the `provenance` block will admit about the objdiff-cli that wrote a
+/// report, read out of JSON this binary cannot fully deserialize.
+///
+/// Three answers, and they are different: the block names its writer, the block is
+/// there but names nobody (a build outside a git checkout writes empty strings, and
+/// proto3 JSON then omits the keys), or there is no block at all (the writer
+/// predates provenance, or was not objdiff-cli). Saying "no provenance block" for
+/// the middle case sends the reader looking for something that is right there.
+///
+/// Accepts both spellings of each key: objdiff writes proto field names
+/// (`preserve_proto_field_names`), but pbjson emits and accepts camelCase too, and a
+/// report that has been through another JSON tool may carry either.
+fn describe_report_writer(document: &serde_json::Value) -> String {
+    let Some(provenance) = document.get("provenance") else {
+        return "it carries no provenance block, so it cannot name its writer".to_string();
+    };
+    let field = |snake: &str, camel: &str| -> Option<&str> {
+        provenance
+            .get(snake)
+            .or_else(|| provenance.get(camel))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    match (field("tool_version", "toolVersion"), field("tool_commit", "toolCommit")) {
+        (Some(version), Some(commit)) => {
+            format!("the report's provenance says tool_version {version} ({commit})")
+        }
+        (Some(version), None) => format!("the report's provenance says tool_version {version}"),
+        (None, Some(commit)) => format!("the report's provenance says tool_commit {commit}"),
+        (None, None) => {
+            "its provenance block does not identify its writer (no tool_version, no tool_commit)"
+                .to_string()
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2916,5 +3083,190 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(Some(hash), tool_binary_hash());
+    }
+
+    // ── Reading a report written by a different objdiff-cli.
+    //
+    // Three shapes go through `parse_report`, and only the third may be decorated.
+    // The other two are the fallback chain inside `Report::parse`, which the
+    // diagnosis must not disturb: a legacy report ALSO fails the strict pass with an
+    // unknown field, and still has to come back Ok.
+
+    /// A current-shape report, provenance and all.
+    fn current_report_json() -> String {
+        r#"{
+            "measures": {"fuzzy_match_percent": 42.5, "total_code": 100, "matched_code": 40},
+            "units": [],
+            "version": 2,
+            "provenance": {
+                "tool_version": "9.9.9",
+                "tool_binary_hash": "0123456789abcdef",
+                "tool_commit": "cafef00dbaad"
+            }
+        }"#
+        .to_string()
+    }
+
+    /// (a) The normal case: this binary's own output reads back.
+    #[test]
+    fn test_parse_report_accepts_a_current_report() {
+        let report = parse_report(current_report_json().as_bytes()).unwrap();
+        assert_eq!(report.version, 2);
+        let provenance =
+            report.provenance.as_ref().expect("provenance must survive the round trip");
+        assert_eq!(provenance.tool_version, "9.9.9");
+        assert_eq!(provenance.tool_commit, "cafef00dbaad");
+        assert_eq!(report.measures.as_ref().unwrap().total_code, 100);
+    }
+
+    /// (b) The invariant: pre-v0 JSON still migrates in through `LegacyReport`. Its
+    /// strict pass fails on `unknown field 'fuzzy_match_percent'` -- the same class of
+    /// error the hint decorates -- so this is the test that catches a diagnosis wired
+    /// one layer too early.
+    #[test]
+    fn test_parse_report_still_accepts_a_legacy_report() {
+        let legacy = r#"{
+            "fuzzy_match_percent": 50.0,
+            "total_code": 200,
+            "matched_code": 100,
+            "matched_code_percent": 50.0,
+            "total_data": 20,
+            "matched_data": 10,
+            "matched_data_percent": 50.0,
+            "total_functions": 4,
+            "matched_functions": 2,
+            "matched_functions_percent": 50.0,
+            "units": []
+        }"#;
+        let report = parse_report(legacy.as_bytes()).unwrap();
+        let measures = report.measures.as_ref().expect("legacy measures are lifted into Measures");
+        assert_eq!(measures.total_code, 200);
+        assert_eq!(measures.matched_functions, 2);
+        // Legacy reports carry no version; `migrate` is what raises it later.
+        assert_eq!(report.version, 0);
+    }
+
+    /// (c) A field from the future: the error has to name the cause and both binaries.
+    #[test]
+    fn test_parse_report_from_the_future_explains_the_version_skew() {
+        let future = current_report_json().replace(
+            "\"version\": 2,",
+            "\"version\": 2, \"something_a_later_objdiff_added\": {\"x\": 1},",
+        );
+        let err = parse_report(future.as_bytes()).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("newer objdiff-cli"), "{rendered}");
+        // The writer, read leniently out of a document the strict deserializer refused.
+        assert!(rendered.contains("9.9.9"), "{rendered}");
+        assert!(rendered.contains("cafef00dbaad"), "{rendered}");
+        // This binary, so the two can be compared without a second command.
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")), "{rendered}");
+        assert!(rendered.contains("Rebuild/upgrade"), "{rendered}");
+        // And the original serde message survives underneath the hint.
+        assert!(rendered.contains("unknown field"), "{rendered}");
+    }
+
+    /// A report with no provenance says so rather than inventing a version, and an
+    /// error that is not a version skew is passed through untouched.
+    #[test]
+    fn test_parse_report_hint_is_honest_about_what_it_does_not_know() {
+        let future = r#"{"version": 2, "units": [], "something_a_later_objdiff_added": 1}"#;
+        let rendered = format!("{:#}", parse_report(future.as_bytes()).unwrap_err());
+        assert!(rendered.contains("no provenance block"), "{rendered}");
+
+        // Malformed JSON is a syntax error, not a skew: no hint.
+        let rendered = format!("{:#}", parse_report(b"{\"version\":").unwrap_err());
+        assert!(!rendered.contains("newer objdiff-cli"), "{rendered}");
+    }
+
+    /// A provenance block that names nobody -- what a build outside a git checkout
+    /// writes, since proto3 JSON omits the empty strings -- must not be described as
+    /// a missing block. It is right there, and it is empty.
+    #[test]
+    fn test_parse_report_distinguishes_an_anonymous_provenance_from_a_missing_one() {
+        let anonymous = r#"{
+            "version": 2, "units": [],
+            "provenance": {"cache_hits": 3},
+            "something_a_later_objdiff_added": 1
+        }"#;
+        let rendered = format!("{:#}", parse_report(anonymous.as_bytes()).unwrap_err());
+        assert!(rendered.contains("does not identify its writer"), "{rendered}");
+        assert!(!rendered.contains("no provenance block"), "{rendered}");
+    }
+
+    /// JSON that is not a report at all fails identically -- the strict pass rejects
+    /// its first key, `LegacyReport` then fails on missing fields, and the strict
+    /// "unknown field" error is what propagates. Telling that user to upgrade
+    /// objdiff-cli is a wrong answer delivered confidently, so the hint stays out of
+    /// it and the raw serde error stands.
+    #[test]
+    fn test_parse_report_does_not_diagnose_a_skew_for_a_document_that_is_not_a_report() {
+        for not_a_report in [
+            r#"{"foo": 1}"#,
+            // The near-miss, in its REAL shape. objdiff.json sits beside the report
+            // in every repo objdiff diffs and its top-level `units` is an ARRAY, so
+            // no shape check on `units` alone can tell them apart -- an earlier
+            // version of this test used `"units": 3` and passed while the real file
+            // failed. `min_version` unknown-fields first, so this is the message a
+            // user pointing `report summary` at their project config actually gets.
+            r#"{
+                "min_version": "2.0.0-beta.5",
+                "custom_make": "ninja",
+                "build_target": false,
+                "watch_patterns": ["*.c", "*.h"],
+                "units": [{"name": "main", "target_path": "a.o", "base_path": "b.o"}],
+                "progress_categories": [{"id": "dol", "name": "DOL"}],
+                "options": {"functionRelocDiffs": "none"}
+            }"#,
+            // Same class, different vocabulary: `version` is the most common key in
+            // any JSON config ever written and is not evidence of anything.
+            r#"{"version": 3, "services": {"web": {"image": "nginx"}}}"#,
+            r#"{"version": "1.2.3-beta", "dependencies": {}}"#, // package.json
+            // A `units` that is not a list: the key name alone must not decide.
+            r#"{"name": "some-tool.json", "units": 3}"#,
+            // (`{}` is not in this list: every Report field is optional, so an empty
+            // object parses as an empty report and never reaches an error at all.)
+        ] {
+            let err = parse_report(not_a_report.as_bytes()).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(!rendered.contains("newer objdiff-cli"), "{not_a_report} -> {rendered}");
+            assert!(!rendered.contains("Rebuild/upgrade"), "{not_a_report} -> {rendered}");
+        }
+    }
+
+    /// ...but a document carrying any ONE distinctive report key is a report, and
+    /// still gets diagnosed. This is the boundary the test above must not overshoot,
+    /// and the property that keeps the hint working for a future report that renamed
+    /// something: four keys qualify, so any one rename still leaves three.
+    #[test]
+    fn test_parse_report_diagnoses_a_skew_from_any_one_distinctive_key() {
+        for known in ["\"measures\": {}", "\"units\": []", "\"categories\": []", "\"provenance\": {}"]
+        {
+            let doc = format!("{{{known}, \"something_a_later_objdiff_added\": 1}}");
+            let rendered = format!("{:#}", parse_report(doc.as_bytes()).unwrap_err());
+            assert!(rendered.contains("newer objdiff-cli"), "{doc} -> {rendered}");
+        }
+        // `version` is deliberately NOT one of them -- see the docker-compose case
+        // above. A document whose only report-shaped key is `version` gets the raw
+        // serde error.
+        let version_only = r#"{"version": 2, "something_a_later_objdiff_added": 1}"#;
+        let rendered = format!("{:#}", parse_report(version_only.as_bytes()).unwrap_err());
+        assert!(!rendered.contains("newer objdiff-cli"), "{rendered}");
+    }
+
+    /// The veto is scoped to keys that are project-config-ONLY. A real report that
+    /// happens to be diagnosed must still be diagnosed, and `units` -- the key both
+    /// files share -- must never be treated as a veto.
+    #[test]
+    fn test_parse_report_veto_does_not_swallow_a_real_report() {
+        let rendered =
+            format!("{:#}", parse_report(current_report_json().replace(
+                "\"version\": 2,",
+                "\"version\": 2, \"something_a_later_objdiff_added\": 1,",
+            ).as_bytes()).unwrap_err());
+        assert!(rendered.contains("newer objdiff-cli"), "{rendered}");
+        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"units"), "units is the collision, not the tell");
+        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"measures"));
+        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"provenance"));
     }
 }

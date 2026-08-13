@@ -37,6 +37,25 @@ message Report {
 // for equality by several tools here; a clock in the report would make every
 // report differ from every other and destroy that. Everything in here changes
 // only when something that can change a NUMBER changes.
+//
+// JSON READERS: this is proto3, so JSON serialization OMITS every zero-valued
+// scalar. A missing key in here means zero (or empty), never "unknown", and it
+// is the ORDINARY case, not the edge one: a fully fresh run writes no
+// `cache_hits` at all, a fully cached one no `cache_misses`, a project with no
+// map file none of the three `map_file*` fields. Read every scalar with a
+// default -- `prov.get("cache_hits", 0)` in Python, never `prov["cache_hits"]`,
+// which raises on exactly the fresh run a consumer is usually checking for.
+// Absence of the whole `provenance` block is the different thing, and the one
+// that does mean unknown: the writer predates it, or was not objdiff-cli.
+//
+// ONE EXEMPTION, and it is the important field: a missing or empty
+// `tool_binary_hash` does NOT mean zero-or-nothing-happened. It means the
+// executable could not be read and the ruler's identity is UNKNOWN (see that
+// field). Treat such a report as suspect rather than clean -- it cannot be
+// compared with another report by instrument, which is the job this whole
+// message exists to do. `tool_version` and `tool_commit` are empty in the same
+// honest way when a build has no crate version or no git checkout; they are
+// just weaker evidence to begin with.
 message ReportProvenance {
   // objdiff's own crate version, e.g. "4.2.3". Coarse: many semantically
   // different builds share it.
