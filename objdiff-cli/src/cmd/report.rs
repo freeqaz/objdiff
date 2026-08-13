@@ -1247,12 +1247,79 @@ fn read_report(path: &Utf8PlatformPath) -> Result<Report> {
     if path == Utf8PlatformPath::new("-") {
         let mut data = vec![];
         std::io::stdin().read_to_end(&mut data)?;
-        return Report::parse(&data).with_context(|| "Failed to load report from stdin");
+        return parse_report(&data).with_context(|| "Failed to load report from stdin");
     }
     let file = File::open(path).with_context(|| format!("Failed to open {path}"))?;
     let mmap =
         unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("Failed to map {path}"))?;
-    Report::parse(mmap.as_ref()).with_context(|| format!("Failed to load report {path}"))
+    parse_report(mmap.as_ref()).with_context(|| format!("Failed to load report {path}"))
+}
+
+/// [`Report::parse`], with a failure a human can act on.
+///
+/// Every consumer of a report reaches it through `read_report` (`changes`, `summary`,
+/// `query`, `function`, `analyze`, `trending`), so all six get the same diagnosis.
+fn parse_report(data: &[u8]) -> Result<Report> {
+    Report::parse(data).map_err(|e| explain_report_parse_failure(e, data))
+}
+
+/// Turn `unknown field 'x', expected one of ...` into the sentence that explains it.
+///
+/// Report JSON is deserialized with `deny_unknown_fields`, so a report written by a
+/// NEWER objdiff-cli than this one fails naming a field the reader has never heard
+/// of, and saying nothing about why it is there. The cause is almost always a version
+/// skew between the binary that wrote the report and the binary reading it, and the
+/// report itself can usually say so: `provenance` records the writer's version and
+/// commit. Read that block LENIENTLY (`serde_json::Value`) -- the strict deserializer
+/// has just refused this document, and asking it again would fail the same way.
+///
+/// Decorates a failure and nothing else. By the time this is called,
+/// [`Report::parse`] has already tried binary protobuf, strict JSON, and the
+/// legacy-JSON fallback; a legacy report reaches `Ok` through `LegacyReport` and
+/// never arrives here, even though its strict pass also failed on an unknown field.
+fn explain_report_parse_failure(err: anyhow::Error, data: &[u8]) -> anyhow::Error {
+    if !err.chain().any(|c| c.to_string().contains("unknown field")) {
+        return err;
+    }
+    let mut hint = String::from(
+        "this report has a field this objdiff-cli does not know about, so it was probably \
+         written by a newer objdiff-cli",
+    );
+    match report_writer_identity(data) {
+        Some(writer) => hint.push_str(&format!(" -- the report's provenance says {writer}")),
+        None => hint.push_str(" (it carries no provenance block, so it cannot say which)"),
+    }
+    hint.push_str(&format!(
+        "; this one is {}. Rebuild/upgrade this objdiff-cli, or regenerate the report with this \
+         binary",
+        crate::build_id::version_line("objdiff-cli")
+    ));
+    err.context(hint)
+}
+
+/// Whatever the `provenance` block will admit about the objdiff-cli that wrote a
+/// report, read out of JSON this binary cannot fully deserialize.
+///
+/// Accepts both spellings of each key: objdiff writes proto field names
+/// (`preserve_proto_field_names`), but pbjson emits and accepts camelCase too, and a
+/// report that has been through another JSON tool may carry either.
+fn report_writer_identity(data: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
+    let provenance = value.get("provenance")?;
+    let field = |snake: &str, camel: &str| -> Option<String> {
+        provenance
+            .get(snake)
+            .or_else(|| provenance.get(camel))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    match (field("tool_version", "toolVersion"), field("tool_commit", "toolCommit")) {
+        (Some(version), Some(commit)) => Some(format!("tool_version {version} ({commit})")),
+        (Some(version), None) => Some(format!("tool_version {version}")),
+        (None, Some(commit)) => Some(format!("tool_commit {commit}")),
+        (None, None) => None,
+    }
 }
 
 #[derive(Serialize)]
@@ -2916,5 +2983,99 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(Some(hash), tool_binary_hash());
+    }
+
+    // ── Reading a report written by a different objdiff-cli.
+    //
+    // Three shapes go through `parse_report`, and only the third may be decorated.
+    // The other two are the fallback chain inside `Report::parse`, which the
+    // diagnosis must not disturb: a legacy report ALSO fails the strict pass with an
+    // unknown field, and still has to come back Ok.
+
+    /// A current-shape report, provenance and all.
+    fn current_report_json() -> String {
+        r#"{
+            "measures": {"fuzzy_match_percent": 42.5, "total_code": 100, "matched_code": 40},
+            "units": [],
+            "version": 2,
+            "provenance": {
+                "tool_version": "9.9.9",
+                "tool_binary_hash": "0123456789abcdef",
+                "tool_commit": "cafef00dbaad"
+            }
+        }"#
+        .to_string()
+    }
+
+    /// (a) The normal case: this binary's own output reads back.
+    #[test]
+    fn test_parse_report_accepts_a_current_report() {
+        let report = parse_report(current_report_json().as_bytes()).unwrap();
+        assert_eq!(report.version, 2);
+        let provenance =
+            report.provenance.as_ref().expect("provenance must survive the round trip");
+        assert_eq!(provenance.tool_version, "9.9.9");
+        assert_eq!(provenance.tool_commit, "cafef00dbaad");
+        assert_eq!(report.measures.as_ref().unwrap().total_code, 100);
+    }
+
+    /// (b) The invariant: pre-v0 JSON still migrates in through `LegacyReport`. Its
+    /// strict pass fails on `unknown field 'fuzzy_match_percent'` -- the same class of
+    /// error the hint decorates -- so this is the test that catches a diagnosis wired
+    /// one layer too early.
+    #[test]
+    fn test_parse_report_still_accepts_a_legacy_report() {
+        let legacy = r#"{
+            "fuzzy_match_percent": 50.0,
+            "total_code": 200,
+            "matched_code": 100,
+            "matched_code_percent": 50.0,
+            "total_data": 20,
+            "matched_data": 10,
+            "matched_data_percent": 50.0,
+            "total_functions": 4,
+            "matched_functions": 2,
+            "matched_functions_percent": 50.0,
+            "units": []
+        }"#;
+        let report = parse_report(legacy.as_bytes()).unwrap();
+        let measures = report.measures.as_ref().expect("legacy measures are lifted into Measures");
+        assert_eq!(measures.total_code, 200);
+        assert_eq!(measures.matched_functions, 2);
+        // Legacy reports carry no version; `migrate` is what raises it later.
+        assert_eq!(report.version, 0);
+    }
+
+    /// (c) A field from the future: the error has to name the cause and both binaries.
+    #[test]
+    fn test_parse_report_from_the_future_explains_the_version_skew() {
+        let future = current_report_json().replace(
+            "\"version\": 2,",
+            "\"version\": 2, \"something_a_later_objdiff_added\": {\"x\": 1},",
+        );
+        let err = parse_report(future.as_bytes()).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("newer objdiff-cli"), "{rendered}");
+        // The writer, read leniently out of a document the strict deserializer refused.
+        assert!(rendered.contains("9.9.9"), "{rendered}");
+        assert!(rendered.contains("cafef00dbaad"), "{rendered}");
+        // This binary, so the two can be compared without a second command.
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")), "{rendered}");
+        assert!(rendered.contains("Rebuild/upgrade"), "{rendered}");
+        // And the original serde message survives underneath the hint.
+        assert!(rendered.contains("unknown field"), "{rendered}");
+    }
+
+    /// A report with no provenance says so rather than inventing a version, and an
+    /// error that is not a version skew is passed through untouched.
+    #[test]
+    fn test_parse_report_hint_is_honest_about_what_it_does_not_know() {
+        let future = r#"{"version": 2, "units": [], "something_a_later_objdiff_added": 1}"#;
+        let rendered = format!("{:#}", parse_report(future.as_bytes()).unwrap_err());
+        assert!(rendered.contains("no provenance block"), "{rendered}");
+
+        // Malformed JSON is a syntax error, not a skew: no hint.
+        let rendered = format!("{:#}", parse_report(b"{\"version\":").unwrap_err());
+        assert!(!rendered.contains("newer objdiff-cli"), "{rendered}");
     }
 }
