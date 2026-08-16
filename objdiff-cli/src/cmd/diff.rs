@@ -1345,6 +1345,32 @@ fn resolve_symbol_unit(target_units: &[u32], base_units: Option<&[u32]>) -> Opti
         .or_else(|| target_units.first().copied())
 }
 
+/// Place one symbol, honouring a `-u` scope if there is one.
+///
+/// With no scope this is exactly `resolve_symbol_unit` — the batch-determinism
+/// rules, unchanged, and `unit_filter == None` must stay a pure pass-through or
+/// every unscoped run moves.
+///
+/// With a scope, neither rule runs. The caller named the unit; the point of the
+/// flag is that its answer beats anything derived here, including Rule 1's
+/// preference for a unit that defines the symbol on both sides. A scoped symbol
+/// the unit does not define is `None` — reported to the caller as
+/// `not_in_unit`, never silently relocated to some other unit, which is the
+/// whole failure mode being closed.
+///
+/// `target_units` is ascending (built by walking units in project order), so
+/// membership is a binary search.
+fn pick_symbol_unit(
+    unit_filter: Option<u32>,
+    target_units: &[u32],
+    base_units: Option<&[u32]>,
+) -> Option<u32> {
+    match unit_filter {
+        Some(want) => target_units.binary_search(&want).ok().map(|_| want),
+        None => resolve_symbol_unit(target_units, base_units),
+    }
+}
+
 fn run_batch(args: Args) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
@@ -1620,17 +1646,12 @@ fn run_batch(args: Args) -> Result<()> {
             // every run. Re-derive before quoting any of these numbers:
             // `scripts/determinism/coff_dup_symbols.py <project>`.
             //
-            // Under `-u` neither rule runs: the caller has already named the
-            // unit, and the whole point of the flag is that its answer wins
-            // over anything derived here. The candidate list is ascending, so
-            // membership is a binary search.
-            let pos = match unit_filter {
-                Some(want) => candidates.binary_search(&want).ok().map(|_| want),
-                None => resolve_symbol_unit(
-                    candidates,
-                    base_symbol_index.get(symbol.as_str()).map(Vec::as_slice),
-                ),
-            };
+            // Under `-u` neither rule runs — see `pick_symbol_unit`.
+            let pos = pick_symbol_unit(
+                unit_filter,
+                candidates,
+                base_symbol_index.get(symbol.as_str()).map(Vec::as_slice),
+            );
             if let Some(pos) = pos {
                 by_unit.entry(pos).or_default().push(symbol.clone());
                 continue;
@@ -3590,6 +3611,138 @@ mod tests {
         assert_eq!(resolve_symbol_unit(&[3, 7], None), Some(3));
         assert_eq!(resolve_symbol_unit(&[5], None), Some(5));
         assert_eq!(resolve_symbol_unit(&[], Some(&[1])), None);
+    }
+
+    // =========================================================================
+    // Batch-mode `-u` / `--unit` scope
+    //
+    // `run_batch` declared `unit` and never read it, so `-u` was accepted and
+    // ignored: callers passing it got whole-project results. These pin the two
+    // halves of the fix — what a unit NAME resolves to, and what a scope does
+    // to symbol placement — including the case the bug consisted of, which is
+    // that "no `-u`" must behave exactly as before.
+    // =========================================================================
+
+    #[test]
+    fn test_resolve_unit_name_exact_beats_every_fuzzy_tier() {
+        let names = ["main/system/synth/MidiSynth", "MidiSynth", "extra/MidiSynthImpl"];
+        // "MidiSynth" is an exact name AND a path-suffix of names[0] AND a
+        // substring of names[2]. Exact must win outright rather than report
+        // three matches as ambiguous.
+        assert_eq!(resolve_unit_name(&names, "MidiSynth").unwrap(), 1);
+        assert_eq!(
+            resolve_unit_name(&names, "main/system/synth/MidiSynth").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_resolve_unit_name_suffix_then_basename_then_substring() {
+        let names = ["main/system/synth/MidiSynth", "game/audio/Mixer"];
+        // Path-component suffix.
+        assert_eq!(resolve_unit_name(&names, "system/synth/MidiSynth").unwrap(), 0);
+        // Basename only.
+        assert_eq!(resolve_unit_name(&names, "Mixer").unwrap(), 1);
+        // Substring that is neither a suffix nor a basename.
+        assert_eq!(resolve_unit_name(&names, "audio").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_resolve_unit_name_higher_tier_ambiguity_does_not_fall_through() {
+        // Two basename matches, and "Foo" is also a substring of a third name.
+        // Falling through to the substring tier would turn an ambiguous request
+        // into three candidates; worse, an implementation that took the first
+        // hit at some tier would silently pick one. This must report the
+        // ambiguity at the tier that found it.
+        let names = ["a/Foo", "b/Foo", "c/FooBarBaz"];
+        let err = resolve_unit_name(&names, "Foo").unwrap_err().to_string();
+        assert!(err.contains("Ambiguous unit `Foo`"), "{err}");
+        assert!(err.contains("2 matches"), "{err}");
+        assert!(err.contains("a/Foo") && err.contains("b/Foo"), "{err}");
+        assert!(!err.contains("c/FooBarBaz"), "substring tier leaked in: {err}");
+    }
+
+    #[test]
+    fn test_resolve_unit_name_unknown_is_an_error_naming_the_unit() {
+        // The whole bug was silence. An unknown unit must not resolve to
+        // "nothing to do" — it must say which unit it could not find.
+        let names = ["main/system/synth/MidiSynth"];
+        let err = resolve_unit_name(&names, "NoSuchUnit").unwrap_err().to_string();
+        assert!(err.contains("Unit not found: NoSuchUnit"), "{err}");
+        assert!(err.contains("Hint:"), "error should tell the user what to pass: {err}");
+    }
+
+    #[test]
+    fn test_resolve_unit_name_ambiguity_preview_is_capped_and_sorted() {
+        let names: Vec<String> = (0..12).map(|i| format!("u{:02}/Thing", i)).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let err = resolve_unit_name(&refs, "Thing").unwrap_err().to_string();
+        assert!(err.contains("12 matches"), "{err}");
+        assert!(err.contains("... and 4 more"), "preview should cap at 8: {err}");
+        // Sorted, not hash order: the first previewed name is the lowest.
+        let first_listed = err.lines().nth(1).unwrap().trim();
+        assert_eq!(first_listed, "u00/Thing", "{err}");
+    }
+
+    #[test]
+    fn test_resolve_unit_name_empty_project_still_errors() {
+        let names: [&str; 0] = [];
+        let err = resolve_unit_name(&names, "Anything").unwrap_err().to_string();
+        assert!(err.contains("Unit not found: Anything"), "{err}");
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_without_a_scope_is_unchanged() {
+        // The regression that matters most: every batch run that passes no `-u`
+        // must place symbols exactly as it did before the flag existed. This is
+        // the same table as the determinism tests above, routed through the new
+        // entry point.
+        for (target, base) in [
+            (&[3u32, 7][..], Some(&[7u32, 9][..])),
+            (&[3, 7][..], Some(&[9][..])),
+            (&[3, 7][..], None),
+            (&[5][..], None),
+            (&[][..], Some(&[1][..])),
+        ] {
+            assert_eq!(
+                pick_symbol_unit(None, target, base),
+                resolve_symbol_unit(target, base),
+                "unscoped pick diverged from resolve_symbol_unit for {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_scope_overrides_the_both_sides_preference() {
+        // Unscoped, Rule 1 takes unit 7 because the base side defines it there
+        // too. Scoped to unit 3, the caller's answer wins — this is the COMDAT
+        // disambiguation batch mode could not express before.
+        assert_eq!(pick_symbol_unit(None, &[3, 7], Some(&[7, 9])), Some(7));
+        assert_eq!(pick_symbol_unit(Some(3), &[3, 7], Some(&[7, 9])), Some(3));
+        assert_eq!(pick_symbol_unit(Some(7), &[3, 7], Some(&[7, 9])), Some(7));
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_scope_refuses_rather_than_relocates() {
+        // Unit 5 does not define this symbol. The answer is None — which the
+        // caller sees as `not_in_unit` — and emphatically NOT unit 3, which is
+        // what a whole-project resolution would have quietly returned.
+        assert_eq!(pick_symbol_unit(Some(5), &[3, 7], Some(&[3][..])), None);
+        assert_eq!(pick_symbol_unit(None, &[3, 7], Some(&[3][..])), Some(3));
+        // And an empty candidate list is None under any scope.
+        assert_eq!(pick_symbol_unit(Some(0), &[], None), None);
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_scope_is_membership_not_position() {
+        // `binary_search` returns an INDEX into the candidate list; the value
+        // returned must be the unit position, not that index. With candidates
+        // [4, 9] and scope 9, an index-returning bug yields 1 (some unrelated
+        // unit) instead of 9, and it would be invisible in any project whose
+        // first units happen to be the interesting ones.
+        assert_eq!(pick_symbol_unit(Some(9), &[4, 9], None), Some(9));
+        assert_eq!(pick_symbol_unit(Some(4), &[4, 9], None), Some(4));
+        assert_eq!(pick_symbol_unit(Some(1), &[4, 9], None), None);
     }
 
     fn make_test_instr(
