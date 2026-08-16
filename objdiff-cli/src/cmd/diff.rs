@@ -1374,6 +1374,34 @@ fn pick_symbol_unit(
 fn run_batch(args: Args) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
+    // `-1` / `-2` are the OTHER flags batch mode silently ignored, and the
+    // failure they produce is worse than the one `-u` produced: batch resolves
+    // against the project, so an explicit object pair is discarded and the
+    // answer comes from whatever unit the symbol index picked. rb3-xenon
+    // documented the consequence on 2026-07-01 — a symbol answered from the
+    // wrong unit with `base_size=0` reads as a false STUB verdict — and worked
+    // around it by using one-shot mode instead of trusting the flag.
+    //
+    // Refusing is the honest fix, not a limitation: batch mode is defined over
+    // a project (it groups symbols by unit and loads each unit's objects once),
+    // so a single explicit pair has no meaning here. `-u` now expresses the
+    // thing a caller reaching for `-1/-2` actually wanted — scope this batch to
+    // one unit — and one-shot mode still takes an arbitrary pair.
+    //
+    // Safe to make an error rather than a warning: none of the seven known
+    // batch call sites across rb3, rb3-xenon, dc3-decomp and decomp-synth pass
+    // either flag (surveyed 2026-08-16).
+    if args.target.is_some() || args.base.is_some() {
+        bail!(
+            "--batch does not accept -1/--target or -2/--base.\n\
+             Batch mode resolves symbols through the project's units and would \
+             silently ignore the object pair you passed, answering from some \
+             other unit instead.\n\
+             Use `-u <unit>` to scope a batch to one unit, or drop --batch to \
+             diff an explicit pair of objects."
+        );
+    }
+
     // Load project config
     let project_dir = match &args.project {
         Some(project) => project.clone(),
