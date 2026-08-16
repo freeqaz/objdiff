@@ -1388,10 +1388,32 @@ fn pick_symbol_unit(
 ///   itself, by the dispatch in `run`).
 /// - HONOURED here, previously dropped: `output`, `include_instructions`,
 ///   `full_listing` (which implies instructions, exactly as one-shot does).
+///
+///   `include_instructions` is honoured rather than refused on purpose, and the
+///   cost was measured before deciding. Its one live caller
+///   (rb3-xenon `scripts/harvest/subobject_ref_scan.py`) passes it in a
+///   whole-pool gate and never reads the field — 646 symbols, output 2.3 MB →
+///   50.0 MB (21.4×), producer wall 4.35 s → 4.63 s, survivor list bit-identical
+///   (400 narrow / 625 `--wide`), rows identical once `instructions` is removed.
+///   Refusing would break that caller at exit 1 in a repo this lane must not
+///   edit, and would make one flag mean two things by mode — the defect the
+///   shared `resolve_unit_name` exists to prevent. The 21.4× is a vestigial
+///   request on the caller's side, one word to delete there; it is not a reason
+///   for the differ to lie about a flag it accepts.
 /// - INERT, correctly: `summary`, `analyze`, `verdict` — batch computes all
 ///   three unconditionally, so asking for them is asking for what you already
 ///   have. `context` and `concise` shape MARKDOWN rendering only and are
 ///   equally inert in `diff -f json`.
+///
+///   Do not "fix" that asymmetry by gating batch's summary on `--summary`.
+///   One-shot builds instruction rows for `wants_instructions || wants_summary`
+///   but emits `instruction_summary` only under `wants_summary`, so
+///   `diff <sym> --include-instructions` alone yields instructions and NO
+///   summary (verified 2026-08-16). Batch's unconditional summary is therefore
+///   a real difference, and a live consumer depends on it:
+///   rb3-xenon `scripts/harvest/subobject_ref_scan.py` gates its whole pool on
+///   `instruction_summary.replace` while passing neither `--summary` nor
+///   `--analyze` nor `--verdict`. Gating it would silently empty that gate.
 /// - REFUSED below: everything else.
 ///
 /// Refusing beats warning here because it is verifiably safe: none of the seven
