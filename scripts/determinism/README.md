@@ -24,6 +24,120 @@ hasher per process, so a leak of iteration order is invisible within a single
 run and only shows up across repeats of the *same* binary. Do not compare two
 different builds and call the difference nondeterminism.
 
+## `report generate`, including `--deduplicate`
+
+```sh
+scripts/determinism/repeat_report.sh \
+    target/release/objdiff-cli <project-dir> 6 <outdir> --deduplicate
+```
+
+Repeats `report generate` and reports how many distinct report *bodies* came
+out. Two details it exists to get right, both of which have produced a false
+result here:
+
+- **One `-o` per repeat.** The report cache sidecar path is the `-o` path with
+  the suffix replaced, so two runs sharing an `-o` feed each other and the
+  second measures the first one's answer rather than the tree.
+- **Strip `provenance` before comparing.** It legitimately carries per-run
+  values (cache hits/misses), so comparing it reports a difference on a
+  perfectly deterministic pair.
+
+`dup_surface.py <plain-report.json> [dedup-report.json]` bounds what any
+dedup-ordering bug could ever do to a given tree: it counts the names defined
+in more than one unit, and — the number that matters — how many of those have
+copies that *disagree* on `(fuzzy, size)`. Copies that agree are a tie no walk
+order can break into a different answer.
+
+### `--deduplicate` was measured and is NOT nondeterministic (2026-08-16)
+
+`report generate --deduplicate` was carried as a "known remaining exposure"
+with a figure attached — `fuzzy_match_percent` moving ~0.47 pp and
+`matched_functions` by up to 104 — in `a08c12a`, `bd389f0` and the 2026-08-13
+landing doc. **That figure is unsourced and did not reproduce.** No primary
+artifact for it exists anywhere on this machine: all three mentions restate the
+same sentence, each says "has been measured" in the passive with no project,
+binary or run count, and the landing doc attributes it to "review". Every other
+number in those same messages names its tree, its binary and its run count.
+
+Measured on `6bf7ba7`, one binary per row, per-run `-o`, provenance stripped,
+input trees fingerprinted before and after (mtime+size over the object trees;
+unmoved). `dropped` is how many functions `-d` removes on that tree — the
+ceiling on what any dedup-ordering bug could possibly do there:
+
+| project | ruler | dropped by `-d` | repeats | distinct bodies |
+| --- | --- | --- | --- | --- |
+| dc3-decomp | project default (`none`) | 19 | 20 | 1 |
+| dc3-decomp | `-c functionRelocDiffs=none` | 19 | 6 | 1 |
+| rb3-xenon | project default (`name_check`) | 1 | 5 | 1 |
+| rb3-xenon | `-c functionRelocDiffs=none` | 1 | 6 | 1 |
+| rb3 | project default | 0 | 6 | 1 |
+| decomp-clones/zeldaret_tww | project default | **12,266** | 6 | 1 |
+| decomp-clones/zeldaret_tp | project default | **10,542** | 6 | 1 |
+| decomp-clones/mariopartyrd_marioparty4 | project default | **1,296** | 6 | 1 |
+
+(Surface census over every project on this box that generates a report:
+`zeldaret_ss` 3,210 dropped, `cea-decomp` 169, and 0 for melee, bfbb,
+smstrikers, FFCC and the three pikmin trees.)
+
+The three game repos have almost no dedup surface at all — 19, 1 and 0
+functions — so a flat result on them alone would prove little. The clone trees
+are the real test: `zeldaret_tww` defines 360 names in more than one unit
+(12,708 surplus copies, 51 of them disagreeing on `(fuzzy, size)`) and
+`mariopartyrd_marioparty4` has 826 divergent duplicated names out of 876. If
+walk order leaked into the answer anywhere, those are the trees that would show
+it, and they do not.
+
+`dup_surface.py` also bounds the specific claim about `matched_functions`: on
+all five trees examined, **zero** duplicated names have one copy at 100% and
+another below it, so no choice between copies can move `matched_functions` by
+even 1, let alone 104. The entire effect of `-d` on dc3-decomp — not its
+variance, its whole effect — is 19 functions and 53.88503 → 53.885654, i.e.
+0.0006 pp. On rb3 (Wii, mwcc) `-d` drops nothing at all: its duplicate names
+are local, and `-d` only suppresses global/weak.
+
+The comparator is not blind, either: on the same tree it separates default
+(`dd6bcae7…`), `-d` (`1d05f95b…`) and a second ruler (`c50b255b…`) into three
+distinct hashes.
+
+A guess at where the figure came from, offered as a guess: numbers of exactly
+that magnitude are what `-d` *itself* does, i.e. the difference between the two
+MODES, not between two runs of one mode. On `zeldaret_tww`, turning `-d` on
+moves `fuzzy_match_percent` 77.01107 → 77.24625 (+0.235 pp) and
+`matched_functions` 31,534 → 22,375; on `zeldaret_ss`, 31.92137 → 31.23235
+(−0.69 pp). A default-vs-`-d` pair read as a repeat-run pair produces a claim
+shaped exactly like this one.
+
+**Trees move under you.** rb3-xenon's object fingerprint changed mid-session
+here (`77cc8648…` → `dd1468f5…`) — peers rebuild it — so its reports from
+07:36 and 08:20 differ for reasons that have nothing to do with the binary.
+Fingerprint before and after, and compare two binaries only inside one
+fingerprint window.
+
+Why the code has nowhere left to leak: the walk is over `project_units` in
+declared order; `existing_functions` is a `HashSet<String>` that is only ever
+`insert`ed and never iterated; within a unit the walk is by section index then
+by symbol index over `obj.symbols`, which `objdiff-core/src/obj/read.rs` sorts
+by (section, section-symbols-first, address, size) over the object file's own
+symbol table; and `report_object`'s one hash-order iteration
+(`partner_groups.values()`) picks a per-group owner by a rule that is
+independent of group order and yields a set. Default mode shares all of that
+and has been byte-identical here across every measurement.
+
+What IS real, and is already fixed, is the same shape one layer down: the
+report cache used to be served under `-d`. On `f9333e6` (= `345778c^`),
+dc3-decomp, three runs through one shared `-o`:
+
+    1 dedup (cold cache)   total_fn 48325   <- correct dedup answer
+    2 default              total_fn 48325   <- WRONG, 2224 cache hits, should be 48344
+    3 dedup (warm cache)   total_fn 48325
+
+A `-d` run poisoned the cache and the *default-mode* run after it silently
+reported the deduplicated number. On `6bf7ba7` the same sequence gives
+48325 / 48344 / 48325 and logs `report cache disabled`. That rule is now a
+named function with a truth-table test (`report_cache_enabled`) rather than an
+inline expression, because its failure mode is a moved progress number and not
+an error.
+
 ## Finding a symbol list that actually flips
 
 A random sample mostly hits symbols with one candidate unit and proves nothing.
