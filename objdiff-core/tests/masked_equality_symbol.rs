@@ -22,11 +22,11 @@
 
 #![cfg(all(feature = "ppc", feature = "bindings"))]
 
+use objdiff_core::{diff, obj};
 use object::{
     Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
     write::{Object as WriteObject, StandardSection, Symbol, SymbolSection},
 };
-use objdiff_core::{diff, obj};
 
 /// Build a minimal big-endian PPC ELF relocatable object with a single code
 /// symbol `name` covering `code`, no relocations. Two objects built with the
@@ -57,9 +57,8 @@ fn diff_symbol(target_bytes: &[u8], base_bytes: &[u8], name: &str) -> (f32, bool
         obj::read::parse(target_bytes, &diff_config, diff::DiffSide::Target).expect("parse target");
     let base =
         obj::read::parse(base_bytes, &diff_config, diff::DiffSide::Base).expect("parse base");
-    let result =
-        diff::diff_objs(Some(&target), Some(&base), None, &diff_config, &mapping_config)
-            .expect("diff objects");
+    let result = diff::diff_objs(Some(&target), Some(&base), None, &diff_config, &mapping_config)
+        .expect("diff objects");
     let target_diff = result.left.as_ref().expect("target diff present");
     let idx = target.symbols.iter().position(|s| s.name == name).expect("symbol present");
     let sym = &target_diff.symbols[idx];
@@ -121,11 +120,7 @@ fn caseb_promotion_sets_report_masked_equal_and_counter() {
 
     let unit_objs = vec![
         diff::UnitObjs { unit_name: "foo".to_string(), target: None, base: Some(foo_base) },
-        diff::UnitObjs {
-            unit_name: "other".to_string(),
-            target: Some(other_target),
-            base: None,
-        },
+        diff::UnitObjs { unit_name: "other".to_string(), target: Some(other_target), base: None },
     ];
 
     // Report units. "foo" has the still-<100% case-B method plus a genuinely

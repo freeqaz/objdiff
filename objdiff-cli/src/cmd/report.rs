@@ -16,10 +16,7 @@ use objdiff_core::{
         Report, ReportCategory, ReportItem, ReportItemMetadata, ReportProvenance, ReportUnit,
         ReportUnitMetadata,
     },
-    config::{
-        ProjectObject, ProjectOptions, apply_project_options,
-        path::platform_path,
-    },
+    config::{ProjectObject, ProjectOptions, apply_project_options, path::platform_path},
     diff,
     obj::{self, SectionKind, SymbolFlag, SymbolKind},
 };
@@ -701,8 +698,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
                 if let Some(cached_unit) = cache.get(hash) {
                     return Ok(Some(cached_unit));
                 }
-                let result =
-                    report_object(object, &diff_config, None, Some(&mapping_config))?;
+                let result = report_object(object, &diff_config, None, Some(&mapping_config))?;
                 if let Some(ref unit) = result {
                     let encoded = unit.encode_to_vec();
                     new_cache_entries.lock().unwrap().insert(hash, encoded);
@@ -1401,9 +1397,8 @@ fn looks_like_a_report(document: &serde_json::Value) -> bool {
     if PROJECT_CONFIG_ONLY_KEYS.iter().any(|key| document.get(key).is_some()) {
         return false;
     }
-    let has = |key: &str, shaped: fn(&serde_json::Value) -> bool| {
-        document.get(key).is_some_and(shaped)
-    };
+    let has =
+        |key: &str, shaped: fn(&serde_json::Value) -> bool| document.get(key).is_some_and(shaped);
     has("measures", serde_json::Value::is_object)
         || has("provenance", serde_json::Value::is_object)
         || has("units", serde_json::Value::is_array)
@@ -2330,7 +2325,7 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
                     results.needs_investigation.push(analyzed)
                 }
                 VerdictClassification::Complete => {} // Should not happen (filtered out)
-                VerdictClassification::Stub => {} // Unimplemented, skip
+                VerdictClassification::Stub => {}     // Unimplemented, skip
             }
         }
     }
@@ -2981,9 +2976,13 @@ mod tests {
     fn test_hash_unit_key_changes_with_the_effective_ruler() {
         let object = ObjectConfig::default();
         let global = key_global();
-        let none = ReportCache::hash_unit(&object, &key_config(&["functionRelocDiffs=none"]), &global);
-        let name_check =
-            ReportCache::hash_unit(&object, &key_config(&["functionRelocDiffs=name_check"]), &global);
+        let none =
+            ReportCache::hash_unit(&object, &key_config(&["functionRelocDiffs=none"]), &global);
+        let name_check = ReportCache::hash_unit(
+            &object,
+            &key_config(&["functionRelocDiffs=name_check"]),
+            &global,
+        );
         assert_ne!(none, name_check, "the ruler must be in the cache key");
         // Same resolved config, same key — the key is a function of the config, not
         // of the object identity that carried it.
@@ -3009,16 +3008,14 @@ mod tests {
         // decide which symbols may pair, so it moves scores.
         let object = ObjectConfig::default();
         let config = key_config(&[]);
-        let a = ReportCache::hash_unit(
-            &object,
-            &config,
-            &GlobalCacheKey { tool_binary_hash: Some("aa"), map_file_hash: 1 },
-        );
-        let b = ReportCache::hash_unit(
-            &object,
-            &config,
-            &GlobalCacheKey { tool_binary_hash: Some("aa"), map_file_hash: 2 },
-        );
+        let a = ReportCache::hash_unit(&object, &config, &GlobalCacheKey {
+            tool_binary_hash: Some("aa"),
+            map_file_hash: 1,
+        });
+        let b = ReportCache::hash_unit(&object, &config, &GlobalCacheKey {
+            tool_binary_hash: Some("aa"),
+            map_file_hash: 2,
+        });
         assert_ne!(a, b, "the map file's content must be in the cache key");
     }
 
@@ -3029,16 +3026,14 @@ mod tests {
         // was made in objdiff-core, by an author who never opened this file.
         let object = ObjectConfig::default();
         let config = key_config(&[]);
-        let a = ReportCache::hash_unit(
-            &object,
-            &config,
-            &GlobalCacheKey { tool_binary_hash: Some("aa"), map_file_hash: 0 },
-        );
-        let b = ReportCache::hash_unit(
-            &object,
-            &config,
-            &GlobalCacheKey { tool_binary_hash: Some("bb"), map_file_hash: 0 },
-        );
+        let a = ReportCache::hash_unit(&object, &config, &GlobalCacheKey {
+            tool_binary_hash: Some("aa"),
+            map_file_hash: 0,
+        });
+        let b = ReportCache::hash_unit(&object, &config, &GlobalCacheKey {
+            tool_binary_hash: Some("bb"),
+            map_file_hash: 0,
+        });
         assert_ne!(a, b, "the objdiff binary's identity must be in the cache key");
     }
 
@@ -3288,7 +3283,8 @@ mod tests {
     /// something: four keys qualify, so any one rename still leaves three.
     #[test]
     fn test_parse_report_diagnoses_a_skew_from_any_one_distinctive_key() {
-        for known in ["\"measures\": {}", "\"units\": []", "\"categories\": []", "\"provenance\": {}"]
+        for known in
+            ["\"measures\": {}", "\"units\": []", "\"categories\": []", "\"provenance\": {}"]
         {
             let doc = format!("{{{known}, \"something_a_later_objdiff_added\": 1}}");
             let rendered = format!("{:#}", parse_report(doc.as_bytes()).unwrap_err());
@@ -3307,13 +3303,23 @@ mod tests {
     /// files share -- must never be treated as a veto.
     #[test]
     fn test_parse_report_veto_does_not_swallow_a_real_report() {
-        let rendered =
-            format!("{:#}", parse_report(current_report_json().replace(
-                "\"version\": 2,",
-                "\"version\": 2, \"something_a_later_objdiff_added\": 1,",
-            ).as_bytes()).unwrap_err());
+        let rendered = format!(
+            "{:#}",
+            parse_report(
+                current_report_json()
+                    .replace(
+                        "\"version\": 2,",
+                        "\"version\": 2, \"something_a_later_objdiff_added\": 1,",
+                    )
+                    .as_bytes()
+            )
+            .unwrap_err()
+        );
         assert!(rendered.contains("newer objdiff-cli"), "{rendered}");
-        assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"units"), "units is the collision, not the tell");
+        assert!(
+            !PROJECT_CONFIG_ONLY_KEYS.contains(&"units"),
+            "units is the collision, not the tell"
+        );
         assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"measures"));
         assert!(!PROJECT_CONFIG_ONLY_KEYS.contains(&"provenance"));
     }

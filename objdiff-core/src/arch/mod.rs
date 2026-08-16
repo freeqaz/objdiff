@@ -451,15 +451,11 @@ pub trait Arch: Any + Debug + Send + Sync {
         Ok(None)
     }
 
-    fn reloc_name(&self, _flags: RelocationFlags) -> Option<&'static str> {
-        None
-    }
+    fn reloc_name(&self, _flags: RelocationFlags) -> Option<&'static str> { None }
 
     fn data_reloc_size(&self, flags: RelocationFlags) -> usize;
 
-    fn symbol_address(&self, address: u64, _kind: SymbolKind) -> u64 {
-        address
-    }
+    fn symbol_address(&self, address: u64, _kind: SymbolKind) -> u64 { address }
 
     fn extra_symbol_flags(&self, _symbol: &object::Symbol) -> SymbolFlagSet {
         SymbolFlagSet::default()
@@ -473,13 +469,9 @@ pub trait Arch: Any + Debug + Send + Sync {
         None
     }
 
-    fn symbol_hover(&self, _obj: &Object, _symbol_index: usize) -> Vec<HoverItem> {
-        Vec::new()
-    }
+    fn symbol_hover(&self, _obj: &Object, _symbol_index: usize) -> Vec<HoverItem> { Vec::new() }
 
-    fn symbol_context(&self, _obj: &Object, _symbol_index: usize) -> Vec<ContextItem> {
-        Vec::new()
-    }
+    fn symbol_context(&self, _obj: &Object, _symbol_index: usize) -> Vec<ContextItem> { Vec::new() }
 
     fn instruction_hover(
         &self,
@@ -537,9 +529,7 @@ pub fn new_arch(object: &object::File, diff_side: DiffSide) -> Result<Box<dyn Ar
 pub struct ArchDummy {}
 
 impl ArchDummy {
-    pub fn new() -> Box<Self> {
-        Box::new(Self {})
-    }
+    pub fn new() -> Box<Self> { Box::new(Self {}) }
 }
 
 impl Arch for ArchDummy {
@@ -563,9 +553,7 @@ impl Arch for ArchDummy {
         Ok(())
     }
 
-    fn data_reloc_size(&self, _flags: RelocationFlags) -> usize {
-        0
-    }
+    fn data_reloc_size(&self, _flags: RelocationFlags) -> usize { 0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

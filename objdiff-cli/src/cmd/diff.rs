@@ -80,13 +80,9 @@ impl DiffOutputFormat {
         }
     }
 
-    fn is_json(&self) -> bool {
-        matches!(self, Self::Json | Self::JsonPretty)
-    }
+    fn is_json(&self) -> bool { matches!(self, Self::Json | Self::JsonPretty) }
 
-    fn is_non_tui(&self) -> bool {
-        !matches!(self, Self::Tui)
-    }
+    fn is_non_tui(&self) -> bool { !matches!(self, Self::Tui) }
 }
 
 // JSON output structures
@@ -114,16 +110,12 @@ impl TypedArg {
     /// Check if this is a register argument.
     /// Used by analysis pattern detection and external consumers.
     #[allow(dead_code)]
-    pub fn is_register(&self) -> bool {
-        matches!(self, TypedArg::Register(_))
-    }
+    pub fn is_register(&self) -> bool { matches!(self, TypedArg::Register(_)) }
 
     /// Check if this is a numeric value (signed or unsigned).
     /// Used by analysis pattern detection and external consumers.
     #[allow(dead_code)]
-    pub fn is_numeric(&self) -> bool {
-        matches!(self, TypedArg::Signed(_) | TypedArg::Unsigned(_))
-    }
+    pub fn is_numeric(&self) -> bool { matches!(self, TypedArg::Signed(_) | TypedArg::Unsigned(_)) }
 
     /// Get the numeric value if this is a signed or unsigned arg.
     /// Used by analysis pattern detection for value comparisons.
@@ -549,12 +541,7 @@ fn resolve_unit_name(names: &[&str], needle: &str) -> Result<usize> {
     }
 
     let hits_by = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
-        names
-            .iter()
-            .enumerate()
-            .filter(|(_, name)| pred(name))
-            .map(|(pos, _)| pos)
-            .collect()
+        names.iter().enumerate().filter(|(_, name)| pred(name)).map(|(pos, _)| pos).collect()
     };
 
     let suffix_pattern = format!("/{}", needle);
@@ -586,8 +573,7 @@ fn resolve_unit_name(names: &[&str], needle: &str) -> Result<usize> {
             let mut matched: Vec<&str> = hits.iter().map(|pos| names[*pos]).collect();
             matched.sort_unstable();
             let preview: Vec<&&str> = matched.iter().take(8).collect();
-            let trailer =
-                if n > 8 { format!("\n  ... and {} more", n - 8) } else { String::new() };
+            let trailer = if n > 8 { format!("\n  ... and {} more", n - 8) } else { String::new() };
             Err(anyhow!(
                 "Ambiguous unit `{}`: {} matches.\n  {}{}\n\
                  Use a longer suffix or the canonical name.",
@@ -659,8 +645,7 @@ pub fn run(args: Args) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let (object, unit_idx) = if let Some(u) = u {
-                let names: Vec<&str> =
-                    objects.iter().map(|(obj, _)| obj.name.as_str()).collect();
+                let names: Vec<&str> = objects.iter().map(|(obj, _)| obj.name.as_str()).collect();
                 let pos = resolve_unit_name(&names, u)?;
                 let (obj, idx) = &objects[pos];
                 (obj, *idx)
@@ -787,14 +772,10 @@ pub fn run(args: Args) -> Result<()> {
     // would be a behavioural change beyond the defect being fixed.
     if args.build {
         if let Some(base) = &base_path {
-            let make = project_config
-                .as_ref()
-                .and_then(|c| c.custom_make.as_deref())
-                .unwrap_or("ninja");
-            let make_args: &[String] = project_config
-                .as_ref()
-                .and_then(|c| c.custom_args.as_deref())
-                .unwrap_or(&[]);
+            let make =
+                project_config.as_ref().and_then(|c| c.custom_make.as_deref()).unwrap_or("ninja");
+            let make_args: &[String] =
+                project_config.as_ref().and_then(|c| c.custom_args.as_deref()).unwrap_or(&[]);
 
             let build_command = |target: Option<&str>| -> Result<()> {
                 let mut command = Command::new(make);
@@ -1061,30 +1042,23 @@ fn run_json(
     // Use the diff result's matched symbol for the "other" side — this is more
     // reliable than name lookup for anonymous namespace functions where the
     // hash differs between builds (e.g. ?A0xaf4cfd2b@@ vs ?A0x12345678@@).
-    let (target_symbol_idx, base_symbol_idx, target_size, base_size) =
-        if target_obj.is_some() {
-            // Symbol was found in target; use diff match for base
-            let target_size = target_obj
-                .as_ref()
-                .map(|o| o.symbols[symbol_idx].size)
-                .unwrap_or(0);
-            let base_symbol_idx = symbol_diff.target_symbol;
-            let base_size = base_symbol_idx
-                .and_then(|idx| base_obj.as_ref().map(|o| o.symbols[idx].size))
-                .unwrap_or(0);
-            (Some(symbol_idx), base_symbol_idx, target_size, base_size)
-        } else {
-            // Symbol was found in base; use diff match for target
-            let base_size = base_obj
-                .as_ref()
-                .map(|o| o.symbols[symbol_idx].size)
-                .unwrap_or(0);
-            let target_symbol_idx = symbol_diff.target_symbol;
-            let target_size = target_symbol_idx
-                .and_then(|idx| target_obj.as_ref().map(|o| o.symbols[idx].size))
-                .unwrap_or(0);
-            (target_symbol_idx, Some(symbol_idx), target_size, base_size)
-        };
+    let (target_symbol_idx, base_symbol_idx, target_size, base_size) = if target_obj.is_some() {
+        // Symbol was found in target; use diff match for base
+        let target_size = target_obj.as_ref().map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+        let base_symbol_idx = symbol_diff.target_symbol;
+        let base_size = base_symbol_idx
+            .and_then(|idx| base_obj.as_ref().map(|o| o.symbols[idx].size))
+            .unwrap_or(0);
+        (Some(symbol_idx), base_symbol_idx, target_size, base_size)
+    } else {
+        // Symbol was found in base; use diff match for target
+        let base_size = base_obj.as_ref().map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+        let target_symbol_idx = symbol_diff.target_symbol;
+        let target_size = target_symbol_idx
+            .and_then(|idx| target_obj.as_ref().map(|o| o.symbols[idx].size))
+            .unwrap_or(0);
+        (target_symbol_idx, Some(symbol_idx), target_size, base_size)
+    };
 
     // Get both sides of the diff
     let left_diff = diff_result.left.as_ref();
@@ -1148,9 +1122,13 @@ fn run_json(
     // Compute verdict if requested
     let verdict = if wants_verdict {
         match (&instruction_summary, &analysis) {
-            (Some(summary), Some(analysis)) => {
-                Some(super::analysis::compute_verdict(summary, analysis, symbol_diff.match_percent, base_size, target_size))
-            }
+            (Some(summary), Some(analysis)) => Some(super::analysis::compute_verdict(
+                summary,
+                analysis,
+                symbol_diff.match_percent,
+                base_size,
+                target_size,
+            )),
             _ => None,
         }
     } else {
@@ -1431,25 +1409,25 @@ fn check_batch_args(args: &Args) -> Result<()> {
     let Args {
         target,
         base,
-        project: _,             // read: locates the project config
-        unit: _,                // read: scopes the batch
-        output: _,              // honoured at the write site below
+        project: _, // read: locates the project config
+        unit: _,    // read: scopes the batch
+        output: _,  // honoured at the write site below
         format,
         symbol,
-        config: _,              // read: layered into every unit's diff config
+        config: _,               // read: layered into every unit's diff config
         include_instructions: _, // honoured at the row-construction sites
         include_data,
-        summary: _,   // inert: batch always emits `instruction_summary`
-        analyze: _,   // inert: batch always emits `analysis`
-        verdict: _,   // inert: batch always emits `verdict`
+        summary: _, // inert: batch always emits `instruction_summary`
+        analyze: _, // inert: batch always emits `analysis`
+        verdict: _, // inert: batch always emits `verdict`
         build,
         full_build,
         incremental,
-        map_file: _,        // read: ICF equivalences
-        context: _,         // inert: markdown rendering only, as in `-f json`
-        full_listing: _,    // honoured: implies instructions, as in one-shot
-        concise: _,         // inert: markdown rendering only, as in `-f json`
-        batch: _,           // read by `run` to get here
+        map_file: _,     // read: ICF equivalences
+        context: _,      // inert: markdown rendering only, as in `-f json`
+        full_listing: _, // honoured: implies instructions, as in one-shot
+        concise: _,      // inert: markdown rendering only, as in `-f json`
+        batch: _,        // read by `run` to get here
     } = args;
 
     let mut refused: Vec<(&str, &str)> = Vec::new();
@@ -1522,10 +1500,7 @@ fn check_batch_args(args: &Args) -> Result<()> {
         .map(|(flag, why)| format!("  {flag}\n      {why}"))
         .collect::<Vec<_>>()
         .join("\n");
-    bail!(
-        "--batch does not support these flags and would silently ignore them:\n{}",
-        detail
-    )
+    bail!("--batch does not support these flags and would silently ignore them:\n{}", detail)
 }
 
 /// Is an unplaceable symbol `not_in_unit` (as opposed to `not_found`)?
@@ -1558,10 +1533,10 @@ fn run_batch(args: Args) -> Result<()> {
     // Load project config
     let project_dir = match &args.project {
         Some(project) => project.clone(),
-        _ => check_path_buf(
-            std::env::current_dir().context("Failed to get the current directory")?,
-        )
-        .context("Current directory is not valid UTF-8")?,
+        _ => {
+            check_path_buf(std::env::current_dir().context("Failed to get the current directory")?)
+                .context("Current directory is not valid UTF-8")?
+        }
     };
     let Some((project_config, project_config_info)) =
         objdiff_core::config::try_project_config(project_dir.as_ref())
@@ -1572,14 +1547,10 @@ fn run_batch(args: Args) -> Result<()> {
         format!("Reading project config {}", project_config_info.path.display())
     })?;
 
-    let target_obj_dir = project_config
-        .target_dir
-        .as_ref()
-        .map(|p| project_dir.join(p.with_platform_encoding()));
-    let base_obj_dir = project_config
-        .base_dir
-        .as_ref()
-        .map(|p| project_dir.join(p.with_platform_encoding()));
+    let target_obj_dir =
+        project_config.target_dir.as_ref().map(|p| project_dir.join(p.with_platform_encoding()));
+    let base_obj_dir =
+        project_config.base_dir.as_ref().map(|p| project_dir.join(p.with_platform_encoding()));
     let units = project_config.units.as_deref().unwrap_or_default();
 
     // Build object configs indexed by unit name
@@ -1610,9 +1581,7 @@ fn run_batch(args: Args) -> Result<()> {
     // Load map file for ICF equivalences
     let mut mapping_config = MappingConfig::default();
     let map_file_path = args.map_file.clone().or_else(|| {
-        project_config.map_file.as_ref().map(|p| {
-            project_dir.join(p.with_platform_encoding())
-        })
+        project_config.map_file.as_ref().map(|p| project_dir.join(p.with_platform_encoding()))
     });
     if let Some(map_path) = &map_file_path {
         let file = std::fs::File::open(map_path.as_str())
@@ -1900,8 +1869,7 @@ fn run_batch(args: Args) -> Result<()> {
             // is routinely mostly out-of-unit. Not worth it to refine an error
             // label; recorded so nobody reads the distinction as sharper than
             // it is.
-            let defined_anywhere =
-                target_mangled_index.get(symbol.as_str()).map(Vec::as_slice);
+            let defined_anywhere = target_mangled_index.get(symbol.as_str()).map(Vec::as_slice);
             if is_not_in_unit(unit_filter, defined_anywhere) {
                 let want = unit_filter.unwrap();
                 // Reaching here means the candidate list does not contain
@@ -1956,8 +1924,9 @@ fn run_batch(args: Args) -> Result<()> {
     }
 
     // Process units in parallel with rayon
-    use rayon::prelude::*;
     use std::sync::atomic::AtomicUsize;
+
+    use rayon::prelude::*;
 
     let units_total = by_unit.len();
     let units_processed = AtomicUsize::new(0);
@@ -2003,9 +1972,13 @@ fn run_batch(args: Args) -> Result<()> {
             // Build symbol filter: only diff the symbols we actually need
             let mut symbol_filter = std::collections::BTreeSet::new();
             for symbol_name in unit_symbols {
-                if let Some(idx) = target_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name)) {
+                if let Some(idx) =
+                    target_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name))
+                {
                     symbol_filter.insert(idx);
-                } else if let Some(idx) = base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name)) {
+                } else if let Some(idx) =
+                    base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name))
+                {
                     symbol_filter.insert(idx);
                 }
             }
@@ -2055,38 +2028,36 @@ fn run_batch(args: Args) -> Result<()> {
                 let name_base_idx =
                     base_obj.as_ref().and_then(|o| o.symbol_by_name_or_demangled(symbol_name));
 
-                let (symbol_idx, symbol, _obj, obj_diff) =
-                    if let Some(idx) = name_target_idx {
-                        let obj = target_obj.as_ref().unwrap();
-                        let diff = diff_result.left.as_ref().unwrap();
-                        (idx, &obj.symbols[idx], obj, diff)
-                    } else if let Some(idx) = name_base_idx {
-                        let obj = base_obj.as_ref().unwrap();
-                        let diff = diff_result.right.as_ref().unwrap();
-                        (idx, &obj.symbols[idx], obj, diff)
-                    } else {
-                        let output = serde_json::json!({
-                            "symbol": symbol_name,
-                            "error": "symbol_not_in_objects",
-                        });
-                        lines.push(serde_json::to_string(&output)?);
-                        continue;
-                    };
+                let (symbol_idx, symbol, _obj, obj_diff) = if let Some(idx) = name_target_idx {
+                    let obj = target_obj.as_ref().unwrap();
+                    let diff = diff_result.left.as_ref().unwrap();
+                    (idx, &obj.symbols[idx], obj, diff)
+                } else if let Some(idx) = name_base_idx {
+                    let obj = base_obj.as_ref().unwrap();
+                    let diff = diff_result.right.as_ref().unwrap();
+                    (idx, &obj.symbols[idx], obj, diff)
+                } else {
+                    let output = serde_json::json!({
+                        "symbol": symbol_name,
+                        "error": "symbol_not_in_objects",
+                    });
+                    lines.push(serde_json::to_string(&output)?);
+                    continue;
+                };
 
                 let symbol_diff = &obj_diff.symbols[symbol_idx];
 
                 let (target_symbol_idx, base_symbol_idx, target_size, base_size) =
                     if name_target_idx.is_some() {
-                        let ts = target_obj.as_ref()
-                            .map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+                        let ts =
+                            target_obj.as_ref().map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
                         let bsi = symbol_diff.target_symbol;
                         let bs = bsi
                             .and_then(|idx| base_obj.as_ref().map(|o| o.symbols[idx].size))
                             .unwrap_or(0);
                         (Some(symbol_idx), bsi, ts, bs)
                     } else {
-                        let bs = base_obj.as_ref()
-                            .map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+                        let bs = base_obj.as_ref().map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
                         let tsi = symbol_diff.target_symbol;
                         let ts = tsi
                             .and_then(|idx| target_obj.as_ref().map(|o| o.symbols[idx].size))
@@ -2239,7 +2210,9 @@ fn run_batch(args: Args) -> Result<()> {
                 );
 
                 let primary_match_percent = symbol_diff.match_percent;
-                let (normalized_match_percent, raw_match_percent) = if let Some(ref alt_result) = alt_diff_result {
+                let (normalized_match_percent, raw_match_percent) = if let Some(ref alt_result) =
+                    alt_diff_result
+                {
                     let alt_match = if target_obj.is_some() {
                         alt_result
                             .left
@@ -2640,10 +2613,8 @@ fn build_instruction_diffs(
 
         // Surface the control-flow (branch) graph from each side's diff row.
         let branch_from = |row: Option<&InstructionDiffRow>| {
-            row.and_then(|r| r.branch_from.as_ref()).map(|b| BranchFrom {
-                source_indices: b.ins_idx.clone(),
-                branch_idx: b.branch_idx,
-            })
+            row.and_then(|r| r.branch_from.as_ref())
+                .map(|b| BranchFrom { source_indices: b.ins_idx.clone(), branch_idx: b.branch_idx })
         };
         let branch_to = |row: Option<&InstructionDiffRow>| {
             row.and_then(|r| r.branch_to.as_ref())
@@ -2888,22 +2859,18 @@ pub fn analyze_symbol(
     let symbol_diff = &obj_diff.symbols[symbol_idx];
 
     // Use diff result's matched symbol for the "other" side
-    let (target_symbol_idx, base_symbol_idx, target_size, base_size) =
-        if name_target_idx.is_some() {
-            let ts = target_obj.map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
-            let bsi = symbol_diff.target_symbol;
-            let bs = bsi
-                .and_then(|idx| base_obj.map(|o| o.symbols[idx].size))
-                .unwrap_or(0);
-            (Some(symbol_idx), bsi, ts, bs)
-        } else {
-            let bs = base_obj.map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
-            let tsi = symbol_diff.target_symbol;
-            let ts = tsi
-                .and_then(|idx| target_obj.map(|o| o.symbols[idx].size))
-                .unwrap_or(0);
-            (tsi, Some(symbol_idx), ts, bs)
-        };
+    let (target_symbol_idx, base_symbol_idx, target_size, base_size) = if name_target_idx.is_some()
+    {
+        let ts = target_obj.map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+        let bsi = symbol_diff.target_symbol;
+        let bs = bsi.and_then(|idx| base_obj.map(|o| o.symbols[idx].size)).unwrap_or(0);
+        (Some(symbol_idx), bsi, ts, bs)
+    } else {
+        let bs = base_obj.map(|o| o.symbols[symbol_idx].size).unwrap_or(0);
+        let tsi = symbol_diff.target_symbol;
+        let ts = tsi.and_then(|idx| target_obj.map(|o| o.symbols[idx].size)).unwrap_or(0);
+        (tsi, Some(symbol_idx), ts, bs)
+    };
 
     // Get both sides of the diff
     let left_diff = diff_result.left.as_ref();
@@ -3656,13 +3623,9 @@ impl AppState {
 pub struct TermWaker(pub AtomicBool);
 
 impl Wake for TermWaker {
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::Relaxed);
-    }
+    fn wake(self: Arc<Self>) { self.0.store(true, Ordering::Relaxed); }
 
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.store(true, Ordering::Relaxed);
-    }
+    fn wake_by_ref(self: &Arc<Self>) { self.0.store(true, Ordering::Relaxed); }
 }
 
 fn run_interactive(
@@ -3865,10 +3828,7 @@ mod tests {
         // substring of names[2]. Exact must win outright rather than report
         // three matches as ambiguous.
         assert_eq!(resolve_unit_name(&names, "MidiSynth").unwrap(), 1);
-        assert_eq!(
-            resolve_unit_name(&names, "main/system/synth/MidiSynth").unwrap(),
-            0
-        );
+        assert_eq!(resolve_unit_name(&names, "main/system/synth/MidiSynth").unwrap(), 0);
     }
 
     #[test]
@@ -4035,14 +3995,9 @@ mod tests {
         // classification says not_in_unit, the candidate list has at least one
         // entry that is not the requested unit. If this can fail, an empty
         // `defined_in` becomes ambiguous again.
-        for (want, candidates) in [
-            (3u32, &[7u32][..]),
-            (3, &[7, 9][..]),
-            (0, &[1, 2, 3][..]),
-        ] {
+        for (want, candidates) in [(3u32, &[7u32][..]), (3, &[7, 9][..]), (0, &[1, 2, 3][..])] {
             assert!(is_not_in_unit(Some(want), Some(candidates)));
-            let others: Vec<u32> =
-                candidates.iter().copied().filter(|p| *p != want).collect();
+            let others: Vec<u32> = candidates.iter().copied().filter(|p| *p != want).collect();
             assert!(!others.is_empty(), "defined_in would be empty for {candidates:?}");
         }
     }
@@ -4206,16 +4161,16 @@ mod tests {
 
     #[test]
     fn test_build_data_diff_segments_relocs() {
-        use objdiff_core::diff::{
-            DataDiff, DataDiffKind, DataDiffRow, DataRelocationDiff, SymbolDiff,
+        use objdiff_core::{
+            diff::{DataDiff, DataDiffKind, DataDiffRow, DataRelocationDiff, SymbolDiff},
+            obj::{Relocation, RelocationFlags, Symbol},
         };
-        use objdiff_core::obj::{Relocation, RelocationFlags, Symbol};
 
         // Symbols table for relocation target-name resolution.
-        let symbols = vec![
-            Symbol { name: "_self".to_string(), ..Default::default() },
-            Symbol { name: "SomeVtableEntry".to_string(), ..Default::default() },
-        ];
+        let symbols = vec![Symbol { name: "_self".to_string(), ..Default::default() }, Symbol {
+            name: "SomeVtableEntry".to_string(),
+            ..Default::default()
+        }];
 
         // A 4-byte relocation at offset 4 (absolute 0x1004) that mismatches.
         let reloc = DataRelocationDiff {
@@ -4271,11 +4226,20 @@ mod tests {
 
         // Adjacent equal segments merge into one 16-byte run.
         assert_eq!(out.segments.len(), 3);
-        assert_eq!((out.segments[0].offset, out.segments[0].size, out.segments[0].kind.as_str()), (0, 16, "equal"));
+        assert_eq!(
+            (out.segments[0].offset, out.segments[0].size, out.segments[0].kind.as_str()),
+            (0, 16, "equal")
+        );
         assert_eq!(out.segments[0].bytes, None);
-        assert_eq!((out.segments[1].offset, out.segments[1].size, out.segments[1].kind.as_str()), (16, 4, "replace"));
+        assert_eq!(
+            (out.segments[1].offset, out.segments[1].size, out.segments[1].kind.as_str()),
+            (16, 4, "replace")
+        );
         assert_eq!(out.segments[1].bytes.as_deref(), Some("deadbeef"));
-        assert_eq!((out.segments[2].offset, out.segments[2].size, out.segments[2].kind.as_str()), (20, 4, "insert"));
+        assert_eq!(
+            (out.segments[2].offset, out.segments[2].size, out.segments[2].kind.as_str()),
+            (20, 4, "insert")
+        );
         assert_eq!(out.segments[2].bytes, None); // inserts have no bytes on this side
         // With no other side, base_bytes is never populated.
         assert!(out.segments.iter().all(|s| s.base_bytes.is_none()));
@@ -4348,8 +4312,9 @@ mod tests {
             ..Default::default()
         };
 
-        let out = build_data_diff(&symbols, &symbol_diff, Some((&other_symbols, &other_symbol_diff)))
-            .expect("data symbol should produce output");
+        let out =
+            build_data_diff(&symbols, &symbol_diff, Some((&other_symbols, &other_symbol_diff)))
+                .expect("data symbol should produce output");
         // equal run: still no bytes on either side.
         assert_eq!(out.segments[0].bytes, None);
         assert_eq!(out.segments[0].base_bytes, None);

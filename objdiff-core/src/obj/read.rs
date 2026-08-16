@@ -838,8 +838,7 @@ fn parse_coff_weak_externals(
             continue;
         }
         let Ok(default_symbol) = symbol_table.symbol(default_index) else { continue };
-        let (Ok(name), Ok(default_name)) =
-            (symbol.name(strings), default_symbol.name(strings))
+        let (Ok(name), Ok(default_name)) = (symbol.name(strings), default_symbol.name(strings))
         else {
             continue;
         };

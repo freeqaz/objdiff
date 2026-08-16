@@ -4,7 +4,6 @@ use alloc::{
     vec,
     vec::Vec,
 };
-
 use core::{num::NonZeroU32, ops::Range};
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
@@ -31,9 +30,7 @@ pub mod display;
 include!(concat!(env!("OUT_DIR"), "/config.gen.rs"));
 
 impl DiffObjConfig {
-    pub fn separator(&self) -> &'static str {
-        if self.space_between_args { ", " } else { "," }
-    }
+    pub fn separator(&self) -> &'static str { if self.space_between_args { ", " } else { "," } }
 }
 
 #[derive(Debug, Clone)]
@@ -156,19 +153,13 @@ impl InstructionArgDiffIndex {
     }
 
     #[inline(always)]
-    pub fn get(&self) -> Option<u32> {
-        self.0.map(|idx| idx.get() - 1)
-    }
+    pub fn get(&self) -> Option<u32> { self.0.map(|idx| idx.get() - 1) }
 
     #[inline(always)]
-    pub fn is_some(&self) -> bool {
-        self.0.is_some()
-    }
+    pub fn is_some(&self) -> bool { self.0.is_some() }
 
     #[inline(always)]
-    pub fn is_none(&self) -> bool {
-        self.0.is_none()
-    }
+    pub fn is_none(&self) -> bool { self.0.is_none() }
 }
 
 #[derive(Debug, Clone)]
@@ -740,7 +731,13 @@ fn matching_symbols(
                 let symbol_match = if is_filtered {
                     SymbolMatch {
                         left: Some(symbol_idx),
-                        right: find_symbol(right, left, symbol_idx, Some(&right_used), fuzzy_literals),
+                        right: find_symbol(
+                            right,
+                            left,
+                            symbol_idx,
+                            Some(&right_used),
+                            fuzzy_literals,
+                        ),
                         prev: find_symbol(prev, left, symbol_idx, None, fuzzy_literals),
                         section_kind,
                         masked_pairing: false,
@@ -1322,7 +1319,14 @@ pub fn reconcile_global_byte_matches(
     if dbg {
         eprintln!(
             "[caseb] funnel: named_unmatched>44B={} have_base_body={} have_sig={} sig_in_retail_index={} unique_retail_va={} not_already_matched={} oracle_own_tu_ok={} -> decisions={}",
-            c_named_unmatched, c_have_base_body, c_have_sig, c_sig_in_index, c_unique_retail, c_not_already, c_oracle_ok, decisions.len()
+            c_named_unmatched,
+            c_have_base_body,
+            c_have_sig,
+            c_sig_in_index,
+            c_unique_retail,
+            c_not_already,
+            c_oracle_ok,
+            decisions.len()
         );
     }
 
@@ -1501,8 +1505,10 @@ fn pair_funclets_by_bytes(
     let mut pass2_pairs: Vec<(usize, usize)> = Vec::new();
     for (sig, left_indices) in &left_by_sig {
         let Some(right_indices) = right_by_sig.get(sig) else { continue };
-        let l_remaining: Vec<usize> = left_indices.iter().copied().filter(|i| !left_used.contains(i)).collect();
-        let r_remaining: Vec<usize> = right_indices.iter().copied().filter(|i| !right_used.contains(i)).collect();
+        let l_remaining: Vec<usize> =
+            left_indices.iter().copied().filter(|i| !left_used.contains(i)).collect();
+        let r_remaining: Vec<usize> =
+            right_indices.iter().copied().filter(|i| !right_used.contains(i)).collect();
         for (l_idx, r_idx) in l_remaining.iter().zip(r_remaining.iter()) {
             pass2_pairs.push((*l_idx, *r_idx));
         }
@@ -1571,10 +1577,16 @@ fn pair_funclets_by_bytes(
 
     // Pass 3: same-size fuzzy match. For each remaining left funclet, find the best
     // unmatched right funclet of the same size by Hamming-equality of bytes.
-    let mut remaining_left: Vec<(usize, &alloc::vec::Vec<u8>)> =
-        left_candidates.iter().filter(|(i, _)| !left_used.contains(i)).map(|(i, s)| (*i, s)).collect();
-    let mut remaining_right: Vec<(usize, &alloc::vec::Vec<u8>)> =
-        right_candidates.iter().filter(|(i, _)| !right_used.contains(i)).map(|(i, s)| (*i, s)).collect();
+    let mut remaining_left: Vec<(usize, &alloc::vec::Vec<u8>)> = left_candidates
+        .iter()
+        .filter(|(i, _)| !left_used.contains(i))
+        .map(|(i, s)| (*i, s))
+        .collect();
+    let mut remaining_right: Vec<(usize, &alloc::vec::Vec<u8>)> = right_candidates
+        .iter()
+        .filter(|(i, _)| !right_used.contains(i))
+        .map(|(i, s)| (*i, s))
+        .collect();
     // Pair greedily: highest similarity first.
     let mut scored: Vec<(usize, usize, usize)> = Vec::new(); // (matching_bytes, l, r)
     for (l_idx, l_sig) in &remaining_left {
@@ -1864,8 +1876,8 @@ mod tests {
         assert!(!is_funclet_like("main"));
         assert!(!is_funclet_like(""));
         // `??__` followed by non-E/F is NOT a dynamic-init/dtor pattern.
-        assert!(!is_funclet_like("??__G"));   // scalar deleting destructor — not a lifecycle thunk
-        assert!(!is_funclet_like("??__R"));   // RTTI base-class descriptor — not a thunk
+        assert!(!is_funclet_like("??__G")); // scalar deleting destructor — not a lifecycle thunk
+        assert!(!is_funclet_like("??__R")); // RTTI base-class descriptor — not a thunk
     }
 
     /// Build a minimal `Object` containing a single `.text` section with the given
@@ -1905,12 +1917,8 @@ mod tests {
         // signatures are equal.
         let target_bytes = vec![0x3C, 0x60, 0x82, 0x34, 0xAA, 0xBB, 0xCC, 0xDD];
         let base_bytes = vec![0x3C, 0x60, 0x82, 0x34, 0x11, 0x22, 0x33, 0x44];
-        let reloc = Relocation {
-            flags: RelocationFlags::Coff(0),
-            address: 4,
-            target_symbol: 0,
-            addend: 0,
-        };
+        let reloc =
+            Relocation { flags: RelocationFlags::Coff(0), address: 4, target_symbol: 0, addend: 0 };
 
         let left = make_funclet_obj("fn_82345678", target_bytes, vec![reloc.clone()]);
         let right = make_funclet_obj("__unwind$42", base_bytes, vec![reloc]);
@@ -2116,8 +2124,10 @@ mod tests {
             &[("fn_82281000", sig_a_1), ("fn_82282000", sig_a_2), ("fn_82283000", sig_other)],
             relocs.iter().take(3).cloned().collect(),
         );
-        let right =
-            make_multi_funclet_obj(&[("__unwind$100", sig_a_b1)], relocs.iter().take(1).cloned().collect());
+        let right = make_multi_funclet_obj(
+            &[("__unwind$100", sig_a_b1)],
+            relocs.iter().take(1).cloned().collect(),
+        );
 
         let mut left_used = BTreeSet::new();
         let mut right_used = BTreeSet::new();

@@ -18,11 +18,11 @@
 
 #![cfg(feature = "ppc")]
 
+use objdiff_core::{diff, obj};
 use object::{
     Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
     write::{Object as WriteObject, Relocation, StandardSection, Symbol, SymbolSection},
 };
-use objdiff_core::{diff, obj};
 
 /// Build a minimal big-endian PPC ELF relocatable object containing a single
 /// function `func` whose body is `bl <callee>; blr`, with an `R_PPC_REL24`
@@ -92,11 +92,8 @@ fn diff_func(
             .expect("diff objects");
 
     let target_diff = result.left.as_ref().expect("target diff present");
-    let idx = target_obj
-        .symbols
-        .iter()
-        .position(|s| s.name == "func")
-        .expect("func symbol present");
+    let idx =
+        target_obj.symbols.iter().position(|s| s.name == "func").expect("func symbol present");
     let sym = &target_diff.symbols[idx];
 
     (
@@ -128,10 +125,7 @@ fn bl_reloc_only_diff_is_masked_under_none_and_visible_under_name_only() {
         masked_none >= 1,
         "under None the masked bl row must be disclosed: masked_equal_rows={masked_none}"
     );
-    assert!(
-        reloc_none >= 1,
-        "the mask is a reloc relaxation: reloc_ignored_rows={reloc_none}"
-    );
+    assert!(reloc_none >= 1, "the mask is a reloc relaxation: reloc_ignored_rows={reloc_none}");
 
     // --- functionRelocDiffs = NameOnly: the difference is METRIC-VISIBLE. ---
     let (pct_name_only, masked_name_only, reloc_name_only) =

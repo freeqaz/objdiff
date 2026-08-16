@@ -279,8 +279,7 @@ pub fn diff_code(
     };
     // Normalized match percent: excludes arg-only penalties (register swaps,
     // offset swaps) that don't represent real structural mismatches.
-    let normalized_diff_score =
-        diff_score.saturating_sub(diff_state.arg_diff_score).min(max_score);
+    let normalized_diff_score = diff_score.saturating_sub(diff_state.arg_diff_score).min(max_score);
     let match_percent_normalized = if max_score == 0 {
         0.0
     } else {
@@ -467,11 +466,12 @@ fn detect_fp_anchor_compensation(
     }
 
     // Parse helper for a single row on a given side.
-    let parse = |obj: &Object, sym_idx: usize, row: &InstructionDiffRow| -> Option<ParsedInstruction> {
-        let ins_ref = row.ins_ref?;
-        let resolved = obj.resolve_instruction_ref(sym_idx, ins_ref)?;
-        obj.arch.process_instruction(resolved, diff_config).ok()
-    };
+    let parse =
+        |obj: &Object, sym_idx: usize, row: &InstructionDiffRow| -> Option<ParsedInstruction> {
+            let ins_ref = row.ins_ref?;
+            let resolved = obj.resolve_instruction_ref(sym_idx, ins_ref)?;
+            obj.arch.process_instruction(resolved, diff_config).ok()
+        };
 
     let mut anchor_row: Option<usize> = None;
     let mut anchor_dst: Option<String> = None;
@@ -591,7 +591,16 @@ fn detect_fp_anchor_compensation(
         if lp.args.len() == rp.args.len()
             && lp.args.iter().zip(rp.args.iter()).all(|(a, b)| {
                 arg_eq(
-                    left_obj, right_obj, lr, rr, a, b, lres, rres, diff_config, symbol_equivalences,
+                    left_obj,
+                    right_obj,
+                    lr,
+                    rr,
+                    a,
+                    b,
+                    lres,
+                    rres,
+                    diff_config,
+                    symbol_equivalences,
                 )
             })
         {
@@ -865,11 +874,7 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
     let mut i = 0;
     let mut had_array = false;
     while i < bytes.len() {
-        if bytes[i] == b'Y'
-            && i + 1 < bytes.len()
-            && bytes[i + 1] >= b'0'
-            && bytes[i + 1] <= b'9'
-        {
+        if bytes[i] == b'Y' && i + 1 < bytes.len() && bytes[i + 1] >= b'0' && bytes[i + 1] <= b'9' {
             let dims = (bytes[i + 1] - b'0') as usize + 1;
             result.push(b'Y');
             result.push(bytes[i + 1]);
@@ -1021,8 +1026,7 @@ fn counter_named_referents_eq(
     else {
         return false;
     };
-    if !is_counter_suffixed_name(&left_symbol.name)
-        || !is_counter_suffixed_name(&right_symbol.name)
+    if !is_counter_suffixed_name(&left_symbol.name) || !is_counter_suffixed_name(&right_symbol.name)
     {
         return false;
     }
@@ -1353,29 +1357,27 @@ fn reloc_eq(
     // target objects contain no weak externals.)
     if name_check
         && (weak_external_aliases(right_obj, &right_reloc.symbol.name, &left_reloc.symbol.name)
-            || weak_external_aliases(
-                left_obj,
-                &left_reloc.symbol.name,
-                &right_reloc.symbol.name,
-            ))
+            || weak_external_aliases(left_obj, &left_reloc.symbol.name, &right_reloc.symbol.name))
     {
         return true;
     }
 
-    let names_match = left_reloc.symbol.name == right_reloc.symbol.name || {
-        #[cfg(feature = "std")]
-        {
-            symbol_equivalences.aliases(&left_reloc.symbol.name, &right_reloc.symbol.name)
+    let names_match = left_reloc.symbol.name == right_reloc.symbol.name
+        || {
+            #[cfg(feature = "std")]
+            {
+                symbol_equivalences.aliases(&left_reloc.symbol.name, &right_reloc.symbol.name)
+            }
+            #[cfg(not(feature = "std"))]
+            false
         }
-        #[cfg(not(feature = "std"))]
-        false
-    } || {
-        // Template array-size equivalence: instantiations differing only in
-        // array sizes produce identical code (arrays decay to pointers).
-        normalize_mangled_array_sizes(&left_reloc.symbol.name)
-            .zip(normalize_mangled_array_sizes(&right_reloc.symbol.name))
-            .is_some_and(|(l, r)| l == r)
-    };
+        || {
+            // Template array-size equivalence: instantiations differing only in
+            // array sizes produce identical code (arrays decay to pointers).
+            normalize_mangled_array_sizes(&left_reloc.symbol.name)
+                .zip(normalize_mangled_array_sizes(&right_reloc.symbol.name))
+                .is_some_and(|(l, r)| l == r)
+        };
     let symbol_name_addend_matches =
         names_match && left_reloc.relocation.addend == right_reloc.relocation.addend;
     // NameOnly: target symbol name (+ section) must match, but the addend is ignored.
@@ -1507,12 +1509,7 @@ struct InstructionDiffResult {
 impl InstructionDiffResult {
     #[inline]
     const fn new(kind: InstructionDiffKind) -> Self {
-        Self {
-            kind,
-            left_args_diff: Vec::new(),
-            right_args_diff: Vec::new(),
-            masked_reloc: false,
-        }
+        Self { kind, left_args_diff: Vec::new(), right_args_diff: Vec::new(), masked_reloc: false }
     }
 }
 
@@ -1624,8 +1621,7 @@ fn diff_instruction(
                         InstructionArgValue::Signed(_) | InstructionArgValue::Unsigned(_),
                     )
                 );
-                let penalty =
-                    if is_immediate { PENALTY_IMM_DIFF } else { PENALTY_REG_DIFF };
+                let penalty = if is_immediate { PENALTY_IMM_DIFF } else { PENALTY_REG_DIFF };
                 state.diff_score += penalty;
                 // Immediates (constants, memory offsets, vtable slots) represent
                 // real semantic differences — they survive into a native port,
@@ -1788,14 +1784,18 @@ mod tests {
     #[test]
     fn test_classify_fp_anchor_rejects_non_r12_source() {
         // addi r31, r1, 0x80 is a stack-frame addressing op, NOT the FP idiom.
-        assert!(classify_fp_anchor(&pins("addi", vec![reg("r31"), reg("r1"), imm(0x80)])).is_none());
+        assert!(
+            classify_fp_anchor(&pins("addi", vec![reg("r31"), reg("r1"), imm(0x80)])).is_none()
+        );
     }
 
     #[cfg(feature = "std")]
     #[test]
     fn test_classify_fp_anchor_rejects_volatile_dst() {
         // addi r3, r12, K targets a volatile register; not a frame anchor.
-        assert!(classify_fp_anchor(&pins("addi", vec![reg("r3"), reg("r12"), imm(0x10)])).is_none());
+        assert!(
+            classify_fp_anchor(&pins("addi", vec![reg("r3"), reg("r12"), imm(0x10)])).is_none()
+        );
     }
 
     #[cfg(feature = "std")]
@@ -1814,7 +1814,9 @@ mod tests {
         // addi r3, r31, 0x78 is [reg, reg, imm], not an offset access; must not
         // be treated as a compensable load. (This guards AsyncFile/fn_8251A200,
         // a real-diff function whose anchor slip is NOT compensated.)
-        assert!(classify_anchor_mem(&pins("addi", vec![reg("r3"), reg("r31"), imm(0x78)])).is_none());
+        assert!(
+            classify_anchor_mem(&pins("addi", vec![reg("r3"), reg("r31"), imm(0x78)])).is_none()
+        );
     }
 
     #[test]
@@ -1857,9 +1859,7 @@ mod tests {
     // pin the truth table directly on reloc_eq so they cannot drift with fixtures.
 
     #[cfg(feature = "std")]
-    use crate::obj::{
-        Relocation, RelocationFlags, Section, SectionData, SectionKind, Symbol,
-    };
+    use crate::obj::{Relocation, RelocationFlags, Section, SectionData, SectionKind, Symbol};
 
     /// Build a one-section object whose single instruction at `address` carries a
     /// relocation referencing a symbol named `target_name` (in section "text") with
@@ -2592,8 +2592,7 @@ mod tests {
         if weak {
             // Undefined: a weak external has no section.
             obj.symbols[1].section = None;
-            obj.weak_external_defaults
-                .insert(target_name.to_string(), default_name.to_string());
+            obj.weak_external_defaults.insert(target_name.to_string(), default_name.to_string());
         }
         obj
     }
@@ -2605,8 +2604,7 @@ mod tests {
         // deleting destructor, which our object declares as an undefined weak
         // external defaulting to exactly that scalar one. Both link to one body.
         let left = obj_with_reloc("??_GFoo@@UAAPAXI@Z", 0x100);
-        let right =
-            obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", true);
+        let right = obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", true);
         assert!(reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
         // Tolerance is NameCheck-specific; NameOnly still charges the name diff.
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameOnly));
@@ -2621,8 +2619,7 @@ mod tests {
         // name binds to itself, so the call does NOT reach `??_G` and the row is
         // ambiguous, never benign. This must stay charged.
         let left = obj_with_reloc("??_GFoo@@UAAPAXI@Z", 0x100);
-        let right =
-            obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", false);
+        let right = obj_with_weak_external("??_EFoo@@UAAPAXI@Z", "??_GFoo@@UAAPAXI@Z", false);
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
     }
 
@@ -2633,8 +2630,7 @@ mod tests {
         // so the rule CAN fire here; but its default is `??_GBar`, while retail calls
         // `??_GQux`. Different classes, different code: the rule must DECLINE.
         let left = obj_with_reloc("??_GQux@@UAAPAXI@Z", 0x100);
-        let right =
-            obj_with_weak_external("??_EBar@@UAAPAXI@Z", "??_GBar@@UAAPAXI@Z", true);
+        let right = obj_with_weak_external("??_EBar@@UAAPAXI@Z", "??_GBar@@UAAPAXI@Z", true);
         assert!(!reloc_match(&left, &right, FunctionRelocDiffs::NameCheck));
     }
 
@@ -2781,10 +2777,7 @@ mod tests {
 
     /// Number of row positions where BOTH sides carry an instruction and the
     /// opcodes agree — i.e. rows the scorer can possibly credit as equal.
-    fn aligned_equal_rows(
-        left: &[InstructionDiffRow],
-        right: &[InstructionDiffRow],
-    ) -> usize {
+    fn aligned_equal_rows(left: &[InstructionDiffRow], right: &[InstructionDiffRow]) -> usize {
         left.iter()
             .zip(right.iter())
             .filter(|(l, r)| match (l.ins_ref, r.ins_ref) {
@@ -2812,7 +2805,11 @@ mod tests {
 
         // Real alignment inserts gap rows, so the row count EXCEEDS the input length.
         // Under the length-equality fast path this was exactly 10.
-        assert!(l.len() > left.len(), "no gap rows emitted => fast path was taken (len {})", l.len());
+        assert!(
+            l.len() > left.len(),
+            "no gap rows emitted => fast path was taken (len {})",
+            l.len()
+        );
         assert_eq!(l.len(), r.len());
         assert!(l.iter().any(|row| row.ins_ref.is_none()), "expected a gap row on the left");
         assert!(r.iter().any(|row| row.ins_ref.is_none()), "expected a gap row on the right");

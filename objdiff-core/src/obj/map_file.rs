@@ -1,5 +1,7 @@
-use std::collections::{BTreeSet, HashMap};
-use std::io::BufRead;
+use std::{
+    collections::{BTreeSet, HashMap},
+    io::BufRead,
+};
 
 use regex::Regex;
 
@@ -91,13 +93,9 @@ impl SymbolEquivalences {
     }
 
     /// Number of names that appear in at least one multi-symbol group.
-    pub fn len(&self) -> usize {
-        self.adjacency.len()
-    }
+    pub fn len(&self) -> usize { self.adjacency.len() }
 
-    pub fn is_empty(&self) -> bool {
-        self.adjacency.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.adjacency.is_empty() }
 
     /// Record one address group's assertion: every pair of names in `group` may
     /// stand in for each other.
@@ -141,8 +139,9 @@ pub fn parse_msvc_map(reader: impl BufRead) -> SymbolEquivalences {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn test_parse_msvc_map_icf() {
@@ -193,7 +192,10 @@ mod tests {
             // Both asserted pairs hold, in the name's OWN entry (no reliance on
             // a symmetric consumer). First-wins fails the second assertion.
             assert!(equivalences.aliases("?Dup@@YAXXZ", "?First@@YAXXZ"));
-            assert!(equivalences.aliases("?Dup@@YAXXZ", "?Second@@YAXXZ"), "later group must not be dropped");
+            assert!(
+                equivalences.aliases("?Dup@@YAXXZ", "?Second@@YAXXZ"),
+                "later group must not be dropped"
+            );
             assert!(equivalences.aliases("?First@@YAXXZ", "?Dup@@YAXXZ"));
             assert!(equivalences.aliases("?Second@@YAXXZ", "?Dup@@YAXXZ"));
         }
@@ -246,7 +248,10 @@ mod tests {
         let equivalences = parse_msvc_map(Cursor::new(map_content));
         assert!(equivalences.aliases("?Survivor1@@YAXXZ", "?Folded@@YAXXZ"));
         assert!(equivalences.aliases("?Survivor2@@YAXXZ", "?Folded@@YAXXZ"));
-        assert!(!equivalences.aliases("?Survivor1@@YAXXZ", "?Survivor2@@YAXXZ"), "closure is a data decision the parser must not take");
+        assert!(
+            !equivalences.aliases("?Survivor1@@YAXXZ", "?Survivor2@@YAXXZ"),
+            "closure is a data decision the parser must not take"
+        );
         assert!(!equivalences.aliases("?Survivor2@@YAXXZ", "?Survivor1@@YAXXZ"));
     }
 

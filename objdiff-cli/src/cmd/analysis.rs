@@ -494,8 +494,7 @@ impl Pattern {
                 let one_line = if pairs == 1 {
                     format!(
                         "{} instructions, {} pair ({}↔{}){}",
-                        total_occurrences, pairs, swaps[0].target_reg, swaps[0].base_reg,
-                        reg_class
+                        total_occurrences, pairs, swaps[0].target_reg, swaps[0].base_reg, reg_class
                     )
                 } else {
                     let dominant = &swaps[0]; // sorted by count descending
@@ -707,7 +706,12 @@ impl Pattern {
                 top_details: guards
                     .iter()
                     .take(3)
-                    .map(|g| format!("target imm {} vs base imm {}", g.target_immediate, g.base_immediate))
+                    .map(|g| {
+                        format!(
+                            "target imm {} vs base imm {}",
+                            g.target_immediate, g.base_immediate
+                        )
+                    })
                     .collect(),
                 truncated: guards.len() > 3,
                 total_items: guards.len(),
@@ -849,10 +853,7 @@ impl Pattern {
                 }
             }
             PatternDetails::FselTernary { count } => PatternSummary {
-                one_line: format!(
-                    "{} fsel explicit ternary pattern(s) detected",
-                    count
-                ),
+                one_line: format!("{} fsel explicit ternary pattern(s) detected", count),
                 top_details: vec![],
                 truncated: false,
                 total_items: *count,
@@ -1343,12 +1344,12 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
             let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
             swaps.iter().filter(|s| s.index >= start_idx && s.index <= end_idx).count()
         }
-        PatternDetails::AnonymousNamespaceHash { mismatches } => mismatches.len().min(
-            instructions.iter().filter(|i| i.match_type == "diff_arg").count(),
-        ),
-        PatternDetails::StaticGuardCounter { guards } => guards.len().min(
-            instructions.iter().filter(|i| i.match_type == "diff_arg").count(),
-        ),
+        PatternDetails::AnonymousNamespaceHash { mismatches } => {
+            mismatches.len().min(instructions.iter().filter(|i| i.match_type == "diff_arg").count())
+        }
+        PatternDetails::StaticGuardCounter { guards } => {
+            guards.len().min(instructions.iter().filter(|i| i.match_type == "diff_arg").count())
+        }
         PatternDetails::DynamicCastMismatch { count } => {
             instructions.iter().filter(|i| i.match_type == "insert").count().min(*count)
         }
@@ -1382,43 +1383,35 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
                 .count()
                 .min(info.count)
         }
-        PatternDetails::BooleanNegation { count } => {
-            instructions
-                .iter()
-                .filter(|i| {
-                    i.match_type == "replace"
-                        && i.target.as_ref().is_some_and(|t| {
-                            matches!(t.opcode.as_str(), "subfic" | "subic" | "subic.")
-                        })
-                })
-                .count()
-                .min(*count)
-        }
+        PatternDetails::BooleanNegation { count } => instructions
+            .iter()
+            .filter(|i| {
+                i.match_type == "replace"
+                    && i.target
+                        .as_ref()
+                        .is_some_and(|t| matches!(t.opcode.as_str(), "subfic" | "subic" | "subic."))
+            })
+            .count()
+            .min(*count),
         PatternDetails::FloatPrecisionMismatch { mismatches } => {
             let start_idx = instructions.first().map(|i| i.index).unwrap_or(0);
             let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
             mismatches.iter().filter(|m| m.index >= start_idx && m.index <= end_idx).count()
         }
-        PatternDetails::FselTernary { count } => {
-            instructions
-                .iter()
-                .filter(|i| {
-                    i.match_type == "insert"
-                        && i.target.as_ref().is_some_and(|t| t.opcode == "fsel")
-                })
-                .count()
-                .min(*count)
-        }
-        PatternDetails::FloatToIntToFloat { count } => {
-            instructions
-                .iter()
-                .filter(|i| {
-                    i.match_type == "insert"
-                        && i.target.as_ref().is_some_and(|t| t.opcode == "fctiwz")
-                })
-                .count()
-                .min(*count)
-        }
+        PatternDetails::FselTernary { count } => instructions
+            .iter()
+            .filter(|i| {
+                i.match_type == "insert" && i.target.as_ref().is_some_and(|t| t.opcode == "fsel")
+            })
+            .count()
+            .min(*count),
+        PatternDetails::FloatToIntToFloat { count } => instructions
+            .iter()
+            .filter(|i| {
+                i.match_type == "insert" && i.target.as_ref().is_some_and(|t| t.opcode == "fctiwz")
+            })
+            .count()
+            .min(*count),
         PatternDetails::SignednessMismatch { mismatches } => {
             let start_idx = instructions.first().map(|i| i.index).unwrap_or(0);
             let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
@@ -2009,9 +2002,7 @@ pub fn pattern_doc_links(pattern: PatternType) -> &'static [DocLink] {
             &[DocLink::StaticGuardCounter, DocLink::StaticSymbolOrder]
         }
         PatternType::DynamicCastMismatch => &[DocLink::DynamicCast],
-        PatternType::DeadStoreElimination => {
-            &[DocLink::DeadStoreElimination, DocLink::PermuterRoi]
-        }
+        PatternType::DeadStoreElimination => &[DocLink::DeadStoreElimination, DocLink::PermuterRoi],
         // A prologue that saves one more/fewer callee-saved register than the
         // target is a live-range budget difference, not a declaration-order
         // one: in the measured case (RndText::FitTextScroll, MSVC/PPC) our
@@ -2143,11 +2134,7 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
 
     Some(Pattern {
         pattern: PatternType::LinkerMerged,
-        confidence: if icf_template_count > 0 {
-            Confidence::Medium
-        } else {
-            Confidence::High
-        },
+        confidence: if icf_template_count > 0 { Confidence::Medium } else { Confidence::High },
         instruction_count: total_count,
         fixability: Fixability::RarelyHandFixable,
         details: PatternDetails::MergedFunctions { merged_functions },
@@ -2368,9 +2355,9 @@ pub fn detect_register_swap(instructions: &[InstructionDiffOutput]) -> Option<Pa
     let has_callee_saved_swap = swaps
         .iter()
         .any(|s| is_callee_saved_register(&s.target_reg) && is_callee_saved_register(&s.base_reg));
-    let has_volatile_swap = swaps
-        .iter()
-        .any(|s| !is_callee_saved_register(&s.target_reg) || !is_callee_saved_register(&s.base_reg));
+    let has_volatile_swap = swaps.iter().any(|s| {
+        !is_callee_saved_register(&s.target_reg) || !is_callee_saved_register(&s.base_reg)
+    });
 
     let fixability = if has_volatile_swap && !has_callee_saved_swap {
         // Pure volatile: scheduling-driven, not declaration-driven. The
@@ -2561,9 +2548,7 @@ const COMMUTATIVE_OPCODES: &[&str] = &[
 ];
 
 /// Check if an opcode is a commutative operation.
-fn is_commutative_opcode(opcode: &str) -> bool {
-    COMMUTATIVE_OPCODES.contains(&opcode)
-}
+fn is_commutative_opcode(opcode: &str) -> bool { COMMUTATIVE_OPCODES.contains(&opcode) }
 
 /// Extract operands from an instruction (excluding the destination register).
 /// For commutative operations like `fadd f0, f1, f2`, returns ["f1", "f2"].
@@ -2784,8 +2769,7 @@ static ANON_NS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\?A0x([0-9a-fA-F]+)@@").unwrap());
 
 /// Regex for static guard symbols (`$S\d+`)
-static STATIC_GUARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$S(\d+)").unwrap());
+static STATIC_GUARD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$S(\d+)").unwrap());
 
 /// Regex for prologue save calls (`__savegprlr_(\d+)` or `__savefpr_(\d+)`)
 static SAVE_REG_RE: LazyLock<Regex> =
@@ -3142,10 +3126,8 @@ pub fn detect_alloca_mismatch(instructions: &[InstructionDiffOutput]) -> Option<
         let t_args = target.args.as_deref().unwrap_or("");
         let b_args = base.args.as_deref().unwrap_or("");
 
-        let t_has_intrinsic =
-            t_args.contains("_RtlCheckStack") || t_args.contains("RtlCheckStack");
-        let b_has_intrinsic =
-            b_args.contains("_RtlCheckStack") || b_args.contains("RtlCheckStack");
+        let t_has_intrinsic = t_args.contains("_RtlCheckStack") || t_args.contains("RtlCheckStack");
+        let b_has_intrinsic = b_args.contains("_RtlCheckStack") || b_args.contains("RtlCheckStack");
         let t_has_crt =
             t_args == "alloca" || t_args.ends_with("/alloca") || t_args.contains("alloca");
         let b_has_crt =
@@ -3177,8 +3159,7 @@ pub fn detect_alloca_mismatch(instructions: &[InstructionDiffOutput]) -> Option<
 /// MSVC numbers static locals by scope depth. Extra `{}` blocks increment the counter.
 /// Detected when both sides reference the same static but with different `?N?` numbers.
 pub fn detect_scope_counter_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
-    static SCOPE_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\?(\d+)\?").unwrap());
+    static SCOPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?(\d+)\?").unwrap());
 
     let mut count = 0usize;
 
@@ -3230,8 +3211,7 @@ static MAKESTRING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\?\?\$MakeString@(.+)$").unwrap());
 
 /// Regex for char[N] dimension in mangled template args (D followed by digits)
-static CHAR_ARRAY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"D(0[A-P]+)@").unwrap());
+static CHAR_ARRAY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"D(0[A-P]+)@").unwrap());
 
 /// Detect MakeString template parameter mismatches.
 ///
@@ -3304,12 +3284,9 @@ pub fn detect_makestring_template_mismatch(
     let count = mismatches.len();
 
     // Fixability depends on sub-types
-    let has_type = mismatches
-        .iter()
-        .any(|m| matches!(m.sub_type, MakeStringMismatchSubType::Type));
-    let all_file_length = mismatches
-        .iter()
-        .all(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength));
+    let has_type = mismatches.iter().any(|m| matches!(m.sub_type, MakeStringMismatchSubType::Type));
+    let all_file_length =
+        mismatches.iter().all(|m| matches!(m.sub_type, MakeStringMismatchSubType::FileLength));
     let fixability = if all_file_length {
         Fixability::RarelyHandFixable
     } else if has_type {
@@ -3340,9 +3317,8 @@ pub fn detect_makestring_template_mismatch(
 /// shift — the source-permuter's `prologue_pressure` family (and equivalents)
 /// can adjust callee-saved usage; otherwise treat as cosmetic.
 fn is_crt_save_restore_diff(target: &InstructionInfo, base: &InstructionInfo) -> bool {
-    static CRT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^__(save|rest)(gpr|fpr|vmx)(lr)?(_\d+)?$").unwrap()
-    });
+    static CRT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^__(save|rest)(gpr|fpr|vmx)(lr)?(_\d+)?$").unwrap());
 
     let t_args = target.args.as_deref().unwrap_or("");
     let b_args = base.args.as_deref().unwrap_or("");
@@ -3408,8 +3384,7 @@ fn has_same_symbol_reloc(target: &InstructionInfo, base: &InstructionInfo) -> bo
     // vs @@IBA (protected const), etc. When the linker merges const and non-const
     // versions via ICF, the bl target differs only in this qualifier character.
     // Normalize A/B (non-const/const) at these positions and compare.
-    static CONST_QUAL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"@@[QI]([AB])").unwrap());
+    static CONST_QUAL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@@[QI]([AB])").unwrap());
     for (t, b) in t_syms.iter().zip(b_syms.iter()) {
         let t_norm = CONST_QUAL_RE.replace_all(t, "@@Q_");
         let b_norm = CONST_QUAL_RE.replace_all(b, "@@Q_");
@@ -3467,9 +3442,7 @@ fn has_same_symbol_reloc(target: &InstructionInfo, base: &InstructionInfo) -> bo
     false
 }
 
-pub fn detect_address_relocation_noise(
-    instructions: &[InstructionDiffOutput],
-) -> Option<Pattern> {
+pub fn detect_address_relocation_noise(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut count = 0usize;
     let mut pair_count = 0usize;
     let mut prev_was_lis = false;
@@ -3535,9 +3508,7 @@ pub fn detect_address_relocation_noise(
             _ => {
                 let t_args = target.args.as_deref().unwrap_or("");
                 let b_args = base.args.as_deref().unwrap_or("");
-                if has_same_symbol_reloc(target, base)
-                    || (t_args == b_args && !t_args.is_empty())
-                {
+                if has_same_symbol_reloc(target, base) || (t_args == b_args && !t_args.is_empty()) {
                     count += 1;
                 }
                 prev_was_lis = false;
@@ -3578,10 +3549,8 @@ pub fn detect_boolean_negation(instructions: &[InstructionDiffOutput]) -> Option
         let t_op = target.opcode.as_str();
         let b_op = base.opcode.as_str();
 
-        let is_subfic_subic = (t_op == "subfic"
-            && matches!(b_op, "subic" | "subic."))
-            || (matches!(t_op, "subic" | "subic.")
-                && b_op == "subfic");
+        let is_subfic_subic = (t_op == "subfic" && matches!(b_op, "subic" | "subic."))
+            || (matches!(t_op, "subic" | "subic.") && b_op == "subfic");
 
         if is_subfic_subic {
             count += 1;
@@ -3619,9 +3588,7 @@ const FLOAT_PRECISION_PAIRS: &[(&str, &str)] = &[
 /// emit a double-precision instruction (e.g., `fmul`) where the target uses
 /// single-precision (`fmuls`), or vice versa. This is often fixable by
 /// adjusting cast placement or using `float` literals.
-pub fn detect_float_precision_mismatch(
-    instructions: &[InstructionDiffOutput],
-) -> Option<Pattern> {
+pub fn detect_float_precision_mismatch(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
     let mut mismatches: Vec<FloatPrecisionMismatchEntry> = Vec::new();
 
     for instr in instructions {
@@ -3634,11 +3601,9 @@ pub fn detect_float_precision_mismatch(
         let b_op = base.opcode.as_str();
 
         // Check if the opcodes form a known precision pair
-        let is_pair = FLOAT_PRECISION_PAIRS
-            .iter()
-            .any(|(double, single)| {
-                (t_op == *double && b_op == *single) || (t_op == *single && b_op == *double)
-            });
+        let is_pair = FLOAT_PRECISION_PAIRS.iter().any(|(double, single)| {
+            (t_op == *double && b_op == *single) || (t_op == *single && b_op == *double)
+        });
 
         if is_pair {
             mismatches.push(FloatPrecisionMismatchEntry {
@@ -4015,7 +3980,11 @@ pub fn compute_verdict(
                 name: "all_rarely_hand_fixable",
                 value: serde_json::json!(true),
                 threshold: None,
-                result: if all_source_immune { "at_limit_source_immune" } else { "at_limit_hand_edit" },
+                result: if all_source_immune {
+                    "at_limit_source_immune"
+                } else {
+                    "at_limit_hand_edit"
+                },
             });
             if all_source_immune {
                 return Verdict {
@@ -4054,7 +4023,8 @@ pub fn compute_verdict(
                      before running the permuter — these patterns are typically permuter-class."
                     .to_string(),
                 suggestions: vec![Suggestion {
-                    action: "Run the source permuter on this function/unit before accepting.".to_string(),
+                    action: "Run the source permuter on this function/unit before accepting."
+                        .to_string(),
                     doc_url: doc_url(DocLink::PermuterRoi),
                 }],
                 doc_urls: verdict_doc_urls.clone(),
@@ -4200,7 +4170,8 @@ pub fn compute_verdict(
                 mismatches (control flow, regalloc) and consider a permuter sweep."
                 .to_string(),
             suggestions: vec![Suggestion {
-                action: "Filter out merged-call diffs and inspect remaining mismatches.".to_string(),
+                action: "Filter out merged-call diffs and inspect remaining mismatches."
+                    .to_string(),
                 doc_url: doc_url(DocLink::IcfVerifiable),
             }],
             doc_urls: verdict_doc_urls.clone(),
@@ -4244,10 +4215,8 @@ pub fn compute_verdict(
 
     // Check for MakeString template mismatches
     if analysis.has_pattern(PatternType::MakeStringTemplateMismatch) {
-        let ms_pattern = analysis
-            .patterns
-            .iter()
-            .find(|p| p.pattern == PatternType::MakeStringTemplateMismatch);
+        let ms_pattern =
+            analysis.patterns.iter().find(|p| p.pattern == PatternType::MakeStringTemplateMismatch);
         if let Some(pat) = ms_pattern
             && let PatternDetails::MakeStringTemplateMismatch { mismatches } = &pat.details
         {
@@ -4405,59 +4374,60 @@ pub fn compute_verdict(
         // before being marked at_limit.
         let high_match = match_percent.unwrap_or(0.0) >= 99.0;
 
-        let (classification, explanation, recommendation) = if high_match && register_swap_count <= 4 {
-            // Very high match (≥99%) with a tiny regswap count — likely a
-            // single FPR f0↔f1 swap or similar. Permuter still worth trying,
-            // but accepting after a sweep is reasonable.
-            (
-                VerdictClassification::MaybeFixable,
-                format!(
-                    "{} register swap instruction(s) at {:.1}% match. Small regswap counts \
+        let (classification, explanation, recommendation) =
+            if high_match && register_swap_count <= 4 {
+                // Very high match (≥99%) with a tiny regswap count — likely a
+                // single FPR f0↔f1 swap or similar. Permuter still worth trying,
+                // but accepting after a sweep is reasonable.
+                (
+                    VerdictClassification::MaybeFixable,
+                    format!(
+                        "{} register swap instruction(s) at {:.1}% match. Small regswap counts \
                      at very high match are usually one live-range or scheduling decision \
                      showing through — check that first, then sweep; if neither moves it, \
                      accepting is reasonable.",
-                    register_swap_count,
-                    match_percent.unwrap_or(0.0)
-                ),
-                format!(
-                    "Look for the single liveness/scheduling difference behind the swaps, \
+                        register_swap_count,
+                        match_percent.unwrap_or(0.0)
+                    ),
+                    format!(
+                        "Look for the single liveness/scheduling difference behind the swaps, \
                      then run the source permuter (~250 builds). If neither improves it, \
                      accept ({:.1}%) and mark at_limit.",
-                    match_percent.unwrap_or(0.0)
-                ),
-            )
-        } else if register_swap_count > 20 {
-            (
-                VerdictClassification::MaybeFixable,
-                format!(
-                    "{} register swap instructions — large cascade, typically driven by ONE \
+                        match_percent.unwrap_or(0.0)
+                    ),
+                )
+            } else if register_swap_count > 20 {
+                (
+                    VerdictClassification::MaybeFixable,
+                    format!(
+                        "{} register swap instructions — large cascade, typically driven by ONE \
                      upstream decision (a value's live range across a call, or where an \
                      operation was scheduled). Large count does not mean large fix: cascades \
                      of 17 and ~40 swaps have both collapsed to zero from a single edit.",
-                    register_swap_count
-                ),
-                "Find the one upstream difference rather than chasing individual registers: \
+                        register_swap_count
+                    ),
+                    "Find the one upstream difference rather than chasing individual registers: \
                  compare which values survive across calls (prologue save count is a tell), \
                  and whether producers are scheduled before their consumers. Then run the \
                  source permuter. Only mark at_limit after both yield nothing."
-                    .to_string(),
-            )
-        } else {
-            (
-                VerdictClassification::MaybeFixable,
-                format!(
-                    "{} register swap instruction(s) detected. Symptom class — the swaps \
+                        .to_string(),
+                )
+            } else {
+                (
+                    VerdictClassification::MaybeFixable,
+                    format!(
+                        "{} register swap instruction(s) detected. Symptom class — the swaps \
                      follow from a liveness or scheduling difference rather than being the \
                      difference themselves.",
-                    register_swap_count
-                ),
-                "Look for the cause first: a member reloaded at a call site the target keeps \
+                        register_swap_count
+                    ),
+                    "Look for the cause first: a member reloaded at a call site the target keeps \
                  in a register, a temp whose live range spans a call it need not, or an \
                  operation scheduled after the instruction that consumes it. Then run the \
                  source permuter. Declaration reorder is for stack-slot diffs, not this."
-                    .to_string(),
-            )
-        };
+                        .to_string(),
+                )
+            };
 
         return Verdict {
             classification,
@@ -4886,8 +4856,7 @@ mod tests {
         }
 
         let render = || {
-            let pattern =
-                detect_register_swap(&instructions).expect("Should detect register swap");
+            let pattern = detect_register_swap(&instructions).expect("Should detect register swap");
             let summary = pattern.summarize();
             (summary.one_line, summary.top_details)
         };
@@ -4906,14 +4875,11 @@ mod tests {
         // And the tie-break orders by register NUMBER, not lexicographically:
         // f2 and f11 come before f13, where a string sort would give
         // f0, f11, f13, f2. (`top_details` is capped at 3.)
-        assert_eq!(
-            expected.1,
-            vec![
-                format!("f0↔f10: {reps}"),
-                format!("f2↔f8: {reps}"),
-                format!("f11↔f3: {reps}"),
-            ]
-        );
+        assert_eq!(expected.1, vec![
+            format!("f0↔f10: {reps}"),
+            format!("f2↔f8: {reps}"),
+            format!("f11↔f3: {reps}"),
+        ]);
     }
 
     /// The CONTROL_FLOW summary's "dominated by" opcode pair must not depend on
@@ -4943,9 +4909,8 @@ mod tests {
             make_instr(5, "diff_op", Some("blt"), None, Some("bge"), None),
         ];
 
-        let render = || {
-            detect_control_flow(&instructions).expect("should detect control flow").summarize()
-        };
+        let render =
+            || detect_control_flow(&instructions).expect("should detect control flow").summarize();
         let expected = render();
         for _ in 0..256 {
             assert_eq!(
@@ -5001,10 +4966,7 @@ mod tests {
             assert_eq!(render(), expected, "LINKER_MERGED detail order varied between runs");
         }
         // All counts are 1, so the order is purely the name tie-break.
-        assert_eq!(
-            expected,
-            vec!["??_Ezeta@@UAAPAXI@Z", "OnlyReturns", "merged_1", "merged_9"]
-        );
+        assert_eq!(expected, vec!["??_Ezeta@@UAAPAXI@Z", "OnlyReturns", "merged_1", "merged_9"]);
     }
 
     #[test]
@@ -6275,14 +6237,8 @@ mod tests {
     #[test]
     fn test_detect_address_relocation_noise_none() {
         // No lis/addi diff_arg
-        let instructions = vec![make_instr(
-            0,
-            "diff_arg",
-            Some("mr"),
-            Some("r3, r4"),
-            Some("mr"),
-            Some("r3, r5"),
-        )];
+        let instructions =
+            vec![make_instr(0, "diff_arg", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r5"))];
 
         let pattern = detect_address_relocation_noise(&instructions);
         assert!(pattern.is_none());
@@ -6406,11 +6362,7 @@ mod tests {
                 Some("f0, f1, f2"),
             )];
             let pattern = detect_float_precision_mismatch(&instructions);
-            assert!(
-                pattern.is_some(),
-                "Should detect {} vs {} pair",
-                double, single
-            );
+            assert!(pattern.is_some(), "Should detect {} vs {} pair", double, single);
         }
     }
 
@@ -6470,8 +6422,22 @@ mod tests {
         // never inspected, so identical signed opcodes are not a mismatch.
         let instructions = vec![
             make_instr(0, "equal", Some("lha"), Some("r3, 0(r4)"), Some("lha"), Some("r3, 0(r4)")),
-            make_instr(1, "equal", Some("cmpw"), Some("cr0, r3, r4"), Some("cmpw"), Some("cr0, r3, r4")),
-            make_instr(2, "equal", Some("srawi"), Some("r3, r3, 2"), Some("srawi"), Some("r3, r3, 2")),
+            make_instr(
+                1,
+                "equal",
+                Some("cmpw"),
+                Some("cr0, r3, r4"),
+                Some("cmpw"),
+                Some("cr0, r3, r4"),
+            ),
+            make_instr(
+                2,
+                "equal",
+                Some("srawi"),
+                Some("r3, r3, 2"),
+                Some("srawi"),
+                Some("r3, r3, 2"),
+            ),
             make_instr(3, "equal", Some("extsb"), Some("r3, r3"), Some("extsb"), Some("r3, r3")),
         ];
         assert!(
@@ -6486,8 +6452,22 @@ mod tests {
         // (lha vs lwz — both loads, but not a signedness counterpart) must not
         // fire. Guards against over-broad matching.
         let instructions = vec![
-            make_instr(0, "replace", Some("lha"), Some("r3, 0(r4)"), Some("lwz"), Some("r3, 0(r4)")),
-            make_instr(1, "replace", Some("cmpw"), Some("cr0, r3, r4"), Some("cmpwi"), Some("cr0, r3, 0")),
+            make_instr(
+                0,
+                "replace",
+                Some("lha"),
+                Some("r3, 0(r4)"),
+                Some("lwz"),
+                Some("r3, 0(r4)"),
+            ),
+            make_instr(
+                1,
+                "replace",
+                Some("cmpw"),
+                Some("cr0, r3, r4"),
+                Some("cmpwi"),
+                Some("cr0, r3, 0"),
+            ),
         ];
         assert!(
             detect_signedness_mismatch(&instructions).is_none(),
@@ -6501,8 +6481,22 @@ mod tests {
         // surfaces the pattern and always lists it in patterns_checked.
         let instructions = vec![
             make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")),
-            make_instr(1, "replace", Some("lha"), Some("r3, 0(r4)"), Some("lhz"), Some("r3, 0(r4)")),
-            make_instr(2, "replace", Some("cmplw"), Some("cr0, r3, r4"), Some("cmpw"), Some("cr0, r3, r4")),
+            make_instr(
+                1,
+                "replace",
+                Some("lha"),
+                Some("r3, 0(r4)"),
+                Some("lhz"),
+                Some("r3, 0(r4)"),
+            ),
+            make_instr(
+                2,
+                "replace",
+                Some("cmplw"),
+                Some("cr0, r3, r4"),
+                Some("cmpw"),
+                Some("cr0, r3, r4"),
+            ),
         ];
         let pattern = detect_signedness_mismatch(&instructions).expect("should detect");
         assert_eq!(pattern.instruction_count, 2);
@@ -6530,7 +6524,14 @@ mod tests {
     fn test_detect_fsel_ternary() {
         let instructions = vec![
             make_instr(0, "replace", Some("fneg"), Some("f0, f1"), Some("fneg"), Some("f0, f1")),
-            make_instr(1, "replace", Some("fsel"), Some("f1, f0, f12, f1"), Some("fsel"), Some("f1, f0, f12, f1")),
+            make_instr(
+                1,
+                "replace",
+                Some("fsel"),
+                Some("f1, f0, f12, f1"),
+                Some("fsel"),
+                Some("f1, f0, f12, f1"),
+            ),
         ];
         let pattern = detect_fsel_ternary(&instructions).expect("Should detect fsel ternary");
         assert_eq!(pattern.pattern, PatternType::FselTernary);
@@ -6540,22 +6541,32 @@ mod tests {
     #[test]
     fn test_detect_float_to_int_to_float() {
         let instructions = vec![
-            make_instr(0, "replace", Some("fctiwz"), Some("f0, f1"), Some("fctiwz"), Some("f0, f1")),
-            make_instr(1, "replace", Some("stfd"), Some("f0, 0x58(r31)"), Some("stfd"), Some("f0, 0x58(r31)")),
+            make_instr(
+                0,
+                "replace",
+                Some("fctiwz"),
+                Some("f0, f1"),
+                Some("fctiwz"),
+                Some("f0, f1"),
+            ),
+            make_instr(
+                1,
+                "replace",
+                Some("stfd"),
+                Some("f0, 0x58(r31)"),
+                Some("stfd"),
+                Some("f0, 0x58(r31)"),
+            ),
         ];
-        let pattern = detect_float_to_int_to_float(&instructions).expect("Should detect float-to-int-to-float");
+        let pattern = detect_float_to_int_to_float(&instructions)
+            .expect("Should detect float-to-int-to-float");
         assert_eq!(pattern.pattern, PatternType::FloatToIntToFloat);
         assert_eq!(pattern.instruction_count, 1);
     }
 
     #[test]
     fn test_verdict_at_limit_address_relocation() {
-        let summary = InstructionSummary {
-            total: 10,
-            equal: 5,
-            diff_arg: 5,
-            ..Default::default()
-        };
+        let summary = InstructionSummary { total: 10, equal: 5, diff_arg: 5, ..Default::default() };
         let analysis = Analysis {
             patterns: vec![Pattern {
                 pattern: PatternType::AddressRelocationNoise,
@@ -6578,12 +6589,7 @@ mod tests {
 
     #[test]
     fn test_verdict_likely_fixable_makestring_type() {
-        let summary = InstructionSummary {
-            total: 10,
-            equal: 7,
-            diff_arg: 3,
-            ..Default::default()
-        };
+        let summary = InstructionSummary { total: 10, equal: 7, diff_arg: 3, ..Default::default() };
         let analysis = Analysis {
             patterns: vec![Pattern {
                 pattern: PatternType::MakeStringTemplateMismatch,
@@ -6623,12 +6629,8 @@ mod tests {
         // 99%+ match with only register swaps used to be classified AtLimit,
         // but regswaps are permuter-class — the verdict should now nudge the
         // user toward a permuter sweep before accepting.
-        let summary = InstructionSummary {
-            total: 100,
-            equal: 95,
-            diff_arg: 5,
-            ..Default::default()
-        };
+        let summary =
+            InstructionSummary { total: 100, equal: 95, diff_arg: 5, ..Default::default() };
         let analysis = Analysis {
             patterns: vec![Pattern {
                 pattern: PatternType::RegisterSwap,
@@ -6657,12 +6659,8 @@ mod tests {
     #[test]
     fn test_verdict_maybe_fixable_register_swap_low_match() {
         // Low match% with register swaps → still MaybeFixable
-        let summary = InstructionSummary {
-            total: 100,
-            equal: 80,
-            diff_arg: 20,
-            ..Default::default()
-        };
+        let summary =
+            InstructionSummary { total: 100, equal: 80, diff_arg: 20, ..Default::default() };
         let analysis = Analysis {
             patterns: vec![Pattern {
                 pattern: PatternType::RegisterSwap,

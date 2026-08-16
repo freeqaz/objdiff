@@ -96,9 +96,7 @@ pub struct SectionData(pub Vec<u8>);
 impl core::ops::Deref for SectionData {
     type Target = Vec<u8>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl fmt::Debug for SectionData {
@@ -406,9 +404,7 @@ impl Object {
         self.flow_analysis_results.insert(key, result);
     }
 
-    pub fn has_flow_analysis_result(&self) -> bool {
-        !self.flow_analysis_results.is_empty()
-    }
+    pub fn has_flow_analysis_result(&self) -> bool { !self.flow_analysis_results.is_empty() }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
