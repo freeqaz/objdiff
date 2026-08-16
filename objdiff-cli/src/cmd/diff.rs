@@ -1528,6 +1528,21 @@ fn check_batch_args(args: &Args) -> Result<()> {
     )
 }
 
+/// Is an unplaceable symbol `not_in_unit` (as opposed to `not_found`)?
+///
+/// Only a SCOPED run can produce `not_in_unit`, and only for a symbol the
+/// project defines somewhere. A scope must not swallow `not_found`: reporting a
+/// symbol that exists nowhere as `not_in_unit` with an empty `defined_in`
+/// leaves the consumer inferring "does not exist" from an empty list, a
+/// contract nothing states and nothing asserts — and that is the caller's typo
+/// case, the one most worth naming plainly.
+///
+/// `defined_anywhere` is the mangled target index's candidate list, which is
+/// what `not_found` has always meant on the unscoped path.
+fn is_not_in_unit(unit_filter: Option<u32>, defined_anywhere: Option<&[u32]>) -> bool {
+    unit_filter.is_some() && defined_anywhere.is_some_and(|units| !units.is_empty())
+}
+
 fn run_batch(args: Args) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
@@ -1678,9 +1693,11 @@ fn run_batch(args: Args) -> Result<()> {
     // symbol name → every unit position that defines it, ascending. A COMDAT
     // (inline function, template instantiation, vtable thunk) is defined in
     // every translation unit that uses it, so these lists are routinely longer
-    // than one entry — re-measured 2026-08-16 on rb3-xenon: 1 of 69,437 target
+    // than one entry — re-measured 2026-08-16 on rb3-xenon with this index
+    // itself (`list_function_symbols`, text symbols only): 1 of 69,437 target
     // symbols and 45,878 of 160,539 base symbols (was 7 / 51,334 before that
-    // project repaired its symbol map; see the resolver note below). The
+    // project repaired its symbol map; see the resolver note below, which also
+    // says why `coff_dup_symbols.py` reports different totals). The
     // lopsidedness is the point and it is stable: the extracted TARGET objects
     // are carved out of a linked image, where the linker already picked one
     // copy of each COMDAT, while our own BASE build emits every copy. Keeping
@@ -1809,8 +1826,21 @@ fn run_batch(args: Args) -> Result<()> {
             // project order, and Rule 1 declines to answer whenever no unit
             // defines the symbol on both sides — the byte-identical COMDAT tie,
             // which is common. Something has to break those ties the same way
-            // every run. Re-derive before quoting any of these numbers:
-            // `scripts/determinism/coff_dup_symbols.py <project>`.
+            // every run.
+            //
+            // Re-derive before quoting any of these numbers, and re-derive with
+            // the RIGHT instrument: they come from the index above, i.e.
+            // objdiff-core's `obj::read::list_function_symbols`, counting TEXT
+            // symbols. `scripts/determinism/coff_dup_symbols.py` answers a
+            // neighbouring question — COFF symbols with storage class EXTERNAL
+            // and a positive section number, so code *and* data — and on the
+            // same tree on the same day it reports 1 of 149,874 target and
+            // 51,335 of 111,939 base. It agrees on the target duplicate (the
+            // finding) and on nothing else (the denominators, and the base
+            // count, which is dominated by compiler-generated data symbols:
+            // its largest base group is `__C2_10224` across 1,047 units). Use
+            // it to identify WHICH names collide, which is what it is for; do
+            // not expect its totals to reproduce these.
             //
             // Under `-u` neither rule runs — see `pick_symbol_unit`.
             let pos = pick_symbol_unit(
@@ -1853,20 +1883,40 @@ fn run_batch(args: Args) -> Result<()> {
             // distinction that only exists once `-u` is honoured. The
             // `defined_in` list turns the second into an actionable message
             // instead of a row the caller has to go looking for.
-            match unit_filter {
-                Some(want) => {
-                    let mut defined_in: Vec<&str> = target_mangled_index
-                        .get(symbol.as_str())
-                        .map(Vec::as_slice)
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|pos| **pos != want)
-                        .map(|pos| units_in_order[*pos as usize].1)
-                        .collect();
-                    defined_in.truncate(8);
-                    not_in_unit.push((symbol.clone(), defined_in));
-                }
-                None => not_found.push(symbol.clone()),
+            //
+            // A scope must NOT swallow `not_found`. Reporting a symbol that
+            // exists nowhere as `not_in_unit` with an empty `defined_in` leaves
+            // the consumer inferring "does not exist" from an empty list — a
+            // contract nothing states and nothing asserts — and it is the
+            // caller's typo case, the one worth naming plainly.
+            //
+            // The membership test is on the MANGLED target index, which is
+            // what `not_found` has always meant on the unscoped path. A name
+            // reachable only through a demangled query in some OTHER unit
+            // therefore reports `not_found` here rather than `not_in_unit`.
+            // Classifying that case exactly would cost a demangled scan of
+            // every unit per unresolved symbol — 3,088 object reads each on
+            // rb3-xenon, paid once per out-of-unit symbol, and a scoped batch
+            // is routinely mostly out-of-unit. Not worth it to refine an error
+            // label; recorded so nobody reads the distinction as sharper than
+            // it is.
+            let defined_anywhere =
+                target_mangled_index.get(symbol.as_str()).map(Vec::as_slice);
+            if is_not_in_unit(unit_filter, defined_anywhere) {
+                let want = unit_filter.unwrap();
+                // Reaching here means the candidate list does not contain
+                // `want`, so this list is never empty — which is what makes an
+                // empty `defined_in` impossible rather than merely unlikely.
+                let mut defined_in: Vec<&str> = defined_anywhere
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|pos| **pos != want)
+                    .map(|pos| units_in_order[*pos as usize].1)
+                    .collect();
+                defined_in.truncate(8);
+                not_in_unit.push((symbol.clone(), defined_in));
+            } else {
+                not_found.push(symbol.clone());
             }
         }
     }
@@ -3955,6 +4005,45 @@ mod tests {
             full_listing: false,
             concise: false,
             batch: true,
+        }
+    }
+
+    #[test]
+    fn test_scoping_does_not_swallow_not_found() {
+        // A symbol the project defines nowhere must stay `not_found` under a
+        // scope. Reporting it as `not_in_unit` with an empty `defined_in` makes
+        // the consumer infer non-existence from an empty list -- undocumented,
+        // unasserted, and it is the typo case, the one worth naming plainly.
+        assert!(!is_not_in_unit(Some(3), None), "unknown symbol under a scope");
+        assert!(!is_not_in_unit(Some(3), Some(&[])), "empty candidate list is not membership");
+
+        // Defined somewhere the scope is not: that IS not_in_unit.
+        assert!(is_not_in_unit(Some(3), Some(&[7])));
+        assert!(is_not_in_unit(Some(3), Some(&[7, 9])));
+
+        // With no scope there is no such thing as not_in_unit, however the
+        // symbol is defined -- an unscoped run that failed to place a symbol
+        // failed for the old reason and must keep the old label.
+        assert!(!is_not_in_unit(None, None));
+        assert!(!is_not_in_unit(None, Some(&[7])));
+        assert!(!is_not_in_unit(None, Some(&[])));
+    }
+
+    #[test]
+    fn test_not_in_unit_implies_a_non_empty_defined_in() {
+        // The invariant the row's `defined_in` field rests on: whenever the
+        // classification says not_in_unit, the candidate list has at least one
+        // entry that is not the requested unit. If this can fail, an empty
+        // `defined_in` becomes ambiguous again.
+        for (want, candidates) in [
+            (3u32, &[7u32][..]),
+            (3, &[7, 9][..]),
+            (0, &[1, 2, 3][..]),
+        ] {
+            assert!(is_not_in_unit(Some(want), Some(candidates)));
+            let others: Vec<u32> =
+                candidates.iter().copied().filter(|p| *p != want).collect();
+            assert!(!others.is_empty(), "defined_in would be empty for {candidates:?}");
         }
     }
 
