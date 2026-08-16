@@ -461,7 +461,7 @@ pub struct Args {
     /// Project directory
     project: Option<Utf8PlatformPathBuf>,
     #[argp(option, short = 'u')]
-    /// Unit name within project
+    /// Unit name within project (with --batch: diff every symbol in this unit)
     unit: Option<String>,
     #[argp(option, short = 'o', from_str_fn(platform_path))]
     /// Output file ("-" for stdout, requires --format)
@@ -515,6 +515,89 @@ pub struct Args {
     #[argp(switch)]
     /// Batch mode: read symbols from stdin (one per line), group by unit, output JSONL
     batch: bool,
+}
+
+/// Resolve a `-u` / `--unit` argument to a position in `names`.
+///
+/// ONE resolver, shared by the one-shot path and batch mode, so `-u` cannot
+/// come to mean two different things depending on which mode you are in. It
+/// meant nothing at all in batch mode until this commit — `run_batch` never
+/// read the flag and walked the whole project regardless — and the way that
+/// survived is that it failed *silently*: a caller passing `-u` got a
+/// plausible-looking result set that simply had the wrong scope.
+///
+/// Match priority, first non-empty wins:
+///   0. Exact: `name == needle`. Fast path, and it preserves any caller that
+///      passes the canonical name.
+///   1. Path-component suffix: `name` ends with `/needle` — accepts
+///      `system/synth/MidiSynth` for `main/system/synth/MidiSynth`.
+///   2. Basename: the final `/`-separated segment equals `needle` — accepts
+///      the single-token `MidiSynth`.
+///   3. Substring anywhere in the name.
+///
+/// A needle matching nothing is an error naming the unit; a needle matching
+/// several is an error listing them. Never an empty result, never a silent
+/// pick — the caller asked for a specific unit and gets either that unit or a
+/// message saying why not.
+///
+/// `names` is expected in project-declared order; the returned position indexes
+/// it, so callers ordered by that same order can use it directly as a handle.
+fn resolve_unit_name(names: &[&str], needle: &str) -> Result<usize> {
+    // Exact match first.
+    if let Some(pos) = names.iter().position(|name| *name == needle) {
+        return Ok(pos);
+    }
+
+    let hits_by = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| pred(name))
+            .map(|(pos, _)| pos)
+            .collect()
+    };
+
+    let suffix_pattern = format!("/{}", needle);
+    let mut hits = hits_by(&|name: &str| name.ends_with(&suffix_pattern));
+    if hits.is_empty() {
+        hits = hits_by(&|name: &str| name.rsplit('/').next() == Some(needle));
+    }
+    if hits.is_empty() {
+        hits = hits_by(&|name: &str| name.contains(needle));
+    }
+
+    match hits.len() {
+        0 => Err(anyhow!(
+            "Unit not found: {}\n\
+             Hint: pass a path-suffix (e.g. `system/synth/MidiSynth`) \
+             or basename (e.g. `MidiSynth`) — these resolve against \
+             the project's full unit names (e.g. `main/system/synth/MidiSynth`).",
+            needle
+        )),
+        1 => {
+            let pos = hits[0];
+            // Tell the user what we resolved to so they can copy the canonical
+            // name into scripts if needed. (Unreachable when input already
+            // equals the canonical name — that took the exact path above.)
+            eprintln!("objdiff: resolved unit `{}` -> `{}`", needle, names[pos]);
+            Ok(pos)
+        }
+        n => {
+            let mut matched: Vec<&str> = hits.iter().map(|pos| names[*pos]).collect();
+            matched.sort_unstable();
+            let preview: Vec<&&str> = matched.iter().take(8).collect();
+            let trailer =
+                if n > 8 { format!("\n  ... and {} more", n - 8) } else { String::new() };
+            Err(anyhow!(
+                "Ambiguous unit `{}`: {} matches.\n  {}{}\n\
+                 Use a longer suffix or the canonical name.",
+                needle,
+                n,
+                preview.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n  "),
+                trailer
+            ))
+        }
+    }
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -576,89 +659,11 @@ pub fn run(args: Args) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let (object, unit_idx) = if let Some(u) = u {
-                // Try exact match first (fast path, preserves any agent that
-                // passes the canonical name).
-                let exact = objects.iter().find(|(obj, _)| obj.name == *u);
-                if let Some((obj, idx)) = exact {
-                    (obj, *idx)
-                } else {
-                    // Suffix/contains match: accept "system/synth/MidiSynth"
-                    // or just "MidiSynth" when the canonical name is
-                    // "main/system/synth/MidiSynth". Match priority:
-                    //   1. Path-component suffix: name == u OR name ends with "/" + u
-                    //   2. Basename-only match: final path segment == u
-                    //   3. Substring fallback (only if previous yields nothing)
-                    let needle = u.as_str();
-                    let suffix_pattern = format!("/{}", needle);
-                    let mut suffix_hits: Vec<_> = objects
-                        .iter()
-                        .filter(|(obj, _)| obj.name.ends_with(&suffix_pattern))
-                        .collect();
-                    if suffix_hits.is_empty() {
-                        // Basename match: final segment equals needle (handles
-                        // single-token names like "MidiSynth")
-                        suffix_hits = objects
-                            .iter()
-                            .filter(|(obj, _)| {
-                                obj.name.rsplit('/').next() == Some(needle)
-                            })
-                            .collect();
-                    }
-                    if suffix_hits.is_empty() {
-                        // Last resort: substring anywhere in the name.
-                        suffix_hits = objects
-                            .iter()
-                            .filter(|(obj, _)| obj.name.contains(needle))
-                            .collect();
-                    }
-                    match suffix_hits.len() {
-                        0 => {
-                            return Err(anyhow!(
-                                "Unit not found: {}\n\
-                                 Hint: pass a path-suffix (e.g. `system/synth/MidiSynth`) \
-                                 or basename (e.g. `MidiSynth`) — these resolve against \
-                                 the project's full unit names (e.g. `main/system/synth/MidiSynth`).",
-                                u
-                            ));
-                        }
-                        1 => {
-                            let (obj, idx) = suffix_hits[0];
-                            // Tell the user what we resolved to so they can
-                            // copy the canonical name into scripts if needed.
-                            // Skip the hint when input already equals the canonical name.
-                            if obj.name != *u {
-                                eprintln!(
-                                    "objdiff: resolved unit `{}` -> `{}`",
-                                    u, obj.name
-                                );
-                            }
-                            (obj, *idx)
-                        }
-                        n => {
-                            let mut names: Vec<&str> =
-                                suffix_hits.iter().map(|(obj, _)| obj.name.as_str()).collect();
-                            names.sort();
-                            let preview: Vec<&&str> = names.iter().take(8).collect();
-                            let trailer = if n > 8 {
-                                format!("\n  ... and {} more", n - 8)
-                            } else {
-                                String::new()
-                            };
-                            return Err(anyhow!(
-                                "Ambiguous unit `{}`: {} matches.\n  {}{}\n\
-                                 Use a longer suffix or the canonical name.",
-                                u,
-                                n,
-                                preview
-                                    .iter()
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n  "),
-                                trailer
-                            ));
-                        }
-                    }
-                }
+                let names: Vec<&str> =
+                    objects.iter().map(|(obj, _)| obj.name.as_str()).collect();
+                let pos = resolve_unit_name(&names, u)?;
+                let (obj, idx) = &objects[pos];
+                (obj, *idx)
             } else if let Some(symbol_name) = &args.symbol {
                 // Build a minimal diff config for demangling during symbol lookup
                 let mut lookup_config = DiffObjConfig::default();
@@ -1430,6 +1435,49 @@ fn run_batch(args: Args) -> Result<()> {
     // Positions in this vec (`pos` below) are used as compact unit handles.
     let units_in_order = units_in_project_order(&object_configs);
 
+    // `-u` / `--unit` in batch mode.
+    //
+    // This flag was DECLARED and then never read here: `run_batch` built its
+    // object configs from `project_config.units` and walked the whole project,
+    // so every caller that passed `-u` believed it had unit scope and had
+    // whole-project results. Resolving it here, before any symbol is placed,
+    // is what makes the flag real.
+    //
+    // Meaning: `-u U` pins the batch to unit U — every requested symbol is
+    // diffed as U defines it, and a symbol U's target object does not define
+    // is reported as `not_in_unit` rather than quietly diffed somewhere else.
+    // That is the SCOPE reading, not the FILTER reading, and the difference is
+    // visible only for a COMDAT (inline function, template instantiation,
+    // vtable thunk) that several translation units define: unrestricted
+    // resolution places it by `resolve_symbol_unit`, which may well choose
+    // another unit, so filtering the unrestricted run's rows would silently
+    // drop it. Under the scope reading `-u` is instead the disambiguator for
+    // exactly that case — the one thing batch mode had no way to express.
+    //
+    // Two consequences worth stating rather than discovering:
+    //   - `-u U` is not guaranteed to reproduce the `unit == "U"` rows of an
+    //     unrestricted run. For a symbol that unrestricted resolution assigned
+    //     elsewhere it produces a row the unrestricted run did not have. That
+    //     is the flag working, not drifting.
+    //   - It does not disable the cross-unit COMDAT base fallback below. `-u`
+    //     scopes which TARGET object's bytes are scored; the fallback only
+    //     finds a base body to score them against, and gating it on this flag
+    //     would make `-u` change scores as well as scope.
+    //
+    // Resolution goes through the same `resolve_unit_name` the one-shot path
+    // uses, so an unknown unit is a hard error naming it — silence is how the
+    // original bug survived — and a suffix or basename resolves identically in
+    // both modes.
+    let unit_filter: Option<u32> = match args.unit.as_deref() {
+        Some(requested) => {
+            let names: Vec<&str> = units_in_order.iter().map(|(_, name)| *name).collect();
+            let pos = resolve_unit_name(&names, requested)?;
+            eprintln!("Batch mode restricted to unit `{}`", names[pos]);
+            Some(pos as u32)
+        }
+        None => None,
+    };
+
     // Build symbol indexes: open each .obj file ONCE, extract all text symbols.
     // This replaces the O(symbols × units) scan with O(units + symbols) lookups.
     let index_start = std::time::Instant::now();
@@ -1499,6 +1547,9 @@ fn run_batch(args: Args) -> Result<()> {
     // every run (15 distinct orders over 15 runs of one binary).
     let mut by_unit: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     let mut not_found: Vec<String> = Vec::new();
+    // Only ever non-empty under `-u`: symbols the project defines somewhere,
+    // just not in the unit the caller scoped the batch to.
+    let mut not_in_unit: Vec<(String, Vec<&str>)> = Vec::new();
 
     for symbol in &symbols {
         if let Some(candidates) = target_mangled_index.get(symbol.as_str()) {
@@ -1530,10 +1581,18 @@ fn run_batch(args: Args) -> Result<()> {
             // objects) there is no answer the CLI can derive — the ambiguity is
             // upstream, in the alias map. All it can promise is the same answer
             // every run.
-            let pos = resolve_symbol_unit(
-                candidates,
-                base_symbol_index.get(symbol.as_str()).map(Vec::as_slice),
-            );
+            //
+            // Under `-u` neither rule runs: the caller has already named the
+            // unit, and the whole point of the flag is that its answer wins
+            // over anything derived here. The candidate list is ascending, so
+            // membership is a binary search.
+            let pos = match unit_filter {
+                Some(want) => candidates.binary_search(&want).ok().map(|_| want),
+                None => resolve_symbol_unit(
+                    candidates,
+                    base_symbol_index.get(symbol.as_str()).map(Vec::as_slice),
+                ),
+            };
             if let Some(pos) = pos {
                 by_unit.entry(pos).or_default().push(symbol.clone());
                 continue;
@@ -1542,9 +1601,14 @@ fn run_batch(args: Args) -> Result<()> {
         // Demangled fallback: scan target .obj files for demangled match.
         // Project-declared order again — this loop takes the first hit, and
         // over `object_configs` that first hit was whichever unit the hasher
-        // happened to visit first.
+        // happened to visit first. Under `-u` it visits exactly one unit, so
+        // the demangled spelling of a symbol is scoped the same way the
+        // mangled one is.
         let mut found = false;
         for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
+            if unit_filter.is_some_and(|want| want != pos as u32) {
+                continue;
+            }
             let Some((obj_config, _)) = object_configs.get(*unit_name) else { continue };
             if let Some(target_path) = obj_config.target_path.as_deref() {
                 let matches =
@@ -1558,16 +1622,43 @@ fn run_batch(args: Args) -> Result<()> {
             }
         }
         if !found {
-            not_found.push(symbol.clone());
+            // Two different failures, and conflating them is how a scoped run
+            // misleads: `not_found` means no unit in the project defines this
+            // symbol, `not_in_unit` means the requested unit does not — a
+            // distinction that only exists once `-u` is honoured. The
+            // `defined_in` list turns the second into an actionable message
+            // instead of a row the caller has to go looking for.
+            match unit_filter {
+                Some(want) => {
+                    let mut defined_in: Vec<&str> = target_mangled_index
+                        .get(symbol.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|pos| **pos != want)
+                        .map(|pos| units_in_order[*pos as usize].1)
+                        .collect();
+                    defined_in.truncate(8);
+                    not_in_unit.push((symbol.clone(), defined_in));
+                }
+                None => not_found.push(symbol.clone()),
+            }
         }
     }
 
     eprintln!(
         "Resolved: {} symbols across {} units ({} not found)",
-        symbols.len() - not_found.len(),
+        symbols.len() - not_found.len() - not_in_unit.len(),
         by_unit.len(),
         not_found.len(),
     );
+    if let Some(want) = unit_filter {
+        eprintln!(
+            "{} symbols not defined in unit `{}`",
+            not_in_unit.len(),
+            units_in_order[want as usize].1,
+        );
+    }
 
     // Output not-found symbols as error entries
     let mut not_found_lines: Vec<String> = Vec::new();
@@ -1575,6 +1666,16 @@ fn run_batch(args: Args) -> Result<()> {
         let output = serde_json::json!({
             "symbol": symbol,
             "error": "not_found",
+        });
+        not_found_lines.push(serde_json::to_string(&output)?);
+    }
+    for (symbol, defined_in) in &not_in_unit {
+        let unit_name = unit_filter.map(|want| units_in_order[want as usize].1);
+        let output = serde_json::json!({
+            "symbol": symbol,
+            "error": "not_in_unit",
+            "unit": unit_name,
+            "defined_in": defined_in,
         });
         not_found_lines.push(serde_json::to_string(&output)?);
     }
@@ -1937,7 +2038,7 @@ fn run_batch(args: Args) -> Result<()> {
 
     eprintln!(
         "Batch complete: {} symbols, {} units",
-        symbols.len() - not_found.len(),
+        symbols.len() - not_found.len() - not_in_unit.len(),
         by_unit.len(),
     );
     Ok(())
