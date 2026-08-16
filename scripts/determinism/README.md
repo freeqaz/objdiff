@@ -69,6 +69,16 @@ times. Re-derive, don't quote.
 > carried on that gate's explicit `_internal_linkage_allow` list. Internal
 > linkage means one mangled name legitimately denotes a different function per
 > defining TU, so expect this class at a low count forever rather than at zero.
+>
+> **This script's totals do not match the differ's, by design.** It counts COFF
+> symbols with storage class `EXTERNAL` and a positive section number — code
+> *and* data — while `diff --batch` indexes text symbols through objdiff-core's
+> `list_function_symbols`. Same tree, same day: this script says 1 of 149,874
+> target and 51,335 of 111,939 base; the batch index says 1 of 69,437 target and
+> 45,878 of 160,539 base. They agree on *which* target name collides, which is
+> what this script is for. The base gap is mostly compiler-generated data — the
+> largest base group here is `__C2_10224` across 1,047 units. Use this to find
+> the colliding names; do not quote its totals against a batch-index number.
 
 ## Two things a reader of batch output must know
 
