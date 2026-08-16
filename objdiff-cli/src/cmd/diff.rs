@@ -2764,24 +2764,52 @@ fn build_instruction_info(
         .context("Failed to resolve instruction")?;
     let processed = obj.arch.process_instruction(resolved, diff_config)?;
 
-    // Build string args for backward compatibility
-    let args_str = if processed.args.is_empty() {
-        None
-    } else {
-        let args: Vec<String> = processed
-            .args
-            .iter()
-            .map(|arg| match arg {
-                objdiff_core::obj::InstructionArg::Value(v) => v.to_string(),
-                objdiff_core::obj::InstructionArg::Reloc => resolved
-                    .relocation
-                    .as_ref()
-                    .map_or("<reloc>".to_string(), |r| r.symbol.name.clone()),
-                objdiff_core::obj::InstructionArg::BranchDest(d) => format!("{:#x}", d),
-            })
-            .collect();
-        Some(args.join(diff_config.separator()))
-    };
+    // Build the string args from the DISPLAY parts, not from processed.args.
+    // processed.args is the COMPARISON arg list: process_instruction appends a
+    // trailing InstructionArg::Reloc whenever the row carries a relocation the
+    // display never formatted (PPC fake-pool relocations attach to rows like
+    // `mr r5, r6`), and it drops the Basic parts, so the old comma-join
+    // rendered a phantom final operand (`mr r5, r6, sDevices__6UsbWii`) and
+    // flattened memory operands (`lwz r0, 0x0, r5` for `lwz r0, 0x0(r5)`).
+    // Walking display_instruction reproduces what the TUI shows: parens and
+    // reloc suffixes (@l/@ha) included, non-displayed relocations excluded.
+    // The non-displayed relocation still reaches consumers as the trailing
+    // Symbol entry of typed_args (built from processed.args below, unchanged).
+    // Display-layer only: scoring/diffing never reads these strings.
+    let mut args_display = String::new();
+    obj.arch.display_instruction(resolved, diff_config, &mut |part| {
+        match part {
+            objdiff_core::diff::display::InstructionPart::Opcode(..) => {}
+            objdiff_core::diff::display::InstructionPart::Separator => {
+                args_display.push_str(diff_config.separator());
+            }
+            objdiff_core::diff::display::InstructionPart::Basic(s) => {
+                args_display.push_str(&s);
+            }
+            objdiff_core::diff::display::InstructionPart::Arg(arg) => match arg {
+                objdiff_core::obj::InstructionArg::Value(v) => {
+                    args_display.push_str(&v.to_string());
+                }
+                objdiff_core::obj::InstructionArg::Reloc => {
+                    // Same branch-dest substitution process_instruction makes,
+                    // so branch rows keep their resolved local target address.
+                    if let Some(dest) = resolved.ins_ref.branch_dest {
+                        args_display.push_str(&format!("{dest:#x}"));
+                    } else {
+                        match resolved.relocation.as_ref() {
+                            Some(r) => args_display.push_str(&r.symbol.name),
+                            None => args_display.push_str("<reloc>"),
+                        }
+                    }
+                }
+                objdiff_core::obj::InstructionArg::BranchDest(d) => {
+                    args_display.push_str(&format!("{d:#x}"));
+                }
+            },
+        }
+        Ok(())
+    })?;
+    let args_str = if args_display.is_empty() { None } else { Some(args_display) };
 
     // Build typed args preserving type information
     let typed_args = if processed.args.is_empty() {
