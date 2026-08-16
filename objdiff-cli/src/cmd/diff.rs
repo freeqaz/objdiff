@@ -135,6 +135,22 @@ pub struct DiffOutput {
     pub demangled: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// Disclosure: the base object this row was scored against came from a
+    /// DIFFERENT unit than `unit` — the cross-unit COMDAT fallback fired
+    /// because the requested unit's base object has no copy of the symbol, so
+    /// this unit's target bytes were paired with the first base-DEFINING
+    /// unit's copy.
+    ///
+    /// Emitted ONLY when it differs from `unit`; absent on every same-unit
+    /// row, which is every row that existed before this field. It does NOT
+    /// change any match percent: gating the fallback would move scores on
+    /// same-unit rows too (see the fallback comment in `run_batch`), so the
+    /// fix for "a low fuzzy that is really a cross-unit pairing" is disclosure,
+    /// not suppression. A consumer that sees this field should read the score
+    /// as "this unit's target copy vs `base_unit`'s base copy", which for an
+    /// internal-linkage name can be a genuinely different function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_unit: Option<String>,
     pub target_size: u64,
     pub base_size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1235,6 +1251,12 @@ fn run_json(
         symbol: symbol_name.clone(),
         demangled: symbol.demangled_name.clone(),
         unit: args.unit.clone(),
+        // One-shot has no cross-unit pairing to disclose: target and base both
+        // come from the single `ObjectConfig` resolved above, so the base
+        // object is always the requested unit's own. There is no COMDAT
+        // fallback on this path -- a symbol the base object does not define
+        // simply scores against nothing.
+        base_unit: None,
         target_size,
         base_size,
         fuzzy_match_percent: normalized_match_percent,
@@ -1347,6 +1369,30 @@ fn pick_symbol_unit(
         Some(want) => target_units.binary_search(&want).ok().map(|_| want),
         None => resolve_symbol_unit(target_units, base_units),
     }
+}
+
+/// The unit whose BASE object the cross-unit COMDAT fallback pairs against,
+/// when it is not the unit the row is reported under.
+///
+/// `base_units` is the ascending list of unit positions whose base object
+/// defines the symbol; the fallback takes the first — project-declared unit
+/// order, the documented total order (see the fallback site in `run_batch`).
+/// `None` means there is nothing to fall back to (`base_units` empty or
+/// absent) or the first base definition is the row's own unit, in which case
+/// no cross-unit pairing happens and nothing is disclosed.
+///
+/// Returning the name rather than deciding inside the fallback block is what
+/// lets the row report it: this same answer both selects the base object and
+/// populates `DiffOutput::base_unit`, so the disclosure cannot drift from the
+/// object actually diffed.
+fn fallback_base_unit<'a>(
+    base_units: Option<&[u32]>,
+    units_in_order: &[(usize, &'a str)],
+    unit_name: &str,
+) -> Option<&'a str> {
+    let pos = *base_units?.first()?;
+    let name = units_in_order.get(pos as usize)?.1;
+    (name != unit_name).then_some(name)
 }
 
 /// Classify EVERY field of `Args` for batch mode, and refuse the ones batch
@@ -2075,12 +2121,12 @@ fn run_batch(args: Args) -> Result<()> {
                 // order. That order is project-declared unit order — `.first()`
                 // on an ascending candidate list — not `HashMap` iteration.
                 if base_size == 0 && name_target_idx.is_some() {
-                    let fallback = base_symbol_index
-                        .get(symbol_name.as_str())
-                        .and_then(|units| units.first())
-                        .map(|pos| units_in_order[*pos as usize].1);
+                    let fallback = fallback_base_unit(
+                        base_symbol_index.get(symbol_name.as_str()).map(Vec::as_slice),
+                        &units_in_order,
+                        unit_name,
+                    );
                     if let Some(fallback_unit) = fallback
-                        && fallback_unit != unit_name
                         && let Some((fallback_config, _)) = object_configs.get(fallback_unit)
                         && let Some(fallback_base_path) = fallback_config.base_path.as_deref()
                         && let Ok(fb_obj) = obj::read::read(
@@ -2161,6 +2207,11 @@ fn run_batch(args: Args) -> Result<()> {
                                 symbol: symbol_name.clone(),
                                 demangled: symbol.demangled_name.clone(),
                                 unit: Some(unit_name.to_string()),
+                                // The one row where the base did not come from
+                                // `unit`. Without this the caller sees a low
+                                // fuzzy under their `-u` scope and nothing
+                                // saying it is a cross-unit pairing.
+                                base_unit: Some(fallback_unit.to_string()),
                                 target_size,
                                 base_size: fb_bs,
                                 fuzzy_match_percent: fb_norm,
@@ -2239,6 +2290,8 @@ fn run_batch(args: Args) -> Result<()> {
                     symbol: symbol_name.clone(),
                     demangled: symbol.demangled_name.clone(),
                     unit: Some(unit_name.to_string()),
+                    // Same-unit pairing: nothing to disclose, field omitted.
+                    base_unit: None,
                     target_size,
                     base_size,
                     fuzzy_match_percent: normalized_match_percent,
@@ -3957,6 +4010,79 @@ mod tests {
     }
 
     // =========================================================================
+    // Cross-unit COMDAT base disclosure (`base_unit`)
+    //
+    // The fallback is not being gated -- gating it would move scores on rows
+    // that have nothing to do with `-u`. These pin the DISCLOSURE: the row says
+    // which unit's base object its target bytes were actually scored against,
+    // and says nothing at all when that is its own unit.
+    // =========================================================================
+
+    fn test_units_in_order() -> Vec<(usize, &'static str)> {
+        vec![(0, "main/a/Alpha"), (1, "main/b/Beta"), (2, "main/c/Gamma"), (3, "main/d/Delta")]
+    }
+
+    #[test]
+    fn test_fallback_base_unit_names_the_first_base_definer() {
+        let units = test_units_in_order();
+        // Scoped to Beta, whose base object has no copy: the fallback pairs
+        // against the first base-DEFINING unit in project order (Gamma, not
+        // Delta), and that is what the row must disclose.
+        assert_eq!(
+            fallback_base_unit(Some(&[2u32, 3][..]), &units, "main/b/Beta"),
+            Some("main/c/Gamma")
+        );
+    }
+
+    #[test]
+    fn test_fallback_base_unit_is_silent_on_a_same_unit_pairing() {
+        let units = test_units_in_order();
+        // The row's own unit defines the base copy -- the normal case, and the
+        // one that must stay byte-identical in the JSON for existing consumers.
+        assert_eq!(fallback_base_unit(Some(&[1u32, 3][..]), &units, "main/b/Beta"), None);
+        // Nothing to fall back to at all.
+        assert_eq!(fallback_base_unit(Some(&[][..]), &units, "main/b/Beta"), None);
+        assert_eq!(fallback_base_unit(None, &units, "main/b/Beta"), None);
+    }
+
+    #[test]
+    fn test_fallback_base_unit_ignores_a_position_past_the_project() {
+        // A stale index entry must not panic the batch; it just discloses
+        // nothing (and the fallback then does not fire).
+        let units = test_units_in_order();
+        assert_eq!(fallback_base_unit(Some(&[99u32][..]), &units, "main/b/Beta"), None);
+    }
+
+    #[test]
+    fn test_base_unit_is_serialized_only_when_the_fallback_fired() {
+        // (a) Fallback fired: the field is present, carries the base's unit,
+        // and `unit` still reports the unit the caller scoped to.
+        let mut output = make_test_output(Vec::new(), None, None);
+        output.unit = Some("main/sdk/RVL_SDK/src/vi/vi".to_string());
+        output.base_unit = Some("main/sdk/RVL_SDK/src/os/OSMemory".to_string());
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
+        assert_eq!(value["unit"], "main/sdk/RVL_SDK/src/vi/vi");
+        assert_eq!(value["base_unit"], "main/sdk/RVL_SDK/src/os/OSMemory");
+
+        // (b) Normal case: the key is absent entirely, not null. A consumer
+        // testing `"base_unit" in row` must see nothing on a same-unit row.
+        let output = make_test_output(Vec::new(), None, None);
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(!json.contains("base_unit"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("base_unit").is_none(), "{json}");
+        // And the disclosure is purely additive: every other field of the same
+        // row is unchanged by it.
+        let mut with_disclosure = make_test_output(Vec::new(), None, None);
+        with_disclosure.base_unit = Some("main/c/Gamma".to_string());
+        let mut disclosed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&with_disclosure).unwrap()).unwrap();
+        disclosed.as_object_mut().unwrap().remove("base_unit");
+        assert_eq!(disclosed, value);
+    }
+
+    // =========================================================================
     // Batch-mode flag compatibility
     //
     // `-u` was not a one-off: `Args` is one flat struct read by two code paths,
@@ -4454,6 +4580,7 @@ mod tests {
             symbol: "test_func".to_string(),
             demangled: Some("TestFunc()".to_string()),
             unit: Some("test.o".to_string()),
+            base_unit: None,
             target_size: 100,
             base_size: 100,
             fuzzy_match_percent: Some(90.0),
