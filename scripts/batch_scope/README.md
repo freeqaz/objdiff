@@ -71,3 +71,30 @@ vacuously, so the empty case exits early and says `SKIP`.
 | rb3 | Wii, ELF | 10 passed, 0 failed |
 | rb3-xenon | X360, MSVC PPC COFF | 10 passed, 0 failed |
 | dc3-decomp | X360, MSVC PPC COFF | 10 passed, 0 failed |
+
+### And verified to FAIL against the bug
+
+A regression guard written after the fix has a habit of passing against the bug
+it was written for. Point this at a pre-fix binary as the *first* argument and
+it must go red:
+
+```sh
+scripts/batch_scope/verify_unit_scope.sh <pre-fix-cli> <project-dir>
+```
+
+Measured on rb3: **exit 1, 3 passed, 6 failed** — `RESTRICT BAD 48` (all 48
+requested symbols answered, spanning many units, where 8 were in the unit),
+`OOB BAD 40` (forty out-of-unit symbols answered instead of refused), and all
+four unknown-unit assertions. Against the fixed binary, exit 0, 10/10.
+
+Two assertions pass against the buggy binary and are worth knowing about:
+
+- **the basename check.** With `-u` ignored, the canonical-name run and the
+  basename run return the same whole-project result, so "they agree" is true
+  for the wrong reason. It tests name *resolution*, not scope; it cannot see
+  this bug alone.
+- **the no-move check**, vacuously — with nothing scoped there is nothing whose
+  score could have moved.
+
+Neither is redundant (they catch different regressions), but neither is the
+guard against *this* one. `RESTRICT` and `OOB` are.
