@@ -54,11 +54,29 @@ moves when that tree is rebuilt (7 names became 6 mid-session here, an unrelated
 rebuild dropping a byte-identical one). The **divergent-body** subset was 3 both
 times. Re-derive, don't quote.
 
+> **Re-measured 2026-08-16 (rb3-xenon): 1 multiply-defined target name, and the
+> divergent-body subset is that same 1.** The instruction above was right and
+> the numbers above are dated. rb3-xenon proved on 2026-08-13 that most of that
+> population was a defect in `scripts/target_symbol_map.json` — the map claimed
+> one mangled name at several VAs, which a linked image cannot do — nulled the
+> disproved rows and gated the invariant in ninja
+> (`tools/map_name_injectivity.py`). The extracted objects are produced by
+> applying that map, so the collisions went with it. `?Null@Symbol@@QBA_NXZ`,
+> cited below, is gone from the map and from the objects.
+>
+> The survivor is `?NodeCmp@@YAHPBX0@Z` (148 B in `BandWardrobe.obj`, 332 B in
+> `DataArray.obj`) and it is **not** a defect: a file-static qsort comparator,
+> carried on that gate's explicit `_internal_linkage_allow` list. Internal
+> linkage means one mangled name legitimately denotes a different function per
+> defining TU, so expect this class at a low count forever rather than at zero.
+
 ## Two things a reader of batch output must know
 
 **A deterministic row is not necessarily an unambiguous one.** Where several
 target objects hold genuinely *different* bodies under one name — an ICF alias
-collision in the extracted target objects, 3 such names on rb3-xenon — the
+collision in the extracted target objects, 3 such names on rb3-xenon *when this
+was written; 1 as of 2026-08-16, see the correction above, and the survivor is
+internal linkage rather than a collision* — the
 resolver's pick is stable but **arbitrary**, and nothing in the emitted row says
 so. It reported *lower* than the pre-fix majority answer on 2 of those 3
 (`?Null@Symbol@@QBA_NXZ` 48.57 where the old build answered 90.57 on 10 of 15

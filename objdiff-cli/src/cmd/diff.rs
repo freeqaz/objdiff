@@ -1333,9 +1333,10 @@ fn units_in_project_order<T>(configs: &HashMap<String, (T, usize)>) -> Vec<(usiz
 /// Rule 1 is a measurement-quality rule, not a score-maximizing one: it chooses
 /// between *pairings*, never between bodies, and it does not consult any score.
 /// Where several target objects hold genuinely different bodies under one name
-/// — an ICF alias collision baked into the extracted target objects — no rule
-/// here can recover the right one; the ambiguity is upstream in the alias map,
-/// and all this promises is the same answer every run.
+/// no rule here can recover the right one; all this promises is the same answer
+/// every run. See the long note at the call site for what that population
+/// actually is now — it is one name on rb3-xenon, and it is legal C++ rather
+/// than the upstream map defect this comment used to describe.
 fn resolve_symbol_unit(target_units: &[u32], base_units: Option<&[u32]>) -> Option<u32> {
     target_units
         .iter()
@@ -1485,10 +1486,14 @@ fn run_batch(args: Args) -> Result<()> {
     // symbol name → every unit position that defines it, ascending. A COMDAT
     // (inline function, template instantiation, vtable thunk) is defined in
     // every translation unit that uses it, so these lists are routinely longer
-    // than one entry — 7 of 69,428 target symbols and 51,334 of 161,021 base
-    // symbols on rb3-xenon. Keeping the whole candidate list rather than a
-    // first-wins winner is what lets the resolver below prefer a unit where
-    // both sides define the symbol.
+    // than one entry — re-measured 2026-08-16 on rb3-xenon: 1 of 69,437 target
+    // symbols and 45,878 of 160,539 base symbols (was 7 / 51,334 before that
+    // project repaired its symbol map; see the resolver note below). The
+    // lopsidedness is the point and it is stable: the extracted TARGET objects
+    // are carved out of a linked image, where the linker already picked one
+    // copy of each COMDAT, while our own BASE build emits every copy. Keeping
+    // the whole candidate list rather than a first-wins winner is what lets the
+    // resolver below prefer a unit where both sides define the symbol.
     let index_side = |target_side: bool| {
         let mut index: HashMap<String, Vec<u32>> = HashMap::new();
         for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
@@ -1575,12 +1580,45 @@ fn run_batch(args: Args) -> Result<()> {
             //
             // Rule 2 — otherwise the first candidate in project-declared order.
             // When several target objects define one name with *different*
-            // bodies (7 names on rb3-xenon; `?Null@Symbol@@QBA_NXZ` has three
-            // genuinely different 28-byte bodies across ADSR/FilePath/
-            // MetaMusic, an ICF alias collision baked into the extracted target
-            // objects) there is no answer the CLI can derive — the ambiguity is
-            // upstream, in the alias map. All it can promise is the same answer
-            // every run.
+            // bodies there is no answer the CLI can derive; all it can promise
+            // is the same answer every run.
+            //
+            // What that population is (re-measured 2026-08-16 on rb3-xenon with
+            // this very index: 1 name multiply defined on the target side, of
+            // 69,437; base side 45,878 of 160,539). This comment previously
+            // read "7 names ... `?Null@Symbol@@QBA_NXZ` has three genuinely
+            // different 28-byte bodies", and BOTH halves are now wrong:
+            //
+            //   - `?Null@Symbol@@QBA_NXZ` is gone. rb3-xenon proved on
+            //     2026-08-13 that its collision was a defect in
+            //     `scripts/target_symbol_map.json` — the map claimed one name
+            //     at several VAs, which a linked image cannot do — nulled the
+            //     disproved rows and added a ninja gate
+            //     (`tools/map_name_injectivity.py`). The name is absent from
+            //     the map and from the extracted objects.
+            //   - The "7" was never the divergent-body count; it was the
+            //     multiply-defined count (the number in the index comment
+            //     above), quoted into the wrong sentence. The divergent-body
+            //     subset was 3 at the time.
+            //
+            // The one survivor is `?NodeCmp@@YAHPBX0@Z` — 148 bytes in
+            // BandWardrobe.obj, 332 in DataArray.obj, different sha256 — and it
+            // is NOT a map defect. It is a file-static qsort comparator, and
+            // rb3-xenon's injectivity gate carries it on an explicit
+            // `_internal_linkage_allow` list for that reason: internal linkage
+            // means one mangled name legitimately denotes a different function
+            // per defining TU, so no map repair can remove this case and none
+            // should try. Expect the class to persist at a low count, not to
+            // reach zero.
+            //
+            // Rule 2 is therefore load-bearing for determinism regardless of
+            // that count, and would be even at zero: `candidates` is only
+            // ascending-and-total because it is built by walking units in
+            // project order, and Rule 1 declines to answer whenever no unit
+            // defines the symbol on both sides — the byte-identical COMDAT tie,
+            // which is common. Something has to break those ties the same way
+            // every run. Re-derive before quoting any of these numbers:
+            // `scripts/determinism/coff_dup_symbols.py <project>`.
             //
             // Under `-u` neither rule runs: the caller has already named the
             // unit, and the whole point of the flag is that its answer wins
