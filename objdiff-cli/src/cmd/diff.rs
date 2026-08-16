@@ -1371,36 +1371,152 @@ fn pick_symbol_unit(
     }
 }
 
+/// Classify EVERY field of `Args` for batch mode, and refuse the ones batch
+/// mode would otherwise accept and quietly do nothing about.
+///
+/// `-u` was not a one-off. `Args` is one flat struct shared by two code paths,
+/// `run_batch` reads a subset of it, and nothing in the type system or the
+/// tests noticed the difference — so the same defect existed once per unread
+/// field, waiting for someone to pass it. This is the walk.
+///
+/// The line it draws: **batch refuses a flag whose effect it would not
+/// reproduce, and stays silent on a flag that one-shot ignores too for JSON
+/// output.** A flag that is inert in `diff -f json` is not a batch defect; a
+/// flag that changes `diff -f json` and does nothing here is.
+///
+/// - READ by batch: `project`, `unit`, `config`, `map_file` (and `batch`
+///   itself, by the dispatch in `run`).
+/// - HONOURED here, previously dropped: `output`, `include_instructions`,
+///   `full_listing` (which implies instructions, exactly as one-shot does).
+/// - INERT, correctly: `summary`, `analyze`, `verdict` — batch computes all
+///   three unconditionally, so asking for them is asking for what you already
+///   have. `context` and `concise` shape MARKDOWN rendering only and are
+///   equally inert in `diff -f json`.
+/// - REFUSED below: everything else.
+///
+/// Refusing beats warning here because it is verifiably safe: none of the seven
+/// known batch call sites across rb3, rb3-xenon, dc3-decomp and decomp-synth
+/// passes any refused flag (surveyed 2026-08-16). The two that would have been
+/// hit — `--include-instructions` and `-o -`, both from
+/// rb3-xenon `scripts/harvest/subobject_ref_scan.py` — are the two now
+/// honoured, which is why they are honoured rather than refused.
+fn check_batch_args(args: &Args) -> Result<()> {
+    // Exhaustive destructure, deliberately WITHOUT `..`. This is the structural
+    // half of the fix: add a field to `Args` and this line stops compiling,
+    // forcing whoever adds it to decide which of the four classes above it
+    // belongs to. A list of one-off `if args.foo.is_some()` guards cannot do
+    // that, and a list is how the first two of these got missed.
+    let Args {
+        target,
+        base,
+        project: _,             // read: locates the project config
+        unit: _,                // read: scopes the batch
+        output: _,              // honoured at the write site below
+        format,
+        symbol,
+        config: _,              // read: layered into every unit's diff config
+        include_instructions: _, // honoured at the row-construction sites
+        include_data,
+        summary: _,   // inert: batch always emits `instruction_summary`
+        analyze: _,   // inert: batch always emits `analysis`
+        verdict: _,   // inert: batch always emits `verdict`
+        build,
+        full_build,
+        incremental,
+        map_file: _,        // read: ICF equivalences
+        context: _,         // inert: markdown rendering only, as in `-f json`
+        full_listing: _,    // honoured: implies instructions, as in one-shot
+        concise: _,         // inert: markdown rendering only, as in `-f json`
+        batch: _,           // read by `run` to get here
+    } = args;
+
+    let mut refused: Vec<(&str, &str)> = Vec::new();
+
+    // The object pair. Worse than the `-u` failure, because batch resolves
+    // through the project and answers from whatever unit its index picked:
+    // rb3-xenon documented (2026-07-01) that a symbol answered from the wrong
+    // unit lands with `base_size=0` and reads as a false STUB verdict, and
+    // abandoned batch mode rather than trust the flag. Reproduced on the
+    // pre-fix binary: `-1 obj/DataArray.obj -2 src/system/obj/DataArray.obj`
+    // with `?NodeCmp@@YAHPBX0@Z` answers from `default/BandWardrobe`.
+    if target.is_some() || base.is_some() {
+        refused.push((
+            "-1/--target, -2/--base",
+            "batch resolves symbols through the project's units; use `-u <unit>` \
+             to scope a batch, or drop --batch to diff an explicit pair",
+        ));
+    }
+
+    // Batch reads its symbols from stdin. A positional symbol is not a second
+    // way to say the same thing — it is silently discarded.
+    if symbol.is_some() {
+        refused.push((
+            "<symbol> (positional)",
+            "batch reads symbols from stdin, one per line; pipe them in",
+        ));
+    }
+
+    // Batch emits JSONL and nothing else. An ABSENT `-f` is accepted (four of
+    // the seven known callers omit it, and JSONL is batch's own default), but
+    // an explicit format batch cannot produce must not be answered with a
+    // different one.
+    if let Some(f) = format.as_deref()
+        && f != "json"
+    {
+        refused.push((
+            "-f/--format (other than json)",
+            "batch emits JSON Lines — one object per line — and cannot render \
+             markdown, tui or json-pretty",
+        ));
+    }
+
+    // Batch hardcodes `data_diff: None`; there is no data-section diff to ask
+    // for. Refused rather than honoured because honouring it is real work, not
+    // a discarded value like the instruction rows.
+    if *include_data {
+        refused.push((
+            "--include-data",
+            "batch does not compute data-section diffs; use one-shot mode",
+        ));
+    }
+
+    // Batch never invokes the build system. This is the dangerous one: a caller
+    // passing --build believes it is measuring a fresh object and is measuring
+    // whatever is on disk, which is precisely the stale-object false read this
+    // repo has been bitten by before.
+    if *build || *full_build || *incremental {
+        refused.push((
+            "--build, --full-build, --incremental",
+            "batch never invokes the build system and would silently measure \
+             whatever objects are on disk; build first, then run the batch",
+        ));
+    }
+
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let detail = refused
+        .iter()
+        .map(|(flag, why)| format!("  {flag}\n      {why}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "--batch does not support these flags and would silently ignore them:\n{}",
+        detail
+    )
+}
+
 fn run_batch(args: Args) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
-    // `-1` / `-2` are the OTHER flags batch mode silently ignored, and the
-    // failure they produce is worse than the one `-u` produced: batch resolves
-    // against the project, so an explicit object pair is discarded and the
-    // answer comes from whatever unit the symbol index picked. rb3-xenon
-    // documented the consequence on 2026-07-01 — a symbol answered from the
-    // wrong unit with `base_size=0` reads as a false STUB verdict — and worked
-    // around it by using one-shot mode instead of trusting the flag.
-    //
-    // Refusing is the honest fix, not a limitation: batch mode is defined over
-    // a project (it groups symbols by unit and loads each unit's objects once),
-    // so a single explicit pair has no meaning here. `-u` now expresses the
-    // thing a caller reaching for `-1/-2` actually wanted — scope this batch to
-    // one unit — and one-shot mode still takes an arbitrary pair.
-    //
-    // Safe to make an error rather than a warning: none of the seven known
-    // batch call sites across rb3, rb3-xenon, dc3-decomp and decomp-synth pass
-    // either flag (surveyed 2026-08-16).
-    if args.target.is_some() || args.base.is_some() {
-        bail!(
-            "--batch does not accept -1/--target or -2/--base.\n\
-             Batch mode resolves symbols through the project's units and would \
-             silently ignore the object pair you passed, answering from some \
-             other unit instead.\n\
-             Use `-u <unit>` to scope a batch to one unit, or drop --batch to \
-             diff an explicit pair of objects."
-        );
-    }
+    check_batch_args(&args)?;
+
+    // Matches one-shot: `--full-listing` implies `--include-instructions`.
+    // Batch already builds these rows — it needs them for the summary, the
+    // analysis and the verdict — and then threw them away at the row, so the
+    // flag was accepted and dropped. Honouring it is keeping what is already
+    // computed.
+    let wants_instructions = args.include_instructions || args.full_listing;
 
     // Load project config
     let project_dir = match &args.project {
@@ -2017,7 +2133,7 @@ fn run_batch(args: Args) -> Result<()> {
                                 call_diff: None,
                                 insert_delete_clusters: None,
                                 diff_regions: None,
-                                instructions: None,
+                                instructions: wants_instructions.then_some(fb_instrs),
                                 masked_equal_rows: fb_sd.masked_equal_rows,
                                 reloc_ignored_rows: fb_sd.reloc_ignored_rows,
                                 masked_equal_symbol: fb_sd.masked_equal_symbol,
@@ -2093,7 +2209,7 @@ fn run_batch(args: Args) -> Result<()> {
                     call_diff: None,
                     insert_delete_clusters: None,
                     diff_regions: None,
-                    instructions: None,
+                    instructions: wants_instructions.then_some(instructions),
                     masked_equal_rows: symbol_diff.masked_equal_rows,
                     reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
                     masked_equal_symbol: symbol_diff.masked_equal_symbol,
@@ -2112,16 +2228,35 @@ fn run_batch(args: Args) -> Result<()> {
         })
         .collect();
 
-    // Write all results to stdout
-    let mut stdout = stdout();
+    // Write all results. `-o` was the third flag batch mode accepted and
+    // dropped: rows went to stdout no matter what path you named, so
+    // `-o results.jsonl` left you with an empty file and your output on the
+    // terminal. `-` still means stdout, which is what the one caller passing
+    // `-o` (rb3-xenon `scripts/harvest/subobject_ref_scan.py`) passes and what
+    // `write_diff_output` means by it on the one-shot path.
+    let mut writer: Box<dyn Write> = match args.output.as_deref() {
+        Some(p) if p != Utf8PlatformPath::new("-") => {
+            let file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(p)
+                .with_context(|| format!("Failed to create file {}", p))?;
+            Box::new(BufWriter::new(file))
+        }
+        _ => Box::new(stdout()),
+    };
     for line in &not_found_lines {
-        writeln!(stdout, "{}", line)?;
+        writeln!(writer, "{}", line)?;
     }
     for unit_result in unit_results {
         for line in unit_result? {
-            writeln!(stdout, "{}", line)?;
+            writeln!(writer, "{}", line)?;
         }
     }
+    // A BufWriter that is only dropped can swallow a write error; batch output
+    // is somebody's corpus, so surface it.
+    writer.flush().context("Failed to flush batch output")?;
 
     eprintln!(
         "Batch complete: {} symbols, {} units",
@@ -3759,6 +3894,149 @@ mod tests {
         assert_eq!(pick_symbol_unit(None, &[3, 7], Some(&[3][..])), Some(3));
         // And an empty candidate list is None under any scope.
         assert_eq!(pick_symbol_unit(Some(0), &[], None), None);
+    }
+
+    // =========================================================================
+    // Batch-mode flag compatibility
+    //
+    // `-u` was not a one-off: `Args` is one flat struct read by two code paths,
+    // and every field `run_batch` does not read was a flag it accepted and
+    // silently dropped. These pin the classification of all 21.
+    // =========================================================================
+
+    /// A batch invocation with nothing else set.
+    ///
+    /// Written as a full struct literal on purpose. Like the destructure in
+    /// `check_batch_args`, it stops compiling when a field is added to `Args`,
+    /// so the test suite cannot go on passing while a new flag joins the
+    /// silently-ignored set.
+    fn batch_args() -> Args {
+        Args {
+            target: None,
+            base: None,
+            project: None,
+            unit: None,
+            output: None,
+            format: None,
+            symbol: None,
+            config: Vec::new(),
+            include_instructions: false,
+            include_data: false,
+            summary: false,
+            analyze: false,
+            verdict: false,
+            build: false,
+            full_build: false,
+            incremental: false,
+            map_file: None,
+            context: None,
+            full_listing: false,
+            concise: false,
+            batch: true,
+        }
+    }
+
+    #[test]
+    fn test_check_batch_args_accepts_a_plain_batch() {
+        assert!(check_batch_args(&batch_args()).is_ok());
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_an_explicit_object_pair() {
+        let mut a = batch_args();
+        a.target = Some(Utf8PlatformPathBuf::from("t.o"));
+        let err = check_batch_args(&a).unwrap_err().to_string();
+        assert!(err.contains("-1/--target"), "{err}");
+        assert!(err.contains("-u <unit>"), "should point at the flag that works: {err}");
+
+        let mut b = batch_args();
+        b.base = Some(Utf8PlatformPathBuf::from("b.o"));
+        assert!(check_batch_args(&b).is_err());
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_a_positional_symbol() {
+        let mut a = batch_args();
+        a.symbol = Some("MySymbol".to_string());
+        let err = check_batch_args(&a).unwrap_err().to_string();
+        assert!(err.contains("positional"), "{err}");
+        assert!(err.contains("stdin"), "should say where symbols come from: {err}");
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_a_format_it_cannot_produce() {
+        for f in ["markdown", "tui", "json-pretty"] {
+            let mut a = batch_args();
+            a.format = Some(f.to_string());
+            let err = check_batch_args(&a).unwrap_err().to_string();
+            assert!(err.contains("--format"), "{f}: {err}");
+        }
+        // `json` is what batch emits, and an ABSENT format stays accepted --
+        // four of the seven known callers omit `-f` entirely, so refusing the
+        // absent case would break them for no gain.
+        let mut ok = batch_args();
+        ok.format = Some("json".to_string());
+        assert!(check_batch_args(&ok).is_ok());
+        assert!(check_batch_args(&batch_args()).is_ok());
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_build_flags() {
+        // The dangerous class: a caller passing --build believes it measured a
+        // freshly built object and measured whatever was on disk.
+        for set in [
+            |a: &mut Args| a.build = true,
+            |a: &mut Args| a.full_build = true,
+            |a: &mut Args| a.incremental = true,
+        ] {
+            let mut a = batch_args();
+            set(&mut a);
+            let err = check_batch_args(&a).unwrap_err().to_string();
+            assert!(err.contains("--build"), "{err}");
+            assert!(err.contains("build first"), "should say what to do: {err}");
+        }
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_include_data() {
+        let mut a = batch_args();
+        a.include_data = true;
+        assert!(check_batch_args(&a).unwrap_err().to_string().contains("--include-data"));
+    }
+
+    #[test]
+    fn test_check_batch_args_reports_every_offending_flag_at_once() {
+        // One round trip per mistake is a bad way to learn you made three.
+        let mut a = batch_args();
+        a.target = Some(Utf8PlatformPathBuf::from("t.o"));
+        a.build = true;
+        a.include_data = true;
+        let err = check_batch_args(&a).unwrap_err().to_string();
+        assert!(err.contains("-1/--target"), "{err}");
+        assert!(err.contains("--build"), "{err}");
+        assert!(err.contains("--include-data"), "{err}");
+    }
+
+    #[test]
+    fn test_check_batch_args_accepts_the_honoured_and_the_inert() {
+        // Honoured: these now do something in batch mode, so they must not be
+        // refused. Inert: batch computes summary/analysis/verdict for every row
+        // regardless, and context/concise shape markdown, which `-f json`
+        // ignores in one-shot too -- neither is a batch defect.
+        let mut a = batch_args();
+        a.output = Some(Utf8PlatformPathBuf::from("rows.jsonl"));
+        a.include_instructions = true;
+        a.full_listing = true;
+        a.summary = true;
+        a.analyze = true;
+        a.verdict = true;
+        a.context = Some(3);
+        a.concise = true;
+        a.project = Some(Utf8PlatformPathBuf::from("."));
+        a.unit = Some("some/Unit".to_string());
+        a.config = vec!["functionRelocDiffs=none".to_string()];
+        a.map_file = Some(Utf8PlatformPathBuf::from("icf.map"));
+        assert!(check_batch_args(&a).is_ok(), "{:?}", check_batch_args(&a).err());
     }
 
     #[test]
