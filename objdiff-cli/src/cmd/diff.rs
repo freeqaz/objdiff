@@ -461,7 +461,7 @@ pub struct Args {
     /// Project directory
     project: Option<Utf8PlatformPathBuf>,
     #[argp(option, short = 'u')]
-    /// Unit name within project
+    /// Unit name within project (with --batch: diff every symbol in this unit)
     unit: Option<String>,
     #[argp(option, short = 'o', from_str_fn(platform_path))]
     /// Output file ("-" for stdout, requires --format)
@@ -515,6 +515,89 @@ pub struct Args {
     #[argp(switch)]
     /// Batch mode: read symbols from stdin (one per line), group by unit, output JSONL
     batch: bool,
+}
+
+/// Resolve a `-u` / `--unit` argument to a position in `names`.
+///
+/// ONE resolver, shared by the one-shot path and batch mode, so `-u` cannot
+/// come to mean two different things depending on which mode you are in. It
+/// meant nothing at all in batch mode until this commit — `run_batch` never
+/// read the flag and walked the whole project regardless — and the way that
+/// survived is that it failed *silently*: a caller passing `-u` got a
+/// plausible-looking result set that simply had the wrong scope.
+///
+/// Match priority, first non-empty wins:
+///   0. Exact: `name == needle`. Fast path, and it preserves any caller that
+///      passes the canonical name.
+///   1. Path-component suffix: `name` ends with `/needle` — accepts
+///      `system/synth/MidiSynth` for `main/system/synth/MidiSynth`.
+///   2. Basename: the final `/`-separated segment equals `needle` — accepts
+///      the single-token `MidiSynth`.
+///   3. Substring anywhere in the name.
+///
+/// A needle matching nothing is an error naming the unit; a needle matching
+/// several is an error listing them. Never an empty result, never a silent
+/// pick — the caller asked for a specific unit and gets either that unit or a
+/// message saying why not.
+///
+/// `names` is expected in project-declared order; the returned position indexes
+/// it, so callers ordered by that same order can use it directly as a handle.
+fn resolve_unit_name(names: &[&str], needle: &str) -> Result<usize> {
+    // Exact match first.
+    if let Some(pos) = names.iter().position(|name| *name == needle) {
+        return Ok(pos);
+    }
+
+    let hits_by = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| pred(name))
+            .map(|(pos, _)| pos)
+            .collect()
+    };
+
+    let suffix_pattern = format!("/{}", needle);
+    let mut hits = hits_by(&|name: &str| name.ends_with(&suffix_pattern));
+    if hits.is_empty() {
+        hits = hits_by(&|name: &str| name.rsplit('/').next() == Some(needle));
+    }
+    if hits.is_empty() {
+        hits = hits_by(&|name: &str| name.contains(needle));
+    }
+
+    match hits.len() {
+        0 => Err(anyhow!(
+            "Unit not found: {}\n\
+             Hint: pass a path-suffix (e.g. `system/synth/MidiSynth`) \
+             or basename (e.g. `MidiSynth`) — these resolve against \
+             the project's full unit names (e.g. `main/system/synth/MidiSynth`).",
+            needle
+        )),
+        1 => {
+            let pos = hits[0];
+            // Tell the user what we resolved to so they can copy the canonical
+            // name into scripts if needed. (Unreachable when input already
+            // equals the canonical name — that took the exact path above.)
+            eprintln!("objdiff: resolved unit `{}` -> `{}`", needle, names[pos]);
+            Ok(pos)
+        }
+        n => {
+            let mut matched: Vec<&str> = hits.iter().map(|pos| names[*pos]).collect();
+            matched.sort_unstable();
+            let preview: Vec<&&str> = matched.iter().take(8).collect();
+            let trailer =
+                if n > 8 { format!("\n  ... and {} more", n - 8) } else { String::new() };
+            Err(anyhow!(
+                "Ambiguous unit `{}`: {} matches.\n  {}{}\n\
+                 Use a longer suffix or the canonical name.",
+                needle,
+                n,
+                preview.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n  "),
+                trailer
+            ))
+        }
+    }
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -576,89 +659,11 @@ pub fn run(args: Args) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let (object, unit_idx) = if let Some(u) = u {
-                // Try exact match first (fast path, preserves any agent that
-                // passes the canonical name).
-                let exact = objects.iter().find(|(obj, _)| obj.name == *u);
-                if let Some((obj, idx)) = exact {
-                    (obj, *idx)
-                } else {
-                    // Suffix/contains match: accept "system/synth/MidiSynth"
-                    // or just "MidiSynth" when the canonical name is
-                    // "main/system/synth/MidiSynth". Match priority:
-                    //   1. Path-component suffix: name == u OR name ends with "/" + u
-                    //   2. Basename-only match: final path segment == u
-                    //   3. Substring fallback (only if previous yields nothing)
-                    let needle = u.as_str();
-                    let suffix_pattern = format!("/{}", needle);
-                    let mut suffix_hits: Vec<_> = objects
-                        .iter()
-                        .filter(|(obj, _)| obj.name.ends_with(&suffix_pattern))
-                        .collect();
-                    if suffix_hits.is_empty() {
-                        // Basename match: final segment equals needle (handles
-                        // single-token names like "MidiSynth")
-                        suffix_hits = objects
-                            .iter()
-                            .filter(|(obj, _)| {
-                                obj.name.rsplit('/').next() == Some(needle)
-                            })
-                            .collect();
-                    }
-                    if suffix_hits.is_empty() {
-                        // Last resort: substring anywhere in the name.
-                        suffix_hits = objects
-                            .iter()
-                            .filter(|(obj, _)| obj.name.contains(needle))
-                            .collect();
-                    }
-                    match suffix_hits.len() {
-                        0 => {
-                            return Err(anyhow!(
-                                "Unit not found: {}\n\
-                                 Hint: pass a path-suffix (e.g. `system/synth/MidiSynth`) \
-                                 or basename (e.g. `MidiSynth`) — these resolve against \
-                                 the project's full unit names (e.g. `main/system/synth/MidiSynth`).",
-                                u
-                            ));
-                        }
-                        1 => {
-                            let (obj, idx) = suffix_hits[0];
-                            // Tell the user what we resolved to so they can
-                            // copy the canonical name into scripts if needed.
-                            // Skip the hint when input already equals the canonical name.
-                            if obj.name != *u {
-                                eprintln!(
-                                    "objdiff: resolved unit `{}` -> `{}`",
-                                    u, obj.name
-                                );
-                            }
-                            (obj, *idx)
-                        }
-                        n => {
-                            let mut names: Vec<&str> =
-                                suffix_hits.iter().map(|(obj, _)| obj.name.as_str()).collect();
-                            names.sort();
-                            let preview: Vec<&&str> = names.iter().take(8).collect();
-                            let trailer = if n > 8 {
-                                format!("\n  ... and {} more", n - 8)
-                            } else {
-                                String::new()
-                            };
-                            return Err(anyhow!(
-                                "Ambiguous unit `{}`: {} matches.\n  {}{}\n\
-                                 Use a longer suffix or the canonical name.",
-                                u,
-                                n,
-                                preview
-                                    .iter()
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n  "),
-                                trailer
-                            ));
-                        }
-                    }
-                }
+                let names: Vec<&str> =
+                    objects.iter().map(|(obj, _)| obj.name.as_str()).collect();
+                let pos = resolve_unit_name(&names, u)?;
+                let (obj, idx) = &objects[pos];
+                (obj, *idx)
             } else if let Some(symbol_name) = &args.symbol {
                 // Build a minimal diff config for demangling during symbol lookup
                 let mut lookup_config = DiffObjConfig::default();
@@ -1328,9 +1333,10 @@ fn units_in_project_order<T>(configs: &HashMap<String, (T, usize)>) -> Vec<(usiz
 /// Rule 1 is a measurement-quality rule, not a score-maximizing one: it chooses
 /// between *pairings*, never between bodies, and it does not consult any score.
 /// Where several target objects hold genuinely different bodies under one name
-/// — an ICF alias collision baked into the extracted target objects — no rule
-/// here can recover the right one; the ambiguity is upstream in the alias map,
-/// and all this promises is the same answer every run.
+/// no rule here can recover the right one; all this promises is the same answer
+/// every run. See the long note at the call site for what that population
+/// actually is now — it is one name on rb3-xenon, and it is legal C++ rather
+/// than the upstream map defect this comment used to describe.
 fn resolve_symbol_unit(target_units: &[u32], base_units: Option<&[u32]>) -> Option<u32> {
     target_units
         .iter()
@@ -1339,8 +1345,215 @@ fn resolve_symbol_unit(target_units: &[u32], base_units: Option<&[u32]>) -> Opti
         .or_else(|| target_units.first().copied())
 }
 
+/// Place one symbol, honouring a `-u` scope if there is one.
+///
+/// With no scope this is exactly `resolve_symbol_unit` — the batch-determinism
+/// rules, unchanged, and `unit_filter == None` must stay a pure pass-through or
+/// every unscoped run moves.
+///
+/// With a scope, neither rule runs. The caller named the unit; the point of the
+/// flag is that its answer beats anything derived here, including Rule 1's
+/// preference for a unit that defines the symbol on both sides. A scoped symbol
+/// the unit does not define is `None` — reported to the caller as
+/// `not_in_unit`, never silently relocated to some other unit, which is the
+/// whole failure mode being closed.
+///
+/// `target_units` is ascending (built by walking units in project order), so
+/// membership is a binary search.
+fn pick_symbol_unit(
+    unit_filter: Option<u32>,
+    target_units: &[u32],
+    base_units: Option<&[u32]>,
+) -> Option<u32> {
+    match unit_filter {
+        Some(want) => target_units.binary_search(&want).ok().map(|_| want),
+        None => resolve_symbol_unit(target_units, base_units),
+    }
+}
+
+/// Classify EVERY field of `Args` for batch mode, and refuse the ones batch
+/// mode would otherwise accept and quietly do nothing about.
+///
+/// `-u` was not a one-off. `Args` is one flat struct shared by two code paths,
+/// `run_batch` reads a subset of it, and nothing in the type system or the
+/// tests noticed the difference — so the same defect existed once per unread
+/// field, waiting for someone to pass it. This is the walk.
+///
+/// The line it draws: **batch refuses a flag whose effect it would not
+/// reproduce, and stays silent on a flag that one-shot ignores too for JSON
+/// output.** A flag that is inert in `diff -f json` is not a batch defect; a
+/// flag that changes `diff -f json` and does nothing here is.
+///
+/// - READ by batch: `project`, `unit`, `config`, `map_file` (and `batch`
+///   itself, by the dispatch in `run`).
+/// - HONOURED here, previously dropped: `output`, `include_instructions`,
+///   `full_listing` (which implies instructions, exactly as one-shot does).
+///
+///   `include_instructions` is honoured rather than refused on purpose, and the
+///   cost was measured before deciding. Its one live caller
+///   (rb3-xenon `scripts/harvest/subobject_ref_scan.py`) passes it in a
+///   whole-pool gate and never reads the field — 646 symbols, output 2.3 MB →
+///   50.0 MB (21.4×), producer wall 4.35 s → 4.63 s, survivor list bit-identical
+///   (400 narrow / 625 `--wide`), rows identical once `instructions` is removed.
+///   Refusing would break that caller at exit 1 in a repo this lane must not
+///   edit, and would make one flag mean two things by mode — the defect the
+///   shared `resolve_unit_name` exists to prevent. The 21.4× is a vestigial
+///   request on the caller's side, one word to delete there; it is not a reason
+///   for the differ to lie about a flag it accepts.
+/// - INERT, correctly: `summary`, `analyze`, `verdict` — batch computes all
+///   three unconditionally, so asking for them is asking for what you already
+///   have. `context` and `concise` shape MARKDOWN rendering only and are
+///   equally inert in `diff -f json`.
+///
+///   Do not "fix" that asymmetry by gating batch's summary on `--summary`.
+///   One-shot builds instruction rows for `wants_instructions || wants_summary`
+///   but emits `instruction_summary` only under `wants_summary`, so
+///   `diff <sym> --include-instructions` alone yields instructions and NO
+///   summary (verified 2026-08-16). Batch's unconditional summary is therefore
+///   a real difference, and a live consumer depends on it:
+///   rb3-xenon `scripts/harvest/subobject_ref_scan.py` gates its whole pool on
+///   `instruction_summary.replace` while passing neither `--summary` nor
+///   `--analyze` nor `--verdict`. Gating it would silently empty that gate.
+/// - REFUSED below: everything else.
+///
+/// Refusing beats warning here because it is verifiably safe: none of the seven
+/// known batch call sites across rb3, rb3-xenon, dc3-decomp and decomp-synth
+/// passes any refused flag (surveyed 2026-08-16). The two that would have been
+/// hit — `--include-instructions` and `-o -`, both from
+/// rb3-xenon `scripts/harvest/subobject_ref_scan.py` — are the two now
+/// honoured, which is why they are honoured rather than refused.
+fn check_batch_args(args: &Args) -> Result<()> {
+    // Exhaustive destructure, deliberately WITHOUT `..`. This is the structural
+    // half of the fix: add a field to `Args` and this line stops compiling,
+    // forcing whoever adds it to decide which of the four classes above it
+    // belongs to. A list of one-off `if args.foo.is_some()` guards cannot do
+    // that, and a list is how the first two of these got missed.
+    let Args {
+        target,
+        base,
+        project: _,             // read: locates the project config
+        unit: _,                // read: scopes the batch
+        output: _,              // honoured at the write site below
+        format,
+        symbol,
+        config: _,              // read: layered into every unit's diff config
+        include_instructions: _, // honoured at the row-construction sites
+        include_data,
+        summary: _,   // inert: batch always emits `instruction_summary`
+        analyze: _,   // inert: batch always emits `analysis`
+        verdict: _,   // inert: batch always emits `verdict`
+        build,
+        full_build,
+        incremental,
+        map_file: _,        // read: ICF equivalences
+        context: _,         // inert: markdown rendering only, as in `-f json`
+        full_listing: _,    // honoured: implies instructions, as in one-shot
+        concise: _,         // inert: markdown rendering only, as in `-f json`
+        batch: _,           // read by `run` to get here
+    } = args;
+
+    let mut refused: Vec<(&str, &str)> = Vec::new();
+
+    // The object pair. Worse than the `-u` failure, because batch resolves
+    // through the project and answers from whatever unit its index picked:
+    // rb3-xenon documented (2026-07-01) that a symbol answered from the wrong
+    // unit lands with `base_size=0` and reads as a false STUB verdict, and
+    // abandoned batch mode rather than trust the flag. Reproduced on the
+    // pre-fix binary: `-1 obj/DataArray.obj -2 src/system/obj/DataArray.obj`
+    // with `?NodeCmp@@YAHPBX0@Z` answers from `default/BandWardrobe`.
+    if target.is_some() || base.is_some() {
+        refused.push((
+            "-1/--target, -2/--base",
+            "batch resolves symbols through the project's units; use `-u <unit>` \
+             to scope a batch, or drop --batch to diff an explicit pair",
+        ));
+    }
+
+    // Batch reads its symbols from stdin. A positional symbol is not a second
+    // way to say the same thing — it is silently discarded.
+    if symbol.is_some() {
+        refused.push((
+            "<symbol> (positional)",
+            "batch reads symbols from stdin, one per line; pipe them in",
+        ));
+    }
+
+    // Batch emits JSONL and nothing else. An ABSENT `-f` is accepted (four of
+    // the seven known callers omit it, and JSONL is batch's own default), but
+    // an explicit format batch cannot produce must not be answered with a
+    // different one.
+    if let Some(f) = format.as_deref()
+        && f != "json"
+    {
+        refused.push((
+            "-f/--format (other than json)",
+            "batch emits JSON Lines — one object per line — and cannot render \
+             markdown, tui or json-pretty",
+        ));
+    }
+
+    // Batch hardcodes `data_diff: None`; there is no data-section diff to ask
+    // for. Refused rather than honoured because honouring it is real work, not
+    // a discarded value like the instruction rows.
+    if *include_data {
+        refused.push((
+            "--include-data",
+            "batch does not compute data-section diffs; use one-shot mode",
+        ));
+    }
+
+    // Batch never invokes the build system. This is the dangerous one: a caller
+    // passing --build believes it is measuring a fresh object and is measuring
+    // whatever is on disk, which is precisely the stale-object false read this
+    // repo has been bitten by before.
+    if *build || *full_build || *incremental {
+        refused.push((
+            "--build, --full-build, --incremental",
+            "batch never invokes the build system and would silently measure \
+             whatever objects are on disk; build first, then run the batch",
+        ));
+    }
+
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let detail = refused
+        .iter()
+        .map(|(flag, why)| format!("  {flag}\n      {why}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "--batch does not support these flags and would silently ignore them:\n{}",
+        detail
+    )
+}
+
+/// Is an unplaceable symbol `not_in_unit` (as opposed to `not_found`)?
+///
+/// Only a SCOPED run can produce `not_in_unit`, and only for a symbol the
+/// project defines somewhere. A scope must not swallow `not_found`: reporting a
+/// symbol that exists nowhere as `not_in_unit` with an empty `defined_in`
+/// leaves the consumer inferring "does not exist" from an empty list, a
+/// contract nothing states and nothing asserts — and that is the caller's typo
+/// case, the one most worth naming plainly.
+///
+/// `defined_anywhere` is the mangled target index's candidate list, which is
+/// what `not_found` has always meant on the unscoped path.
+fn is_not_in_unit(unit_filter: Option<u32>, defined_anywhere: Option<&[u32]>) -> bool {
+    unit_filter.is_some() && defined_anywhere.is_some_and(|units| !units.is_empty())
+}
+
 fn run_batch(args: Args) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
+
+    check_batch_args(&args)?;
+
+    // Matches one-shot: `--full-listing` implies `--include-instructions`.
+    // Batch already builds these rows — it needs them for the summary, the
+    // analysis and the verdict — and then threw them away at the row, so the
+    // flag was accepted and dropped. Honouring it is keeping what is already
+    // computed.
+    let wants_instructions = args.include_instructions || args.full_listing;
 
     // Load project config
     let project_dir = match &args.project {
@@ -1430,6 +1643,49 @@ fn run_batch(args: Args) -> Result<()> {
     // Positions in this vec (`pos` below) are used as compact unit handles.
     let units_in_order = units_in_project_order(&object_configs);
 
+    // `-u` / `--unit` in batch mode.
+    //
+    // This flag was DECLARED and then never read here: `run_batch` built its
+    // object configs from `project_config.units` and walked the whole project,
+    // so every caller that passed `-u` believed it had unit scope and had
+    // whole-project results. Resolving it here, before any symbol is placed,
+    // is what makes the flag real.
+    //
+    // Meaning: `-u U` pins the batch to unit U — every requested symbol is
+    // diffed as U defines it, and a symbol U's target object does not define
+    // is reported as `not_in_unit` rather than quietly diffed somewhere else.
+    // That is the SCOPE reading, not the FILTER reading, and the difference is
+    // visible only for a COMDAT (inline function, template instantiation,
+    // vtable thunk) that several translation units define: unrestricted
+    // resolution places it by `resolve_symbol_unit`, which may well choose
+    // another unit, so filtering the unrestricted run's rows would silently
+    // drop it. Under the scope reading `-u` is instead the disambiguator for
+    // exactly that case — the one thing batch mode had no way to express.
+    //
+    // Two consequences worth stating rather than discovering:
+    //   - `-u U` is not guaranteed to reproduce the `unit == "U"` rows of an
+    //     unrestricted run. For a symbol that unrestricted resolution assigned
+    //     elsewhere it produces a row the unrestricted run did not have. That
+    //     is the flag working, not drifting.
+    //   - It does not disable the cross-unit COMDAT base fallback below. `-u`
+    //     scopes which TARGET object's bytes are scored; the fallback only
+    //     finds a base body to score them against, and gating it on this flag
+    //     would make `-u` change scores as well as scope.
+    //
+    // Resolution goes through the same `resolve_unit_name` the one-shot path
+    // uses, so an unknown unit is a hard error naming it — silence is how the
+    // original bug survived — and a suffix or basename resolves identically in
+    // both modes.
+    let unit_filter: Option<u32> = match args.unit.as_deref() {
+        Some(requested) => {
+            let names: Vec<&str> = units_in_order.iter().map(|(_, name)| *name).collect();
+            let pos = resolve_unit_name(&names, requested)?;
+            eprintln!("Batch mode restricted to unit `{}`", names[pos]);
+            Some(pos as u32)
+        }
+        None => None,
+    };
+
     // Build symbol indexes: open each .obj file ONCE, extract all text symbols.
     // This replaces the O(symbols × units) scan with O(units + symbols) lookups.
     let index_start = std::time::Instant::now();
@@ -1437,10 +1693,16 @@ fn run_batch(args: Args) -> Result<()> {
     // symbol name → every unit position that defines it, ascending. A COMDAT
     // (inline function, template instantiation, vtable thunk) is defined in
     // every translation unit that uses it, so these lists are routinely longer
-    // than one entry — 7 of 69,428 target symbols and 51,334 of 161,021 base
-    // symbols on rb3-xenon. Keeping the whole candidate list rather than a
-    // first-wins winner is what lets the resolver below prefer a unit where
-    // both sides define the symbol.
+    // than one entry — re-measured 2026-08-16 on rb3-xenon with this index
+    // itself (`list_function_symbols`, text symbols only): 1 of 69,437 target
+    // symbols and 45,878 of 160,539 base symbols (was 7 / 51,334 before that
+    // project repaired its symbol map; see the resolver note below, which also
+    // says why `coff_dup_symbols.py` reports different totals). The
+    // lopsidedness is the point and it is stable: the extracted TARGET objects
+    // are carved out of a linked image, where the linker already picked one
+    // copy of each COMDAT, while our own BASE build emits every copy. Keeping
+    // the whole candidate list rather than a first-wins winner is what lets the
+    // resolver below prefer a unit where both sides define the symbol.
     let index_side = |target_side: bool| {
         let mut index: HashMap<String, Vec<u32>> = HashMap::new();
         for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
@@ -1499,6 +1761,9 @@ fn run_batch(args: Args) -> Result<()> {
     // every run (15 distinct orders over 15 runs of one binary).
     let mut by_unit: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     let mut not_found: Vec<String> = Vec::new();
+    // Only ever non-empty under `-u`: symbols the project defines somewhere,
+    // just not in the unit the caller scoped the batch to.
+    let mut not_in_unit: Vec<(String, Vec<&str>)> = Vec::new();
 
     for symbol in &symbols {
         if let Some(candidates) = target_mangled_index.get(symbol.as_str()) {
@@ -1524,13 +1789,62 @@ fn run_batch(args: Args) -> Result<()> {
             //
             // Rule 2 — otherwise the first candidate in project-declared order.
             // When several target objects define one name with *different*
-            // bodies (7 names on rb3-xenon; `?Null@Symbol@@QBA_NXZ` has three
-            // genuinely different 28-byte bodies across ADSR/FilePath/
-            // MetaMusic, an ICF alias collision baked into the extracted target
-            // objects) there is no answer the CLI can derive — the ambiguity is
-            // upstream, in the alias map. All it can promise is the same answer
+            // bodies there is no answer the CLI can derive; all it can promise
+            // is the same answer every run.
+            //
+            // What that population is (re-measured 2026-08-16 on rb3-xenon with
+            // this very index: 1 name multiply defined on the target side, of
+            // 69,437; base side 45,878 of 160,539). This comment previously
+            // read "7 names ... `?Null@Symbol@@QBA_NXZ` has three genuinely
+            // different 28-byte bodies", and BOTH halves are now wrong:
+            //
+            //   - `?Null@Symbol@@QBA_NXZ` is gone. rb3-xenon proved on
+            //     2026-08-13 that its collision was a defect in
+            //     `scripts/target_symbol_map.json` — the map claimed one name
+            //     at several VAs, which a linked image cannot do — nulled the
+            //     disproved rows and added a ninja gate
+            //     (`tools/map_name_injectivity.py`). The name is absent from
+            //     the map and from the extracted objects.
+            //   - The "7" was never the divergent-body count; it was the
+            //     multiply-defined count (the number in the index comment
+            //     above), quoted into the wrong sentence. The divergent-body
+            //     subset was 3 at the time.
+            //
+            // The one survivor is `?NodeCmp@@YAHPBX0@Z` — 148 bytes in
+            // BandWardrobe.obj, 332 in DataArray.obj, different sha256 — and it
+            // is NOT a map defect. It is a file-static qsort comparator, and
+            // rb3-xenon's injectivity gate carries it on an explicit
+            // `_internal_linkage_allow` list for that reason: internal linkage
+            // means one mangled name legitimately denotes a different function
+            // per defining TU, so no map repair can remove this case and none
+            // should try. Expect the class to persist at a low count, not to
+            // reach zero.
+            //
+            // Rule 2 is therefore load-bearing for determinism regardless of
+            // that count, and would be even at zero: `candidates` is only
+            // ascending-and-total because it is built by walking units in
+            // project order, and Rule 1 declines to answer whenever no unit
+            // defines the symbol on both sides — the byte-identical COMDAT tie,
+            // which is common. Something has to break those ties the same way
             // every run.
-            let pos = resolve_symbol_unit(
+            //
+            // Re-derive before quoting any of these numbers, and re-derive with
+            // the RIGHT instrument: they come from the index above, i.e.
+            // objdiff-core's `obj::read::list_function_symbols`, counting TEXT
+            // symbols. `scripts/determinism/coff_dup_symbols.py` answers a
+            // neighbouring question — COFF symbols with storage class EXTERNAL
+            // and a positive section number, so code *and* data — and on the
+            // same tree on the same day it reports 1 of 149,874 target and
+            // 51,335 of 111,939 base. It agrees on the target duplicate (the
+            // finding) and on nothing else (the denominators, and the base
+            // count, which is dominated by compiler-generated data symbols:
+            // its largest base group is `__C2_10224` across 1,047 units). Use
+            // it to identify WHICH names collide, which is what it is for; do
+            // not expect its totals to reproduce these.
+            //
+            // Under `-u` neither rule runs — see `pick_symbol_unit`.
+            let pos = pick_symbol_unit(
+                unit_filter,
                 candidates,
                 base_symbol_index.get(symbol.as_str()).map(Vec::as_slice),
             );
@@ -1542,9 +1856,14 @@ fn run_batch(args: Args) -> Result<()> {
         // Demangled fallback: scan target .obj files for demangled match.
         // Project-declared order again — this loop takes the first hit, and
         // over `object_configs` that first hit was whichever unit the hasher
-        // happened to visit first.
+        // happened to visit first. Under `-u` it visits exactly one unit, so
+        // the demangled spelling of a symbol is scoped the same way the
+        // mangled one is.
         let mut found = false;
         for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
+            if unit_filter.is_some_and(|want| want != pos as u32) {
+                continue;
+            }
             let Some((obj_config, _)) = object_configs.get(*unit_name) else { continue };
             if let Some(target_path) = obj_config.target_path.as_deref() {
                 let matches =
@@ -1558,16 +1877,63 @@ fn run_batch(args: Args) -> Result<()> {
             }
         }
         if !found {
-            not_found.push(symbol.clone());
+            // Two different failures, and conflating them is how a scoped run
+            // misleads: `not_found` means no unit in the project defines this
+            // symbol, `not_in_unit` means the requested unit does not — a
+            // distinction that only exists once `-u` is honoured. The
+            // `defined_in` list turns the second into an actionable message
+            // instead of a row the caller has to go looking for.
+            //
+            // A scope must NOT swallow `not_found`. Reporting a symbol that
+            // exists nowhere as `not_in_unit` with an empty `defined_in` leaves
+            // the consumer inferring "does not exist" from an empty list — a
+            // contract nothing states and nothing asserts — and it is the
+            // caller's typo case, the one worth naming plainly.
+            //
+            // The membership test is on the MANGLED target index, which is
+            // what `not_found` has always meant on the unscoped path. A name
+            // reachable only through a demangled query in some OTHER unit
+            // therefore reports `not_found` here rather than `not_in_unit`.
+            // Classifying that case exactly would cost a demangled scan of
+            // every unit per unresolved symbol — 3,088 object reads each on
+            // rb3-xenon, paid once per out-of-unit symbol, and a scoped batch
+            // is routinely mostly out-of-unit. Not worth it to refine an error
+            // label; recorded so nobody reads the distinction as sharper than
+            // it is.
+            let defined_anywhere =
+                target_mangled_index.get(symbol.as_str()).map(Vec::as_slice);
+            if is_not_in_unit(unit_filter, defined_anywhere) {
+                let want = unit_filter.unwrap();
+                // Reaching here means the candidate list does not contain
+                // `want`, so this list is never empty — which is what makes an
+                // empty `defined_in` impossible rather than merely unlikely.
+                let mut defined_in: Vec<&str> = defined_anywhere
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|pos| **pos != want)
+                    .map(|pos| units_in_order[*pos as usize].1)
+                    .collect();
+                defined_in.truncate(8);
+                not_in_unit.push((symbol.clone(), defined_in));
+            } else {
+                not_found.push(symbol.clone());
+            }
         }
     }
 
     eprintln!(
         "Resolved: {} symbols across {} units ({} not found)",
-        symbols.len() - not_found.len(),
+        symbols.len() - not_found.len() - not_in_unit.len(),
         by_unit.len(),
         not_found.len(),
     );
+    if let Some(want) = unit_filter {
+        eprintln!(
+            "{} symbols not defined in unit `{}`",
+            not_in_unit.len(),
+            units_in_order[want as usize].1,
+        );
+    }
 
     // Output not-found symbols as error entries
     let mut not_found_lines: Vec<String> = Vec::new();
@@ -1575,6 +1941,16 @@ fn run_batch(args: Args) -> Result<()> {
         let output = serde_json::json!({
             "symbol": symbol,
             "error": "not_found",
+        });
+        not_found_lines.push(serde_json::to_string(&output)?);
+    }
+    for (symbol, defined_in) in &not_in_unit {
+        let unit_name = unit_filter.map(|want| units_in_order[want as usize].1);
+        let output = serde_json::json!({
+            "symbol": symbol,
+            "error": "not_in_unit",
+            "unit": unit_name,
+            "defined_in": defined_in,
         });
         not_found_lines.push(serde_json::to_string(&output)?);
     }
@@ -1829,7 +2205,7 @@ fn run_batch(args: Args) -> Result<()> {
                                 call_diff: None,
                                 insert_delete_clusters: None,
                                 diff_regions: None,
-                                instructions: None,
+                                instructions: wants_instructions.then_some(fb_instrs),
                                 masked_equal_rows: fb_sd.masked_equal_rows,
                                 reloc_ignored_rows: fb_sd.reloc_ignored_rows,
                                 masked_equal_symbol: fb_sd.masked_equal_symbol,
@@ -1905,7 +2281,7 @@ fn run_batch(args: Args) -> Result<()> {
                     call_diff: None,
                     insert_delete_clusters: None,
                     diff_regions: None,
-                    instructions: None,
+                    instructions: wants_instructions.then_some(instructions),
                     masked_equal_rows: symbol_diff.masked_equal_rows,
                     reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
                     masked_equal_symbol: symbol_diff.masked_equal_symbol,
@@ -1924,20 +2300,39 @@ fn run_batch(args: Args) -> Result<()> {
         })
         .collect();
 
-    // Write all results to stdout
-    let mut stdout = stdout();
+    // Write all results. `-o` was the third flag batch mode accepted and
+    // dropped: rows went to stdout no matter what path you named, so
+    // `-o results.jsonl` left you with an empty file and your output on the
+    // terminal. `-` still means stdout, which is what the one caller passing
+    // `-o` (rb3-xenon `scripts/harvest/subobject_ref_scan.py`) passes and what
+    // `write_diff_output` means by it on the one-shot path.
+    let mut writer: Box<dyn Write> = match args.output.as_deref() {
+        Some(p) if p != Utf8PlatformPath::new("-") => {
+            let file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(p)
+                .with_context(|| format!("Failed to create file {}", p))?;
+            Box::new(BufWriter::new(file))
+        }
+        _ => Box::new(stdout()),
+    };
     for line in &not_found_lines {
-        writeln!(stdout, "{}", line)?;
+        writeln!(writer, "{}", line)?;
     }
     for unit_result in unit_results {
         for line in unit_result? {
-            writeln!(stdout, "{}", line)?;
+            writeln!(writer, "{}", line)?;
         }
     }
+    // A BufWriter that is only dropped can swallow a write error; batch output
+    // is somebody's corpus, so surface it.
+    writer.flush().context("Failed to flush batch output")?;
 
     eprintln!(
         "Batch complete: {} symbols, {} units",
-        symbols.len() - not_found.len(),
+        symbols.len() - not_found.len() - not_in_unit.len(),
         by_unit.len(),
     );
     Ok(())
@@ -3451,6 +3846,320 @@ mod tests {
         assert_eq!(resolve_symbol_unit(&[3, 7], None), Some(3));
         assert_eq!(resolve_symbol_unit(&[5], None), Some(5));
         assert_eq!(resolve_symbol_unit(&[], Some(&[1])), None);
+    }
+
+    // =========================================================================
+    // Batch-mode `-u` / `--unit` scope
+    //
+    // `run_batch` declared `unit` and never read it, so `-u` was accepted and
+    // ignored: callers passing it got whole-project results. These pin the two
+    // halves of the fix — what a unit NAME resolves to, and what a scope does
+    // to symbol placement — including the case the bug consisted of, which is
+    // that "no `-u`" must behave exactly as before.
+    // =========================================================================
+
+    #[test]
+    fn test_resolve_unit_name_exact_beats_every_fuzzy_tier() {
+        let names = ["main/system/synth/MidiSynth", "MidiSynth", "extra/MidiSynthImpl"];
+        // "MidiSynth" is an exact name AND a path-suffix of names[0] AND a
+        // substring of names[2]. Exact must win outright rather than report
+        // three matches as ambiguous.
+        assert_eq!(resolve_unit_name(&names, "MidiSynth").unwrap(), 1);
+        assert_eq!(
+            resolve_unit_name(&names, "main/system/synth/MidiSynth").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_resolve_unit_name_suffix_then_basename_then_substring() {
+        let names = ["main/system/synth/MidiSynth", "game/audio/Mixer"];
+        // Path-component suffix.
+        assert_eq!(resolve_unit_name(&names, "system/synth/MidiSynth").unwrap(), 0);
+        // Basename only.
+        assert_eq!(resolve_unit_name(&names, "Mixer").unwrap(), 1);
+        // Substring that is neither a suffix nor a basename.
+        assert_eq!(resolve_unit_name(&names, "audio").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_resolve_unit_name_higher_tier_ambiguity_does_not_fall_through() {
+        // Two basename matches, and "Foo" is also a substring of a third name.
+        // Falling through to the substring tier would turn an ambiguous request
+        // into three candidates; worse, an implementation that took the first
+        // hit at some tier would silently pick one. This must report the
+        // ambiguity at the tier that found it.
+        let names = ["a/Foo", "b/Foo", "c/FooBarBaz"];
+        let err = resolve_unit_name(&names, "Foo").unwrap_err().to_string();
+        assert!(err.contains("Ambiguous unit `Foo`"), "{err}");
+        assert!(err.contains("2 matches"), "{err}");
+        assert!(err.contains("a/Foo") && err.contains("b/Foo"), "{err}");
+        assert!(!err.contains("c/FooBarBaz"), "substring tier leaked in: {err}");
+    }
+
+    #[test]
+    fn test_resolve_unit_name_unknown_is_an_error_naming_the_unit() {
+        // The whole bug was silence. An unknown unit must not resolve to
+        // "nothing to do" — it must say which unit it could not find.
+        let names = ["main/system/synth/MidiSynth"];
+        let err = resolve_unit_name(&names, "NoSuchUnit").unwrap_err().to_string();
+        assert!(err.contains("Unit not found: NoSuchUnit"), "{err}");
+        assert!(err.contains("Hint:"), "error should tell the user what to pass: {err}");
+    }
+
+    #[test]
+    fn test_resolve_unit_name_ambiguity_preview_is_capped_and_sorted() {
+        let names: Vec<String> = (0..12).map(|i| format!("u{:02}/Thing", i)).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let err = resolve_unit_name(&refs, "Thing").unwrap_err().to_string();
+        assert!(err.contains("12 matches"), "{err}");
+        assert!(err.contains("... and 4 more"), "preview should cap at 8: {err}");
+        // Sorted, not hash order: the first previewed name is the lowest.
+        let first_listed = err.lines().nth(1).unwrap().trim();
+        assert_eq!(first_listed, "u00/Thing", "{err}");
+    }
+
+    #[test]
+    fn test_resolve_unit_name_empty_project_still_errors() {
+        let names: [&str; 0] = [];
+        let err = resolve_unit_name(&names, "Anything").unwrap_err().to_string();
+        assert!(err.contains("Unit not found: Anything"), "{err}");
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_without_a_scope_is_unchanged() {
+        // The regression that matters most: every batch run that passes no `-u`
+        // must place symbols exactly as it did before the flag existed. This is
+        // the same table as the determinism tests above, routed through the new
+        // entry point.
+        for (target, base) in [
+            (&[3u32, 7][..], Some(&[7u32, 9][..])),
+            (&[3, 7][..], Some(&[9][..])),
+            (&[3, 7][..], None),
+            (&[5][..], None),
+            (&[][..], Some(&[1][..])),
+        ] {
+            assert_eq!(
+                pick_symbol_unit(None, target, base),
+                resolve_symbol_unit(target, base),
+                "unscoped pick diverged from resolve_symbol_unit for {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_scope_overrides_the_both_sides_preference() {
+        // Unscoped, Rule 1 takes unit 7 because the base side defines it there
+        // too. Scoped to unit 3, the caller's answer wins — this is the COMDAT
+        // disambiguation batch mode could not express before.
+        assert_eq!(pick_symbol_unit(None, &[3, 7], Some(&[7, 9])), Some(7));
+        assert_eq!(pick_symbol_unit(Some(3), &[3, 7], Some(&[7, 9])), Some(3));
+        assert_eq!(pick_symbol_unit(Some(7), &[3, 7], Some(&[7, 9])), Some(7));
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_scope_refuses_rather_than_relocates() {
+        // Unit 5 does not define this symbol. The answer is None — which the
+        // caller sees as `not_in_unit` — and emphatically NOT unit 3, which is
+        // what a whole-project resolution would have quietly returned.
+        assert_eq!(pick_symbol_unit(Some(5), &[3, 7], Some(&[3][..])), None);
+        assert_eq!(pick_symbol_unit(None, &[3, 7], Some(&[3][..])), Some(3));
+        // And an empty candidate list is None under any scope.
+        assert_eq!(pick_symbol_unit(Some(0), &[], None), None);
+    }
+
+    // =========================================================================
+    // Batch-mode flag compatibility
+    //
+    // `-u` was not a one-off: `Args` is one flat struct read by two code paths,
+    // and every field `run_batch` does not read was a flag it accepted and
+    // silently dropped. These pin the classification of all 21.
+    // =========================================================================
+
+    /// A batch invocation with nothing else set.
+    ///
+    /// Written as a full struct literal on purpose. Like the destructure in
+    /// `check_batch_args`, it stops compiling when a field is added to `Args`,
+    /// so the test suite cannot go on passing while a new flag joins the
+    /// silently-ignored set.
+    fn batch_args() -> Args {
+        Args {
+            target: None,
+            base: None,
+            project: None,
+            unit: None,
+            output: None,
+            format: None,
+            symbol: None,
+            config: Vec::new(),
+            include_instructions: false,
+            include_data: false,
+            summary: false,
+            analyze: false,
+            verdict: false,
+            build: false,
+            full_build: false,
+            incremental: false,
+            map_file: None,
+            context: None,
+            full_listing: false,
+            concise: false,
+            batch: true,
+        }
+    }
+
+    #[test]
+    fn test_scoping_does_not_swallow_not_found() {
+        // A symbol the project defines nowhere must stay `not_found` under a
+        // scope. Reporting it as `not_in_unit` with an empty `defined_in` makes
+        // the consumer infer non-existence from an empty list -- undocumented,
+        // unasserted, and it is the typo case, the one worth naming plainly.
+        assert!(!is_not_in_unit(Some(3), None), "unknown symbol under a scope");
+        assert!(!is_not_in_unit(Some(3), Some(&[])), "empty candidate list is not membership");
+
+        // Defined somewhere the scope is not: that IS not_in_unit.
+        assert!(is_not_in_unit(Some(3), Some(&[7])));
+        assert!(is_not_in_unit(Some(3), Some(&[7, 9])));
+
+        // With no scope there is no such thing as not_in_unit, however the
+        // symbol is defined -- an unscoped run that failed to place a symbol
+        // failed for the old reason and must keep the old label.
+        assert!(!is_not_in_unit(None, None));
+        assert!(!is_not_in_unit(None, Some(&[7])));
+        assert!(!is_not_in_unit(None, Some(&[])));
+    }
+
+    #[test]
+    fn test_not_in_unit_implies_a_non_empty_defined_in() {
+        // The invariant the row's `defined_in` field rests on: whenever the
+        // classification says not_in_unit, the candidate list has at least one
+        // entry that is not the requested unit. If this can fail, an empty
+        // `defined_in` becomes ambiguous again.
+        for (want, candidates) in [
+            (3u32, &[7u32][..]),
+            (3, &[7, 9][..]),
+            (0, &[1, 2, 3][..]),
+        ] {
+            assert!(is_not_in_unit(Some(want), Some(candidates)));
+            let others: Vec<u32> =
+                candidates.iter().copied().filter(|p| *p != want).collect();
+            assert!(!others.is_empty(), "defined_in would be empty for {candidates:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_batch_args_accepts_a_plain_batch() {
+        assert!(check_batch_args(&batch_args()).is_ok());
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_an_explicit_object_pair() {
+        let mut a = batch_args();
+        a.target = Some(Utf8PlatformPathBuf::from("t.o"));
+        let err = check_batch_args(&a).unwrap_err().to_string();
+        assert!(err.contains("-1/--target"), "{err}");
+        assert!(err.contains("-u <unit>"), "should point at the flag that works: {err}");
+
+        let mut b = batch_args();
+        b.base = Some(Utf8PlatformPathBuf::from("b.o"));
+        assert!(check_batch_args(&b).is_err());
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_a_positional_symbol() {
+        let mut a = batch_args();
+        a.symbol = Some("MySymbol".to_string());
+        let err = check_batch_args(&a).unwrap_err().to_string();
+        assert!(err.contains("positional"), "{err}");
+        assert!(err.contains("stdin"), "should say where symbols come from: {err}");
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_a_format_it_cannot_produce() {
+        for f in ["markdown", "tui", "json-pretty"] {
+            let mut a = batch_args();
+            a.format = Some(f.to_string());
+            let err = check_batch_args(&a).unwrap_err().to_string();
+            assert!(err.contains("--format"), "{f}: {err}");
+        }
+        // `json` is what batch emits, and an ABSENT format stays accepted --
+        // four of the seven known callers omit `-f` entirely, so refusing the
+        // absent case would break them for no gain.
+        let mut ok = batch_args();
+        ok.format = Some("json".to_string());
+        assert!(check_batch_args(&ok).is_ok());
+        assert!(check_batch_args(&batch_args()).is_ok());
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_build_flags() {
+        // The dangerous class: a caller passing --build believes it measured a
+        // freshly built object and measured whatever was on disk.
+        for set in [
+            |a: &mut Args| a.build = true,
+            |a: &mut Args| a.full_build = true,
+            |a: &mut Args| a.incremental = true,
+        ] {
+            let mut a = batch_args();
+            set(&mut a);
+            let err = check_batch_args(&a).unwrap_err().to_string();
+            assert!(err.contains("--build"), "{err}");
+            assert!(err.contains("build first"), "should say what to do: {err}");
+        }
+    }
+
+    #[test]
+    fn test_check_batch_args_refuses_include_data() {
+        let mut a = batch_args();
+        a.include_data = true;
+        assert!(check_batch_args(&a).unwrap_err().to_string().contains("--include-data"));
+    }
+
+    #[test]
+    fn test_check_batch_args_reports_every_offending_flag_at_once() {
+        // One round trip per mistake is a bad way to learn you made three.
+        let mut a = batch_args();
+        a.target = Some(Utf8PlatformPathBuf::from("t.o"));
+        a.build = true;
+        a.include_data = true;
+        let err = check_batch_args(&a).unwrap_err().to_string();
+        assert!(err.contains("-1/--target"), "{err}");
+        assert!(err.contains("--build"), "{err}");
+        assert!(err.contains("--include-data"), "{err}");
+    }
+
+    #[test]
+    fn test_check_batch_args_accepts_the_honoured_and_the_inert() {
+        // Honoured: these now do something in batch mode, so they must not be
+        // refused. Inert: batch computes summary/analysis/verdict for every row
+        // regardless, and context/concise shape markdown, which `-f json`
+        // ignores in one-shot too -- neither is a batch defect.
+        let mut a = batch_args();
+        a.output = Some(Utf8PlatformPathBuf::from("rows.jsonl"));
+        a.include_instructions = true;
+        a.full_listing = true;
+        a.summary = true;
+        a.analyze = true;
+        a.verdict = true;
+        a.context = Some(3);
+        a.concise = true;
+        a.project = Some(Utf8PlatformPathBuf::from("."));
+        a.unit = Some("some/Unit".to_string());
+        a.config = vec!["functionRelocDiffs=none".to_string()];
+        a.map_file = Some(Utf8PlatformPathBuf::from("icf.map"));
+        assert!(check_batch_args(&a).is_ok(), "{:?}", check_batch_args(&a).err());
+    }
+
+    #[test]
+    fn test_pick_symbol_unit_scope_is_membership_not_position() {
+        // `binary_search` returns an INDEX into the candidate list; the value
+        // returned must be the unit position, not that index. With candidates
+        // [4, 9] and scope 9, an index-returning bug yields 1 (some unrelated
+        // unit) instead of 9, and it would be invisible in any project whose
+        // first units happen to be the interesting ones.
+        assert_eq!(pick_symbol_unit(Some(9), &[4, 9], None), Some(9));
+        assert_eq!(pick_symbol_unit(Some(4), &[4, 9], None), Some(4));
+        assert_eq!(pick_symbol_unit(Some(1), &[4, 9], None), None);
     }
 
     fn make_test_instr(
