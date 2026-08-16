@@ -48,6 +48,29 @@ use crate::{
 /// the +71 complete functions an A/B measured as zero.
 fn tool_binary_hash() -> Option<&'static str> { crate::build_id::binary_hash() }
 
+/// May this run serve or write report-cache entries?
+///
+/// Three independent refusals, and the middle one is the reason this is a named
+/// function with a test rather than an expression inlined at the call site.
+///
+/// * `no_cache` — the user asked.
+/// * `deduplicate` — the cache and `-d` are INCOMPATIBLE, in both directions,
+///   because a cached unit is a post-dedup unit while the cache key is per-unit
+///   and knows nothing about the units before it. Measured on the build just
+///   before this rule landed (objdiff `f9333e6`, i.e. `345778c^`), dc3-decomp,
+///   one `-o` shared across three consecutive runs: `-d` on a cold cache
+///   reported 48,325 functions, and the *default-mode* run that followed it
+///   reported 48,325 as well — the deduplicated number, from 2,224 cache hits,
+///   for a mode that deduplicates nothing. The correct default-mode answer on
+///   that tree is 48,344. So the failure is not confined to `-d`: one `-d` run
+///   silently reduces every later default-mode run through the same `-o`, which
+///   is exactly how a progress number moves with no source change behind it.
+/// * `binary_hash_available` — an entry that cannot name the binary that
+///   produced it is not safe to serve.
+fn report_cache_enabled(no_cache: bool, deduplicate: bool, binary_hash_available: bool) -> bool {
+    !no_cache && !deduplicate && binary_hash_available
+}
+
 /// Render an effective [`diff::DiffObjConfig`] as canonically-ordered
 /// `key=value` lines: the ruler, spelled out.
 ///
@@ -626,7 +649,8 @@ fn generate(args: GenerateArgs) -> Result<()> {
     if args.deduplicate && !args.no_cache {
         warn!("--deduplicate makes each unit depend on the ones before it; report cache disabled");
     }
-    let cache_enabled = !args.no_cache && !args.deduplicate && tool_binary_hash.is_some();
+    let cache_enabled =
+        report_cache_enabled(args.no_cache, args.deduplicate, tool_binary_hash.is_some());
     let cache = ReportCache::load(cache_path, cache_enabled);
     let global_cache_key = GlobalCacheKey { tool_binary_hash, map_file_hash };
     let new_cache_entries: Mutex<HashMap<u64, Vec<u8>>> = Mutex::new(HashMap::new());
@@ -2759,6 +2783,24 @@ mod tests {
     use objdiff_core::config::ProjectOptionValue;
 
     use super::*;
+
+    /// The whole truth table, because the `--deduplicate` row is the one that
+    /// has already been wrong once in a shipped build and the symptom was a
+    /// changed progress number rather than an error.
+    #[test]
+    fn test_report_cache_enabled() {
+        // no_cache, deduplicate, binary_hash_available -> expected
+        assert!(report_cache_enabled(false, false, true), "the ordinary run caches");
+        assert!(!report_cache_enabled(true, false, true), "--no-cache means no cache");
+        assert!(!report_cache_enabled(false, false, false), "an unhashable binary means no cache");
+        // Every --deduplicate row is false, whatever else is true. A cached unit
+        // is a post-dedup unit under a key that cannot see the units before it,
+        // so serving one corrupts BOTH modes through a shared -o.
+        assert!(!report_cache_enabled(false, true, true), "-d must not use the cache");
+        assert!(!report_cache_enabled(true, true, true), "-d must not use the cache");
+        assert!(!report_cache_enabled(false, true, false), "-d must not use the cache");
+        assert!(!report_cache_enabled(true, true, false), "-d must not use the cache");
+    }
 
     #[test]
     fn test_is_mangled_name_msvc() {
