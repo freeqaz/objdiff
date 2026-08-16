@@ -179,6 +179,37 @@ grep -q "Symbol index built" "$TMP/bad.err" \
     || ok "failed before building the symbol index"
 
 # ---------------------------------------------------------------------------
+# 4b. A scope must not swallow `not_found`.
+#
+# A symbol the project defines NOWHERE has to keep saying so under `-u`.
+# Reporting it as `not_in_unit` with an empty `defined_in` makes the consumer
+# infer non-existence from an empty list, which nothing documents -- and it is
+# the typo case, the one worth naming plainly.
+# ---------------------------------------------------------------------------
+echo "--- 4b. not_found survives a scope"
+nowhere=$(printf 'ThisSymbolDoesNotExistAnywhere_XYZZY\n' \
+    | "$NEW" diff -p "$PROJ" -u "$UNIT" --batch -f json 2>/dev/null \
+    | python3 -c "import json,sys; print(json.loads(sys.stdin.readline()).get('error'))")
+[ "$nowhere" = "not_found" ] \
+    && ok "a symbol defined nowhere is not_found even under -u" \
+    || bad "scoped run reported '$nowhere' for a symbol that exists nowhere"
+
+# And the complement: not_in_unit is only for symbols that DO exist elsewhere,
+# so its `defined_in` is never empty.
+empty=$(python3 -c "
+import json
+bad = 0
+for l in open('$TMP/scoped.jsonl'):
+    r = json.loads(l)
+    if r.get('error') == 'not_in_unit' and not r.get('defined_in'):
+        bad += 1
+print(bad)
+")
+[ "$empty" = "0" ] \
+    && ok "every not_in_unit row names where the symbol IS defined" \
+    || bad "$empty not_in_unit rows carry an empty defined_in"
+
+# ---------------------------------------------------------------------------
 # 5. A basename resolves the way it does on the one-shot path, and says so.
 # ---------------------------------------------------------------------------
 echo "--- 4. -u '${UNIT##*/}' (basename)"

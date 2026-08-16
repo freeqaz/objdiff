@@ -82,19 +82,42 @@ it must go red:
 scripts/batch_scope/verify_unit_scope.sh <pre-fix-cli> <project-dir>
 ```
 
-Measured on rb3: **exit 1, 3 passed, 6 failed** — `RESTRICT BAD 48` (all 48
+Measured on rb3: **exit 1, 5 passed, 6 failed** — `RESTRICT BAD 48` (all 48
 requested symbols answered, spanning many units, where 8 were in the unit),
 `OOB BAD 40` (forty out-of-unit symbols answered instead of refused), and all
-four unknown-unit assertions. Against the fixed binary, exit 0, 10/10.
+four unknown-unit assertions. Against the fixed binary, exit 0, 12/12.
 
-Two assertions pass against the buggy binary and are worth knowing about:
+**Five of the twelve assertions pass against the buggy binary**, and a reader
+counting greens should know none of them is doing the work here. Two pass for a
+wrong reason and three pass vacuously:
 
-- **the basename check.** With `-u` ignored, the canonical-name run and the
-  basename run return the same whole-project result, so "they agree" is true
-  for the wrong reason. It tests name *resolution*, not scope; it cannot see
-  this bug alone.
-- **the no-move check**, vacuously — with nothing scoped there is nothing whose
-  score could have moved.
+- **the basename check** — wrong reason. With `-u` ignored, the canonical-name
+  run and the basename run return the same whole-project result, so "they
+  agree" is true because both are equally unscoped. It tests name *resolution*,
+  not scope.
+- **the accounting check** ("all N requested symbols accounted for") — wrong
+  reason. The buggy binary passes by answering *everything*, which is the bug.
+  Accounting catches dropped rows, not over-broad ones.
+- **the no-move check** — vacuous: with nothing scoped, no score can have moved.
+- **`not_found` survives a scope** — vacuous: with `-u` ignored, a symbol
+  defined nowhere was already going to be `not_found`.
+- **every `not_in_unit` names where the symbol is defined** — vacuous: the buggy
+  binary emits no `not_in_unit` rows at all, so the assertion quantifies over an
+  empty set.
 
-Neither is redundant (they catch different regressions), but neither is the
-guard against *this* one. `RESTRICT` and `OOB` are.
+None is redundant — each catches a different regression — but `RESTRICT` and
+`OOB` are the two that see *this* one. The three vacuous passes guard the fixed
+binary, where the sets they quantify over are not empty.
+
+## Known weaknesses of the guard
+
+- **`NOMOVE` is asserted over few rows.** The unit under test is the busiest one
+  in a broad sample, and on a project with thousands of units that is still
+  thin: 8 rows on rb3, 8 on rb3-xenon, 8 on dc3-decomp. On the COFF projects the
+  sampler falls back to `report.json` order, so the unit is simply whichever
+  comes first (`default/MasterAudio`, `default/keygen_xbox`) rather than a unit
+  chosen to be interesting. Treat a green `NOMOVE` here as a smoke test; the
+  exhaustive version is to sweep every multiply-defined symbol against each of
+  its defining units.
+- **The COFF sampler takes the first 8 functions per unit from `report.json`**,
+  so it inherits that file's ordering rather than sampling uniformly.
