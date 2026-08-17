@@ -93,6 +93,219 @@ fn funclet_paired_symbol_is_disclosed_named_control_is_clear() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// One-shot / batch disclosure parity (§S1b, filtered route).
+//
+// `diff_objs` (one-shot) and `diff_objs_filtered` (batch) must agree
+// FIELD FOR FIELD on the disclosure a consumer renders for a given symbol, not
+// merely on its score. The channel that broke this is the over-subscribed
+// funclet pairing: `pair_funclets_by_bytes` pass 2b pairs N byte-identical
+// target funclets MANY-TO-ONE onto one base funclet, every claimant writes that
+// base symbol's `SymbolDiff`, and the base slot keeps the LAST claimant's half.
+// Filtering out the other claimants changed who wrote last, so the base half —
+// and with it the per-row `masked_equal` bit a renderer ORs in from the base
+// side — moved with the filter while every score stayed put.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::collections::BTreeSet;
+
+use object::write::Relocation;
+
+/// Build a PPC ELF object holding one `bl <callee>; blr` function per entry of
+/// `funcs` (`(symbol name, callee name)`).
+///
+/// Every function's `.text` bytes are identical — the branch displacement lives
+/// in the relocation, not the encoding — so all of them share ONE reloc-masked
+/// funclet signature and land in the same `pair_funclets_by_bytes` signature
+/// group. Only the relocation's target NAME distinguishes them, which is
+/// exactly the difference `functionRelocDiffs=None` masks and discloses.
+fn build_bl_obj(funcs: &[(&str, &str)]) -> Vec<u8> {
+    // bl 0 (LK=1) ; blr — big-endian.
+    const CODE: [u8; 8] = [0x48, 0x00, 0x00, 0x01, 0x4e, 0x80, 0x00, 0x20];
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::PowerPc, Endianness::Big);
+    let text = obj.section_id(StandardSection::Text);
+    for (name, callee) in funcs {
+        let off = obj.append_section_data(text, &CODE, 4);
+        obj.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: off,
+            size: CODE.len() as u64,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        let callee_sym = obj.add_symbol(Symbol {
+            name: callee.as_bytes().to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        obj.add_relocation(text, Relocation {
+            offset: off,
+            symbol: callee_sym,
+            addend: 0,
+            flags: object::RelocationFlags::Elf { r_type: object::elf::R_PPC_REL24 },
+        })
+        .expect("add bl relocation");
+    }
+    obj.write().expect("write ELF object")
+}
+
+/// Every disclosure field a renderer reads for one symbol: the symbol's own
+/// half of the pair, AND the base half it pairs the row against (which is where
+/// `objdiff-cli diff -f json` gets the base pane and ORs the per-row
+/// `masked_equal` bit from).
+#[derive(Debug, PartialEq)]
+struct Disclosure {
+    masked_equal_symbol: bool,
+    masked_equal_rows: u32,
+    reloc_ignored_rows: u32,
+    match_percent: Option<f32>,
+    partner: Option<usize>,
+    /// `left_row.masked_equal` for each row — the target half.
+    target_rows: Vec<bool>,
+    /// `right_row.masked_equal` for each row of the paired base symbol.
+    base_rows: Vec<bool>,
+    /// What the CLI emits per row: `left_row.masked_equal || right_row.masked_equal`.
+    rendered_rows: Vec<bool>,
+    /// The base symbol's back-reference — names the claimant that owns the slot.
+    base_partner: Option<usize>,
+}
+
+fn disclosure(result: &diff::DiffObjsResult, symbol_idx: usize) -> Disclosure {
+    let left = result.left.as_ref().expect("target diff present");
+    let right = result.right.as_ref().expect("base diff present");
+    let sym = &left.symbols[symbol_idx];
+    let base = sym.target_symbol.map(|r| &right.symbols[r]);
+    let target_rows: Vec<bool> = sym.instruction_rows.iter().map(|r| r.masked_equal).collect();
+    let base_rows: Vec<bool> = base
+        .map(|b| b.instruction_rows.iter().map(|r| r.masked_equal).collect())
+        .unwrap_or_default();
+    let rendered_rows = (0..target_rows.len().max(base_rows.len()))
+        .map(|i| {
+            target_rows.get(i).copied().unwrap_or(false)
+                || base_rows.get(i).copied().unwrap_or(false)
+        })
+        .collect();
+    Disclosure {
+        masked_equal_symbol: sym.masked_equal_symbol,
+        masked_equal_rows: sym.masked_equal_rows,
+        reloc_ignored_rows: sym.reloc_ignored_rows,
+        match_percent: sym.match_percent,
+        partner: sym.target_symbol,
+        target_rows,
+        base_rows,
+        rendered_rows,
+        base_partner: base.and_then(|b| b.target_symbol),
+    }
+}
+
+#[test]
+fn oversubscribed_funclet_discloses_identically_one_shot_and_filtered() {
+    // THREE target funclets, one base funclet, one shared reloc-masked
+    // signature: pass 2 pairs the first, pass 2b pairs the other two
+    // many-to-one onto the same base symbol.
+    //
+    // `fn_82000000` calls the SAME callee the base funclet does, so its own pair
+    // has nothing to mask. The two overflow claimants call a DIFFERENT one, so
+    // their pairs mask a real relocation difference under `None` and set
+    // `masked_equal` on BOTH halves of the pair. Unfiltered, the last claimant
+    // owns the base slot, so the base half `fn_82000000`'s row renders against
+    // carries a masked bit that `fn_82000000`'s own half does not.
+    let target = build_bl_obj(&[
+        ("fn_82000000", "callee_same"),
+        ("fn_82000004", "callee_other"),
+        ("fn_82000008", "callee_other"),
+    ]);
+    let base = build_bl_obj(&[("__unwind$42", "callee_same")]);
+
+    // `None` is the mode that masks a wrong callee instead of scoring it — the
+    // masking channel this disclosure exists to expose.
+    let diff_config = diff::DiffObjConfig {
+        function_reloc_diffs: diff::FunctionRelocDiffs::None,
+        ..Default::default()
+    };
+    let mapping_config = diff::MappingConfig::default();
+    let target_obj =
+        obj::read::parse(&target, &diff_config, diff::DiffSide::Target).expect("parse target");
+    let base_obj = obj::read::parse(&base, &diff_config, diff::DiffSide::Base).expect("parse base");
+
+    let one_shot =
+        diff::diff_objs(Some(&target_obj), Some(&base_obj), None, &diff_config, &mapping_config)
+            .expect("one-shot diff");
+
+    for name in ["fn_82000000", "fn_82000004", "fn_82000008"] {
+        let idx = target_obj.symbols.iter().position(|s| s.name == name).expect("symbol present");
+
+        // Batch, one symbol on the filter — the shape the defect was found with.
+        let solo_filter = BTreeSet::from([idx]);
+        let solo = diff::diff_objs_filtered(
+            Some(&target_obj),
+            Some(&base_obj),
+            None,
+            &diff_config,
+            &mapping_config,
+            Some(&solo_filter),
+        )
+        .expect("solo filtered diff");
+
+        // Batch, the whole group — a filter that admits every claimant.
+        let group_filter: BTreeSet<usize> = (0..target_obj.symbols.len()).collect();
+        let group = diff::diff_objs_filtered(
+            Some(&target_obj),
+            Some(&base_obj),
+            None,
+            &diff_config,
+            &mapping_config,
+            Some(&group_filter),
+        )
+        .expect("group filtered diff");
+
+        let expected = disclosure(&one_shot, idx);
+        assert!(
+            expected.masked_equal_symbol,
+            "{name}: precondition — this pairing comes from the funclet byte-signature fallback"
+        );
+        assert_eq!(
+            disclosure(&solo, idx),
+            expected,
+            "{name}: single-symbol batch must disclose exactly what one-shot discloses"
+        );
+        assert_eq!(
+            disclosure(&group, idx),
+            expected,
+            "{name}: whole-group batch must disclose exactly what one-shot discloses"
+        );
+    }
+
+    // The defect is only interesting if the base slot really is contested:
+    // the base half a row renders against belongs to the LAST claimant, not to
+    // the symbol being rendered. Pin that, so a future change that makes every
+    // claimant own its own base half is noticed rather than silently accepted.
+    let first =
+        target_obj.symbols.iter().position(|s| s.name == "fn_82000000").expect("first claimant");
+    let last =
+        target_obj.symbols.iter().position(|s| s.name == "fn_82000008").expect("last claimant");
+    let d = disclosure(&one_shot, first);
+    assert_eq!(d.base_partner, Some(last), "the base slot is owned by the last claimant");
+    assert_eq!(
+        d.target_rows,
+        vec![false, false],
+        "the first claimant's own half masks nothing — same callee as the base"
+    );
+    assert_eq!(
+        d.rendered_rows,
+        vec![true, false],
+        "yet the rendered row IS flagged, from the contested base half"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // case-B report-level disclosure.
 // ─────────────────────────────────────────────────────────────────────────────
 

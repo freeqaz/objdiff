@@ -233,9 +233,56 @@ pub fn diff_objs(
     diff_objs_filtered(left, right, prev, diff_config, mapping_config, None)
 }
 
+/// Base-symbol slots are SHARED, and that makes a filtered diff's base side
+/// depend on which symbols were filtered in. `pair_funclets_by_bytes` pass 2b
+/// pairs over-subscribed target funclets MANY-TO-ONE onto one base funclet, so
+/// several `SymbolMatch`es can carry the same `right` index. Each one, when
+/// processed, writes that base symbol's `SymbolDiff` — so the base slot ends up
+/// holding the LAST claimant's half of the pair.
+///
+/// The unfiltered route processes every claimant; a filtered route that
+/// processed only the filtered ones would leave the slot holding a DIFFERENT
+/// claimant's rows. Nothing about the target symbol's own score changes either
+/// way (its `SymbolDiff` is the left half of its own pair), but a consumer that
+/// renders a row from both halves — as `objdiff-cli diff -f json` does, taking
+/// the per-row `masked_equal` disclosure from `left_row.masked_equal ||
+/// right_row.masked_equal` — reads a base half that belongs to whichever
+/// claimant wrote last, and that answer moved with the filter.
+///
+/// Returns the `right` indices of the matches that must be processed ANYWAY, so
+/// the filtered route reproduces the unfiltered base side exactly: every base
+/// symbol claimed both by a filtered pair and by at least one unfiltered pair.
+/// Empty when not filtering, and empty for the overwhelming majority of
+/// objects — name-based matching consumes each base symbol at most once, so the
+/// only source of co-claimants is the funclet byte-signature fallback.
+fn co_claimed_matches(
+    symbol_matches: &[SymbolMatch],
+    symbol_filter: Option<&BTreeSet<usize>>,
+) -> BTreeSet<usize> {
+    let Some(filter) = symbol_filter else { return BTreeSet::new() };
+    let claimed_by_filtered: BTreeSet<usize> = symbol_matches
+        .iter()
+        .filter(|m| m.left.is_some_and(|l| filter.contains(&l)))
+        .filter_map(|m| m.right)
+        .collect();
+    if claimed_by_filtered.is_empty() {
+        return BTreeSet::new();
+    }
+    symbol_matches
+        .iter()
+        .filter(|m| m.left.is_some_and(|l| !filter.contains(&l)))
+        .filter_map(|m| m.right)
+        .filter(|r| claimed_by_filtered.contains(r))
+        .collect()
+}
+
 /// Like `diff_objs`, but only diffs symbols whose left-side index is in `symbol_filter`.
 /// When `symbol_filter` is `Some`, skips section-level diffs and mapping symbol generation.
 /// This is much faster for batch mode where only a subset of symbols are needed.
+///
+/// Symbols outside the filter are still processed when they share a base symbol
+/// with a filtered pair — see [`co_claimed_matches`] for why, and for the bound
+/// on how many that is.
 pub fn diff_objs_filtered(
     left: Option<&Object>,
     right: Option<&Object>,
@@ -246,6 +293,7 @@ pub fn diff_objs_filtered(
 ) -> Result<DiffObjsResult> {
     let symbol_matches = matching_symbols(left, right, prev, mapping_config, symbol_filter)?;
     let section_matches = matching_sections(left, right)?;
+    let co_claimants = co_claimed_matches(&symbol_matches, symbol_filter);
     let mut left = left.map(|p| (p, ObjectDiff::new_from_obj(p)));
     let mut right = right.map(|p| (p, ObjectDiff::new_from_obj(p)));
     let mut prev = prev.map(|p| (p, ObjectDiff::new_from_obj(p)));
@@ -254,7 +302,12 @@ pub fn diff_objs_filtered(
         // Skip symbols not in the filter set (when filtering is active)
         if let Some(filter) = symbol_filter {
             let dominated_by_filter = match &symbol_match {
-                SymbolMatch { left: Some(idx), .. } => filter.contains(idx),
+                SymbolMatch { left: Some(idx), right, .. } => {
+                    filter.contains(idx)
+                        // ...or this pair shares its BASE symbol with a filtered
+                        // pair. See `co_claimed_matches`.
+                        || right.is_some_and(|r| co_claimants.contains(&r))
+                }
                 _ => false,
             };
             if !dominated_by_filter {
