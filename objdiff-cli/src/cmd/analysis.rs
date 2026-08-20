@@ -171,32 +171,6 @@ pub enum PatternType {
 }
 
 impl PatternType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PatternType::LinkerMerged => "LINKER_MERGED",
-            PatternType::BoolMask => "BOOL_MASK",
-            PatternType::RegisterSwap => "REGISTER_SWAP",
-            PatternType::ComparisonStyle => "COMPARISON_STYLE",
-            PatternType::ControlFlow => "CONTROL_FLOW",
-            PatternType::CommutativeOpOrder => "COMMUTATIVE_OP_ORDER",
-            PatternType::OffsetSwap => "OFFSET_SWAP",
-            PatternType::AnonymousNamespaceHash => "ANONYMOUS_NAMESPACE_HASH",
-            PatternType::StaticGuardCounter => "STATIC_GUARD_COUNTER",
-            PatternType::DynamicCastMismatch => "DYNAMIC_CAST_MISMATCH",
-            PatternType::DeadStoreElimination => "DEAD_STORE_ELIMINATION",
-            PatternType::PrologueMismatch => "PROLOGUE_MISMATCH",
-            PatternType::AllocaMismatch => "ALLOCA_MISMATCH",
-            PatternType::ScopeCounterMismatch => "SCOPE_COUNTER_MISMATCH",
-            PatternType::MakeStringTemplateMismatch => "MAKESTRING_TEMPLATE_MISMATCH",
-            PatternType::AddressRelocationNoise => "ADDRESS_RELOCATION_NOISE",
-            PatternType::BooleanNegation => "BOOLEAN_NEGATION",
-            PatternType::FloatPrecisionMismatch => "FLOAT_PRECISION_MISMATCH",
-            PatternType::FselTernary => "FSEL_TERNARY",
-            PatternType::FloatToIntToFloat => "FLOAT_TO_INT_TO_FLOAT",
-            PatternType::SignednessMismatch => "SIGNEDNESS_MISMATCH",
-        }
-    }
-
     /// Every variant, so tests (and any future exhaustiveness check) can walk
     /// the set without repeating it.
     pub const ALL: &'static [PatternType] = &[
@@ -222,6 +196,32 @@ impl PatternType {
         PatternType::FloatToIntToFloat,
         PatternType::SignednessMismatch,
     ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PatternType::LinkerMerged => "LINKER_MERGED",
+            PatternType::BoolMask => "BOOL_MASK",
+            PatternType::RegisterSwap => "REGISTER_SWAP",
+            PatternType::ComparisonStyle => "COMPARISON_STYLE",
+            PatternType::ControlFlow => "CONTROL_FLOW",
+            PatternType::CommutativeOpOrder => "COMMUTATIVE_OP_ORDER",
+            PatternType::OffsetSwap => "OFFSET_SWAP",
+            PatternType::AnonymousNamespaceHash => "ANONYMOUS_NAMESPACE_HASH",
+            PatternType::StaticGuardCounter => "STATIC_GUARD_COUNTER",
+            PatternType::DynamicCastMismatch => "DYNAMIC_CAST_MISMATCH",
+            PatternType::DeadStoreElimination => "DEAD_STORE_ELIMINATION",
+            PatternType::PrologueMismatch => "PROLOGUE_MISMATCH",
+            PatternType::AllocaMismatch => "ALLOCA_MISMATCH",
+            PatternType::ScopeCounterMismatch => "SCOPE_COUNTER_MISMATCH",
+            PatternType::MakeStringTemplateMismatch => "MAKESTRING_TEMPLATE_MISMATCH",
+            PatternType::AddressRelocationNoise => "ADDRESS_RELOCATION_NOISE",
+            PatternType::BooleanNegation => "BOOLEAN_NEGATION",
+            PatternType::FloatPrecisionMismatch => "FLOAT_PRECISION_MISMATCH",
+            PatternType::FselTernary => "FSEL_TERNARY",
+            PatternType::FloatToIntToFloat => "FLOAT_TO_INT_TO_FLOAT",
+            PatternType::SignednessMismatch => "SIGNEDNESS_MISMATCH",
+        }
+    }
 }
 
 /// Delegates to [`PatternType::as_str`] rather than deriving, so the JSON
@@ -4820,17 +4820,17 @@ mod tests {
     fn pattern_type_all_covers_every_variant() {
         let names: std::collections::BTreeSet<&str> =
             PatternType::ALL.iter().map(|p| p.as_str()).collect();
-        assert_eq!(
-            names.len(),
-            PatternType::ALL.len(),
-            "PatternType::ALL contains a duplicate"
-        );
+        assert_eq!(names.len(), PatternType::ALL.len(), "PatternType::ALL contains a duplicate");
         // `as_str` is an exhaustive match, so the compiler guarantees a new
         // variant gets a string; this pins the COUNT so a new variant that is
         // added to the enum but not to ALL fails here instead of silently
         // escaping the spelling check.
-        assert_eq!(PatternType::ALL.len(), 21, "a PatternType variant was added or removed — \
-             add it to PatternType::ALL and update this count");
+        assert_eq!(
+            PatternType::ALL.len(),
+            21,
+            "a PatternType variant was added or removed — \
+             add it to PatternType::ALL and update this count"
+        );
     }
 
     #[test]

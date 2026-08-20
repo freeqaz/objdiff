@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# Block a commit that stages Rust files formatted by the WRONG rustfmt.
+#
+# WHY THIS EXISTS, when four other things already said "use nightly"
+# ------------------------------------------------------------------
+# On 2026-08-20 a `cargo fmt -p objdiff-core` run on a STABLE toolchain
+# reformatted 20 files the change had no business touching, and the churn was
+# committed. Afterwards, every guard in the repo turned out to have been
+# correct and present the whole time:
+#
+#   * scripts/fmt.sh          - refuses to run on a non-nightly rustfmt
+#   * AGENTS.md / README.md   - "cargo +nightly fmt --all (nightly required)"
+#   * .github/workflows       - pins nightly, with a comment saying why
+#   * .pre-commit-config.yaml - entry: cargo +nightly fmt --all
+#
+# All four are ADVISORY. `.git/hooks/` was empty and the `pre-commit` tool was
+# not installed, so nothing between the mistake and the commit could say no.
+# Documentation does not stop a reflex; the muscle-memory command is
+# `cargo fmt`, and stable rustfmt exits 0 while quietly reformatting every
+# nightly-governed construct the opposite way.
+#
+# So this hook is deliberately NOT the pre-commit framework: it must work with
+# no Python, no network, and no per-developer install step beyond one
+# `git config` (see scripts/setup-hooks.sh).
+#
+# SCOPE: staged .rs files only. A whole-workspace check would block you for
+# drift in files you never touched, which is how a guard gets disabled instead
+# of fixed.
+#
+# Escape hatch, for the rare commit that must land unformatted:
+#   OBJDIFF_SKIP_FMT_HOOK=1 git commit ...
+set -euo pipefail
+
+if [ "${OBJDIFF_SKIP_FMT_HOOK:-0}" = "1" ]; then
+    echo "pre-commit: fmt check SKIPPED via OBJDIFF_SKIP_FMT_HOOK=1" >&2
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# rustfmt reading stdin has no file to infer the edition from, and guessing
+# wrong silently changes how it parses. Take it from the workspace manifest.
+EDITION="$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9]*\)".*/\1/p' Cargo.toml | head -1)"
+EDITION="${EDITION:-2024}"
+
+# Added/Copied/Modified/Renamed staged files, .rs only. Deletions cannot be
+# misformatted, and -z/NUL keeps paths with spaces intact.
+mapfile -t -d '' staged < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
+[ ${#staged[@]} -eq 0 ] && exit 0
+
+if ! command -v rustup >/dev/null 2>&1 || ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+pre-commit: cannot verify formatting -- no nightly rustfmt available.
+
+  rustup toolchain install nightly --component rustfmt
+
+Refusing rather than passing: this repo's rustfmt.toml needs six nightly-only
+options, and a stable rustfmt does not decline them -- it reformats the tree
+the other way and exits 0. "Could not check" is not "is fine".
+Override with OBJDIFF_SKIP_FMT_HOOK=1 if you know what you are doing.
+EOF
+    exit 1
+fi
+
+# Check the staged CONTENT, not the working tree: those differ whenever
+# something is only partially staged, and it is the staged bytes that get
+# committed.
+#
+# Compare FORMATTED-vs-ORIGINAL rather than trusting an exit code. Measured
+# 2026-08-20: `rustfmt --check` reading from STDIN prints the diff and then
+# exits 0 -- it only exits non-zero for file arguments. The first draft of this
+# hook used `--check` on stdin and was therefore a check that could not fail,
+# which is the same shape as the bug the hook exists to catch. The self-test in
+# scripts/setup-hooks.sh is what caught it.
+bad=()
+for f in "${staged[@]}"; do
+    [ -n "$f" ] || continue
+    orig="$(git show ":$f" 2>/dev/null)" || continue
+    if ! fmted="$(printf '%s\n' "$orig" \
+        | rustup run nightly rustfmt --edition "$EDITION" --emit stdout 2>/dev/null)"; then
+        # Unparseable staged content is a compile error, not a format finding.
+        # Let the commit through; the compiler will say so far more clearly.
+        continue
+    fi
+    # rustfmt --emit stdout prefixes a "// rustfmt-..." banner on some versions;
+    # strip any leading banner line before comparing.
+    fmted="${fmted#\/\/ rustfmt-*$'\n'}"
+    if [ "$fmted" != "$orig" ]; then
+        bad+=("$f")
+    fi
+done
+
+if [ ${#bad[@]} -gt 0 ]; then
+    echo "pre-commit: these staged files are not formatted as rustfmt.toml requires:" >&2
+    printf '  %s\n' "${bad[@]}" >&2
+    cat >&2 <<'EOF'
+
+Fix with:
+  scripts/fmt.sh            # nightly, honours rustfmt.toml
+  git add -u
+
+Do NOT run `cargo fmt`. On a stable toolchain it prints a warning per
+nightly-only option, exits 0, and reformats those constructs the WRONG way.
+Override with OBJDIFF_SKIP_FMT_HOOK=1 if this is deliberate.
+EOF
+    exit 1
+fi

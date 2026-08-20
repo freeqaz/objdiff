@@ -3066,8 +3066,10 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
         // Prefer the CANONICAL score. `normalized_match_percent` is a misnomer
         // -- it is fuzzy measured under a relaxed reloc mode -- and labelling it
         // "normalized" made this the exact number agents quoted as canonical.
-        if let Some(percent) =
-            output.canonical_match_percent.or(output.normalized_match_percent).or(output.fuzzy_match_percent)
+        if let Some(percent) = output
+            .canonical_match_percent
+            .or(output.normalized_match_percent)
+            .or(output.fuzzy_match_percent)
         {
             if let Some(raw) = output.raw_match_percent {
                 writeln!(
@@ -3178,8 +3180,10 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
     if let Some(unit) = &output.unit {
         writeln!(md, "- **Unit**: `{}`", unit).unwrap();
     }
-    if let Some(percent) =
-        output.canonical_match_percent.or(output.normalized_match_percent).or(output.fuzzy_match_percent)
+    if let Some(percent) = output
+        .canonical_match_percent
+        .or(output.normalized_match_percent)
+        .or(output.fuzzy_match_percent)
     {
         if let Some(raw) = output.raw_match_percent {
             writeln!(md, "- **Match**: {:.1}% canonical ({:.1}% raw)", percent, raw).unwrap();

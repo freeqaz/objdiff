@@ -30,9 +30,7 @@ use object::{
 /// bytes are identical regardless of `callee` (the branch displacement lives in
 /// the relocation, not the encoded instruction), so two objects built with
 /// different callees differ ONLY in that relocation's target symbol name.
-fn build_object(callee: &str) -> Vec<u8> {
-    build_object_named(callee, "func")
-}
+fn build_object(callee: &str) -> Vec<u8> { build_object_named(callee, "func") }
 
 /// As `build_object`, but names the ENCLOSING function too. Needed to exercise
 /// the funclet carve-out, which keys off the enclosing symbol's name rather
@@ -111,8 +109,7 @@ fn diff_func_full(
             .expect("diff objects");
 
     let target_diff = result.left.as_ref().expect("target diff present");
-    let idx =
-        target_obj.symbols.iter().position(|s| s.name == sym_name).expect("symbol present");
+    let idx = target_obj.symbols.iter().position(|s| s.name == sym_name).expect("symbol present");
     let sym = &target_diff.symbols[idx];
 
     (
@@ -294,7 +291,10 @@ fn namecheck_anonymous_vftable_placeholder_stays_folded() {
 
     let (_, norm, _, _) =
         diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
-    assert_eq!(norm, 100.0, "two address-numbered vtable placeholders must stay folded; got {norm}");
+    assert_eq!(
+        norm, 100.0,
+        "two address-numbered vtable placeholders must stay folded; got {norm}"
+    );
 }
 
 #[test]
@@ -338,7 +338,10 @@ fn namecheck_local_static_scope_ordinal_stays_folded() {
 
     let (_fuzzy, norm, _, _) =
         diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
-    assert_eq!(norm, 100.0, "a moved local-static scope ordinal is a counter, not a bug; got {norm}");
+    assert_eq!(
+        norm, 100.0,
+        "a moved local-static scope ordinal is a counter, not a bug; got {norm}"
+    );
 }
 
 #[test]
@@ -352,5 +355,8 @@ fn namecheck_local_static_in_a_different_function_is_charged() {
 
     let (_fuzzy, norm, _, _) =
         diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
-    assert!(norm < 100.0, "a local static in a DIFFERENT function is a real divergence; got {norm}");
+    assert!(
+        norm < 100.0,
+        "a local static in a DIFFERENT function is a real divergence; got {norm}"
+    );
 }
