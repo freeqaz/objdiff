@@ -148,7 +148,16 @@ fn map_symbol(
         && let Ok(name) = symbol.name()
         && (name.starts_with("except_data_")
             || name.starts_with("__unwind")
-            || name.starts_with("__catch"))
+            || name.starts_with("__catch")
+            // Zero-size Object marker planted by jeff at the start of each
+            // COMDAT dead-space hole in a parent .text section. It exists purely
+            // to terminate the preceding function's inferred size (see
+            // infer_symbol_sizes: a Function's size runs to the next
+            // Function-or-Object symbol, and a retained bc-target fragment would
+            // otherwise absorb the whole zero-filled hole). Hiding it keeps the
+            // marker itself out of the row set -- without this the bytes are not
+            // removed, they simply move to a new row.
+            || name.starts_with("__comdat_gap"))
     {
         flags |= SymbolFlag::Hidden;
     }

@@ -155,8 +155,24 @@ pub struct DiffOutput {
     pub base_size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_match_percent: Option<f32>,
+    /// MISNOMER, kept for compatibility. This is the FUZZY score measured under
+    /// a relaxed RELOCATION mode -- it is not `match_percent_normalized`, and
+    /// under most reloc modes it is simply equal to `fuzzy_match_percent`. Read
+    /// `canonical_match_percent` if you want the number `report.json` reports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalized_match_percent: Option<f32>,
+    /// The CANONICAL score: objdiff-core's `match_percent_normalized`, the same
+    /// value `report generate` writes. Forgives register permutation and
+    /// argument-level noise; charges immediates, offsets and vtable slots.
+    ///
+    /// This field exists because `normalized_match_percent` above does NOT hold
+    /// it and never did: `objdiff-cli diff` computed all three of its percent
+    /// fields from `symbol_diff.match_percent` and never read
+    /// `symbol_diff.match_percent_normalized` at all. On DC3's `TransformKeys`
+    /// that was a 4.1pp understatement (90.80 reported, 94.91 canonical) in a
+    /// field named "normalized".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_match_percent: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_match_percent: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1261,6 +1277,7 @@ fn run_json(
         base_size,
         fuzzy_match_percent: normalized_match_percent,
         normalized_match_percent,
+        canonical_match_percent: symbol_diff.match_percent_normalized,
         raw_match_percent,
         diff_score: symbol_diff
             .diff_score
@@ -2216,6 +2233,7 @@ fn run_batch(args: Args) -> Result<()> {
                                 base_size: fb_bs,
                                 fuzzy_match_percent: fb_norm,
                                 normalized_match_percent: fb_norm,
+                                canonical_match_percent: fb_sd.match_percent_normalized,
                                 raw_match_percent: fb_raw,
                                 diff_score: fb_sd
                                     .diff_score
@@ -2296,6 +2314,7 @@ fn run_batch(args: Args) -> Result<()> {
                     base_size,
                     fuzzy_match_percent: normalized_match_percent,
                     normalized_match_percent,
+                    canonical_match_percent: symbol_diff.match_percent_normalized,
                     raw_match_percent,
                     diff_score: symbol_diff
                         .diff_score
@@ -3044,11 +3063,16 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
         // --- Concise mode: compact ~10-15 line output ---
 
         // Header: one-line with match%
-        if let Some(percent) = output.normalized_match_percent.or(output.fuzzy_match_percent) {
+        // Prefer the CANONICAL score. `normalized_match_percent` is a misnomer
+        // -- it is fuzzy measured under a relaxed reloc mode -- and labelling it
+        // "normalized" made this the exact number agents quoted as canonical.
+        if let Some(percent) =
+            output.canonical_match_percent.or(output.normalized_match_percent).or(output.fuzzy_match_percent)
+        {
             if let Some(raw) = output.raw_match_percent {
                 writeln!(
                     md,
-                    "# {} -- Match: {:.1}% normalized ({:.1}% raw)",
+                    "# {} -- Match: {:.1}% canonical ({:.1}% raw)",
                     display_name, percent, raw
                 )
                 .unwrap();
@@ -3154,9 +3178,17 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
     if let Some(unit) = &output.unit {
         writeln!(md, "- **Unit**: `{}`", unit).unwrap();
     }
-    if let Some(percent) = output.normalized_match_percent.or(output.fuzzy_match_percent) {
+    if let Some(percent) =
+        output.canonical_match_percent.or(output.normalized_match_percent).or(output.fuzzy_match_percent)
+    {
         if let Some(raw) = output.raw_match_percent {
-            writeln!(md, "- **Match**: {:.1}% normalized ({:.1}% raw)", percent, raw).unwrap();
+            writeln!(md, "- **Match**: {:.1}% canonical ({:.1}% raw)", percent, raw).unwrap();
+            if let (Some(c), Some(f)) = (output.canonical_match_percent, output.fuzzy_match_percent)
+            {
+                if (c - f).abs() >= 0.05 {
+                    writeln!(md, "  - fuzzy (relocation-sensitive): {:.5}%", f).unwrap();
+                }
+            }
         } else {
             writeln!(md, "- **Match**: {:.1}%", percent).unwrap();
         }
