@@ -166,6 +166,11 @@ pub fn diff_code(
                 SymbolDiff {
                     target_symbol: Some(right_symbol_idx),
                     match_percent: Some(100.0),
+                    // A zero diff_score is 100% under BOTH rulers. Leaving this
+                    // at its `None` default made a byte-identical symbol report
+                    // a null canonical score, which any consumer reading
+                    // `match_percent_normalized` has to special-case.
+                    match_percent_normalized: Some(100.0),
                     diff_score: Some((0, max_score)),
                     instruction_rows: left_rows,
                     ..Default::default()
@@ -173,6 +178,7 @@ pub fn diff_code(
                 SymbolDiff {
                     target_symbol: Some(left_symbol_idx),
                     match_percent: Some(100.0),
+                    match_percent_normalized: Some(100.0),
                     diff_score: Some((0, max_score)),
                     instruction_rows: right_rows,
                     ..Default::default()
@@ -912,6 +918,58 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
 /// carrying the cdecl leading underscore, e.g. `_bss_00456208`).
 /// The suffix must be non-empty hex (plus `_` separators) so a genuine source
 /// symbol that merely starts with one of these prefixes is not swallowed.
+/// MSVC's out-of-line register save/restore helpers (`__savegprlr_25`,
+/// `__restfpr_20`, ...). The suffix is the first register the prologue spills,
+/// so which helper a function calls is decided entirely by register allocation.
+/// Used to keep this class folded into `arg_diff_score`: the normalized score
+/// exists to forgive register allocation, and this IS register allocation.
+fn is_regalloc_save_helper(reloc: Option<ResolvedRelocation<'_>>) -> bool {
+    let Some(reloc) = reloc else { return false };
+    let name = reloc.symbol.name.strip_prefix('_').unwrap_or(&reloc.symbol.name);
+    let Some(rest) = name.strip_prefix('_') else { return false };
+    for stem in ["savegprlr_", "restgprlr_", "savefprlr_", "restfprlr_", "savegpr_", "restgpr_",
+                 "savefpr_", "restfpr_", "savevmx_", "restvmx_"]
+    {
+        if let Some(n) = rest.strip_prefix(stem) {
+            return !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
+}
+
+/// Split a function-local static's mangled name around its scope ORDINAL.
+///
+/// MSVC numbers the enclosing scope of a function-local static with a per-TU
+/// counter: in `?msg@?PC@??OnBeat@RhythmBattle@@AAAXXZ@4VMessage@@A`, `PC` is
+/// that ordinal. It moves whenever anything earlier in the translation unit
+/// moves, so it carries no meaning — the same counter shape the existing
+/// `counter_named_data_eq` exemption already handles for mwcc's
+/// `__FUNCTION__$<n>`. Returns (prefix, suffix) with the ordinal removed.
+fn split_local_static_ordinal(name: &str) -> Option<(&str, &str)> {
+    let start = name.find("@?")? + 2;
+    let rest = &name[start..];
+    let end = rest.find("@??")?;
+    let ord = &rest[..end];
+    if ord.is_empty() || ord.len() > 4 || !ord.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((&name[..start], &rest[end..]))
+}
+
+/// True when two local-static names differ ONLY in that per-TU scope ordinal.
+/// The variable and its enclosing function must be identical; if THOSE differ
+/// the site is a real divergence and is charged.
+fn local_static_ordinal_only_diff(
+    left: Option<ResolvedRelocation<'_>>,
+    right: Option<ResolvedRelocation<'_>>,
+) -> bool {
+    let (Some(l), Some(r)) = (left, right) else { return false };
+    match (split_local_static_ordinal(&l.symbol.name), split_local_static_ordinal(&r.symbol.name)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn is_placeholder_symbol_name(name: &str) -> bool {
     // Tolerate a single leading underscore (i386 PE cdecl decoration).
     let name = name.strip_prefix('_').unwrap_or(name);
@@ -1636,7 +1694,70 @@ fn diff_instruction(
                 // showed every in-scope masked bug — wrong vtable slot, wrong
                 // struct size, wrong member offset, wrong constant — was an
                 // immediate diff; reloc diffs were dominated by benign cases.
-                if !is_immediate {
+                //
+                // EXCEPT under `NameCheck`. That premise — "reloc diffs are
+                // dominated by benign noise" — was measured under the OTHER
+                // modes, and `NameCheck` exists precisely to strip that noise
+                // before scoring: it exempts placeholder split names
+                // (`fn_8xxxxxxx`/`lbl_*`/`jumptable_*`/`_bss_*`), MSVC `$`
+                // labels with nondeterministic suffixes, interior
+                // self-reference, counter-suffixed literals (verified by
+                // CONTENT, not name), and a missing target-side relocation
+                // (unverifiable, never evidence). What survives all of that is
+                // a REAL target-side name that disagrees with ours — i.e. we
+                // reference a different symbol than the original does. That is
+                // a semantic difference of exactly the kind the fold is meant
+                // to preserve, and folding it made the canonical metric blind
+                // to an entire bug class: repointing all 13 `bl` sites of a
+                // matched function at a nonexistent decoy, changing ZERO
+                // instruction bytes, left `match_percent_normalized` at exactly
+                // 100.0. Two real bugs hid there — `createFilter` declared
+                // `extern "C"` (unresolved at link, fatal on first call) and
+                // `KinectShareConnection::Poll` calling `MakeString<char>`
+                // where the target calls `MakeString<unsigned char>`.
+                //
+                // Scoped to the Reloc/Reloc path deliberately: only there has
+                // `reloc_eq`'s exemption machinery actually vetted the charge.
+                // A shape mismatch (one side a reloc, the other a constant)
+                // measures the splitter's attribution coverage, not our source,
+                // so it stays folded.
+                // ...with ONE carve-out, measured rather than assumed. Of 1,537
+                // sites this un-fold charges across the DC3 binary, 467 (on 226
+                // functions, 223 of them charged on NOTHING else) are the MSVC
+                // register-save/restore helpers: `__savegprlr_25` vs
+                // `__savegprlr_26`. WHICH helper is called is a direct function
+                // of how many callee-save registers the allocator chose, so
+                // charging it into the NORMALIZED score contradicts that
+                // score's whole purpose -- normalization exists to forgive
+                // register allocation. It stays folded. `match_percent`
+                // (fuzzy) still charges it, which is correct: fuzzy charges
+                // register differences by design.
+                //
+                // Second carve-out, also measured: the ENCLOSING symbol must
+                // have a real name. MSVC EH funclets are split as `fn_<addr>`
+                // and objdiff pairs them BY BYTE SIGNATURE, which is a
+                // heuristic -- `??_B?1??StaticClassName@RndRibbon@@...` against
+                // `??_B?1??StaticClassName@RndFont@@...` is two different
+                // classes' funclets matched because their code shape happens to
+                // coincide. Charging relocation names there measures the
+                // pairing, not our source. 204 of the 226 static-guard sites
+                // and 89 of 213 wrong-symbol sites sat on such funclets.
+                let vetted_reloc_name_diff = diff_config.function_reloc_diffs
+                    == FunctionRelocDiffs::NameCheck
+                    && matches!(a, InstructionArg::Reloc)
+                    && matches!(b, InstructionArg::Reloc)
+                    && !is_regalloc_save_helper(left_resolved.relocation)
+                    && !is_regalloc_save_helper(right_resolved.relocation)
+                    && !is_placeholder_symbol_name(&left_resolved.symbol.name)
+                    && !is_placeholder_symbol_name(&right_resolved.symbol.name)
+                    // Third carve-out: a function-local static whose per-TU
+                    // scope ordinal moved (`?BD@` vs `?BH@`) with the variable
+                    // and enclosing function otherwise identical.
+                    && !local_static_ordinal_only_diff(
+                        left_resolved.relocation,
+                        right_resolved.relocation,
+                    );
+                if !is_immediate && !vetted_reloc_name_diff {
                     state.arg_diff_score += penalty;
                 }
                 if result.kind == InstructionDiffKind::None {
