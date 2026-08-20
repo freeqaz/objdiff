@@ -105,8 +105,18 @@ static REGISTER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([rf]\d+)\
 // =============================================================================
 
 /// Types of patterns that can be detected in instruction diffs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+///
+/// `Serialize` is implemented by hand, delegating to [`PatternType::as_str`],
+/// so that the JSON spelling of a pattern and the spelling this binary prints
+/// cannot drift apart. They used to: the derive ran under
+/// `rename_all = "SCREAMING_SNAKE_CASE"`, which splits the internal capital in
+/// `MakeStringTemplateMismatch` and emitted `MAKE_STRING_TEMPLATE_MISMATCH`
+/// into `patterns[].pattern`, while `as_str` — which feeds `patterns_checked`
+/// and all human output — returned `MAKESTRING_TEMPLATE_MISMATCH`. One JSON
+/// document therefore carried both spellings, and every consumer that matched
+/// on the `as_str` spelling silently never fired. That was exactly one variant
+/// out of 21, which is why it survived: 20 of 21 agreed by coincidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternType {
     /// Calls to linker-merged functions (ICF — source-immune at the call site)
     LinkerMerged,
@@ -185,6 +195,40 @@ impl PatternType {
             PatternType::FloatToIntToFloat => "FLOAT_TO_INT_TO_FLOAT",
             PatternType::SignednessMismatch => "SIGNEDNESS_MISMATCH",
         }
+    }
+
+    /// Every variant, so tests (and any future exhaustiveness check) can walk
+    /// the set without repeating it.
+    pub const ALL: &'static [PatternType] = &[
+        PatternType::LinkerMerged,
+        PatternType::BoolMask,
+        PatternType::RegisterSwap,
+        PatternType::ComparisonStyle,
+        PatternType::ControlFlow,
+        PatternType::CommutativeOpOrder,
+        PatternType::OffsetSwap,
+        PatternType::AnonymousNamespaceHash,
+        PatternType::StaticGuardCounter,
+        PatternType::DynamicCastMismatch,
+        PatternType::DeadStoreElimination,
+        PatternType::PrologueMismatch,
+        PatternType::AllocaMismatch,
+        PatternType::ScopeCounterMismatch,
+        PatternType::MakeStringTemplateMismatch,
+        PatternType::AddressRelocationNoise,
+        PatternType::BooleanNegation,
+        PatternType::FloatPrecisionMismatch,
+        PatternType::FselTernary,
+        PatternType::FloatToIntToFloat,
+        PatternType::SignednessMismatch,
+    ];
+}
+
+/// Delegates to [`PatternType::as_str`] rather than deriving, so the JSON
+/// spelling and the printed spelling are the same string by construction.
+impl Serialize for PatternType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -1621,7 +1665,7 @@ fn doc_entry(link: DocLink) -> DocEntry {
             rb3: "verifiable-icf.md#linker_merged-functions"
         ),
         DocLink::IcfAtLimit => e!(
-            dc3: "at-limit-systemic.md#2-linker_merged-icf-identical-comdat-folding",
+            dc3: "at-limit-systemic.md#2-linker_merged--icf-identical-comdat-folding",
             rb3: "at-limit-mwcc.md#linker-merged-icf"
         ),
         DocLink::BoolMask => e!(
@@ -1663,10 +1707,10 @@ fn doc_entry(link: DocLink) -> DocEntry {
         ),
         DocLink::OffsetSwap => e!(
             dc3: "fixable-declarations.md#offset-swap",
-            rb3: "at-limit-mwcc.md#stack-slot-inversion-offset_swap-on-r1"
+            rb3: "at-limit-mwcc.md#stack-slot-inversion--offset_swap-on-r1"
         ),
         DocLink::StackSlotInversion => e!(
-            dc3: "fixable-liveness.md#lever-4-scope-a-declaration-into-the-block-that-uses-it-stack-lever-not-a-register-lever",
+            dc3: "fixable-liveness.md#lever-4--scope-a-declaration-into-the-block-that-uses-it-stack-lever-not-a-register-lever",
             rb3: "permuter-roi.md#stack-slot-inversion"
         ),
         DocLink::AnonymousNamespaceHash => e!(
@@ -1682,7 +1726,7 @@ fn doc_entry(link: DocLink) -> DocEntry {
             e!(dc3: "fixable-casting.md#avoid-unnecessary-dynamic_cast-getobj-vs-objt")
         }
         DocLink::DeadStoreElimination => e!(
-            dc3: "unfixable-compiler.md#dead-store-elimination-destructor-merging",
+            dc3: "unfixable-compiler.md#dead-store-elimination--destructor-merging",
             rb3: "at-limit-mwcc.md#dead-store-elimination"
         ),
         DocLink::PermuterRoi => e!(dc3: "PERMUTER_ROI_ANALYSIS.md", rb3: "permuter-roi.md"),
@@ -4730,6 +4774,63 @@ mod tests {
             base_branch_from: None,
             base_branch_to: None,
         }
+    }
+
+    /// The JSON spelling of a pattern and the spelling this binary prints must
+    /// be the same string, for EVERY variant.
+    ///
+    /// They were not. `patterns[].pattern` was serde-derived under
+    /// `rename_all = "SCREAMING_SNAKE_CASE"`, which splits the internal capital
+    /// in `MakeStringTemplateMismatch` and emitted `MAKE_STRING_TEMPLATE_MISMATCH`,
+    /// while `as_str()` — which feeds `patterns_checked` and every human-facing
+    /// string — returned `MAKESTRING_TEMPLATE_MISMATCH`. One JSON document
+    /// carried both. Consumers keying on the `as_str` spelling never fired:
+    /// rb3's `sync_objdiff.py` could not set `has_makestring_mismatch` on any
+    /// row, ever, and that is the one pattern bucket that held real wrong-callee
+    /// bugs. dc3 worked around it consumer-side by accepting both spellings.
+    ///
+    /// Exactly 1 of 21 variants diverged, which is why it survived so long —
+    /// the other 20 agreed by coincidence, not by construction. This test is the
+    /// construction.
+    #[test]
+    fn pattern_json_spelling_matches_as_str_for_every_variant() {
+        for &p in PatternType::ALL {
+            let json = serde_json::to_string(&p).expect("PatternType serializes");
+            let unquoted = json.trim_matches('"');
+            assert_eq!(
+                unquoted,
+                p.as_str(),
+                "PatternType::{:?} serializes as {:?} but as_str() says {:?}; a consumer \
+                 keying on either spelling silently never fires",
+                p,
+                unquoted,
+                p.as_str()
+            );
+        }
+        // Pin the variant that actually diverged, so a future derive cannot
+        // quietly reintroduce the split and still pass the loop above.
+        assert_eq!(
+            serde_json::to_string(&PatternType::MakeStringTemplateMismatch).unwrap(),
+            "\"MAKESTRING_TEMPLATE_MISMATCH\""
+        );
+    }
+
+    /// `ALL` must really be all of them, or the test above checks a subset.
+    #[test]
+    fn pattern_type_all_covers_every_variant() {
+        let names: std::collections::BTreeSet<&str> =
+            PatternType::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            PatternType::ALL.len(),
+            "PatternType::ALL contains a duplicate"
+        );
+        // `as_str` is an exhaustive match, so the compiler guarantees a new
+        // variant gets a string; this pins the COUNT so a new variant that is
+        // added to the enum but not to ALL fails here instead of silently
+        // escaping the spelling check.
+        assert_eq!(PatternType::ALL.len(), 21, "a PatternType variant was added or removed — \
+             add it to PatternType::ALL and update this count");
     }
 
     #[test]

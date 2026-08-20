@@ -591,21 +591,24 @@ mod test {
             },
         )
         .unwrap();
-        assert_eq!(parts, &[
-            InstructionPart::opcode("mov", opcode),
-            InstructionPart::opaque("dword"),
-            InstructionPart::basic(" "),
-            InstructionPart::opaque("ptr"),
-            InstructionPart::basic(" "),
-            InstructionPart::basic("["),
-            InstructionPart::opaque("ebp"),
-            InstructionPart::opaque("-"),
-            InstructionPart::signed(152i64),
-            InstructionPart::basic("]"),
-            InstructionPart::basic(","),
-            InstructionPart::basic(" "),
-            InstructionPart::unsigned(0u64),
-        ]);
+        assert_eq!(
+            parts,
+            &[
+                InstructionPart::opcode("mov", opcode),
+                InstructionPart::opaque("dword"),
+                InstructionPart::basic(" "),
+                InstructionPart::opaque("ptr"),
+                InstructionPart::basic(" "),
+                InstructionPart::basic("["),
+                InstructionPart::opaque("ebp"),
+                InstructionPart::opaque("-"),
+                InstructionPart::signed(152i64),
+                InstructionPart::basic("]"),
+                InstructionPart::basic(","),
+                InstructionPart::basic(" "),
+                InstructionPart::unsigned(0u64),
+            ]
+        );
     }
 
     #[test]
@@ -636,21 +639,24 @@ mod test {
             },
         )
         .unwrap();
-        assert_eq!(parts, &[
-            InstructionPart::opcode("mov", opcode),
-            InstructionPart::opaque("dword"),
-            InstructionPart::basic(" "),
-            InstructionPart::opaque("ptr"),
-            InstructionPart::basic(" "),
-            InstructionPart::basic("["),
-            InstructionPart::opaque("ebp"),
-            InstructionPart::opaque("-"),
-            InstructionPart::signed(152i64),
-            InstructionPart::basic("]"),
-            InstructionPart::basic(","),
-            InstructionPart::basic(" "),
-            InstructionPart::reloc(),
-        ]);
+        assert_eq!(
+            parts,
+            &[
+                InstructionPart::opcode("mov", opcode),
+                InstructionPart::opaque("dword"),
+                InstructionPart::basic(" "),
+                InstructionPart::opaque("ptr"),
+                InstructionPart::basic(" "),
+                InstructionPart::basic("["),
+                InstructionPart::opaque("ebp"),
+                InstructionPart::opaque("-"),
+                InstructionPart::signed(152i64),
+                InstructionPart::basic("]"),
+                InstructionPart::basic(","),
+                InstructionPart::basic(" "),
+                InstructionPart::reloc(),
+            ]
+        );
     }
 
     #[test]
@@ -681,19 +687,22 @@ mod test {
             },
         )
         .unwrap();
-        assert_eq!(parts, &[
-            InstructionPart::opcode("mov", opcode),
-            InstructionPart::opaque("eax"),
-            InstructionPart::basic(","),
-            InstructionPart::basic(" "),
-            InstructionPart::basic("["),
-            InstructionPart::opaque("eax"),
-            InstructionPart::opaque("*"),
-            InstructionPart::signed(4),
-            InstructionPart::opaque("+"),
-            InstructionPart::reloc(),
-            InstructionPart::basic("]"),
-        ]);
+        assert_eq!(
+            parts,
+            &[
+                InstructionPart::opcode("mov", opcode),
+                InstructionPart::opaque("eax"),
+                InstructionPart::basic(","),
+                InstructionPart::basic(" "),
+                InstructionPart::basic("["),
+                InstructionPart::opaque("eax"),
+                InstructionPart::opaque("*"),
+                InstructionPart::signed(4),
+                InstructionPart::opaque("+"),
+                InstructionPart::reloc(),
+                InstructionPart::basic("]"),
+            ]
+        );
     }
 
     #[test]
@@ -755,15 +764,18 @@ mod test {
             },
         )
         .unwrap();
-        assert_eq!(parts, &[
-            InstructionPart::opcode("mov", opcode),
-            InstructionPart::opaque("edx"),
-            InstructionPart::basic(","),
-            InstructionPart::basic(" "),
-            InstructionPart::basic("["),
-            InstructionPart::reloc(),
-            InstructionPart::basic("]"),
-        ]);
+        assert_eq!(
+            parts,
+            &[
+                InstructionPart::opcode("mov", opcode),
+                InstructionPart::opaque("edx"),
+                InstructionPart::basic(","),
+                InstructionPart::basic(" "),
+                InstructionPart::basic("["),
+                InstructionPart::reloc(),
+                InstructionPart::basic("]"),
+            ]
+        );
     }
 
     #[test]
@@ -794,15 +806,18 @@ mod test {
             },
         )
         .unwrap();
-        assert_eq!(parts, &[
-            InstructionPart::opcode("mov", opcode),
-            InstructionPart::opaque("rax"),
-            InstructionPart::basic(","),
-            InstructionPart::basic(" "),
-            InstructionPart::basic("["),
-            InstructionPart::reloc(),
-            InstructionPart::basic("]"),
-        ]);
+        assert_eq!(
+            parts,
+            &[
+                InstructionPart::opcode("mov", opcode),
+                InstructionPart::opaque("rax"),
+                InstructionPart::basic(","),
+                InstructionPart::basic(" "),
+                InstructionPart::basic("["),
+                InstructionPart::reloc(),
+                InstructionPart::basic("]"),
+            ]
+        );
     }
 
     #[test]
@@ -859,9 +874,9 @@ mod test {
             },
         )
         .unwrap();
-        assert_eq!(parts, &[
-            InstructionPart::opcode(".byte", OPCODE_DATA),
-            InstructionPart::unsigned(0xABu64),
-        ]);
+        assert_eq!(
+            parts,
+            &[InstructionPart::opcode(".byte", OPCODE_DATA), InstructionPart::unsigned(0xABu64),]
+        );
     }
 }

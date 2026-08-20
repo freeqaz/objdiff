@@ -107,11 +107,30 @@ message ReportProvenance {
 
 // Progress info for a report or unit
 message Measures {
-  // Overall match percent, including partially matched functions and data
+  // Overall match percent, including partially matched functions and data.
+  //
+  // MISNOMER, kept because the tag is stable and consumers depend on it: this
+  // aggregate is size-weighted `match_percent_normalized` (the CANONICAL
+  // score), NOT the per-function `fuzzy_match_percent` field of the same name.
+  // See report.rs, which accumulates `match_percent_normalized * size` here.
+  // There is no aggregate holding true size-weighted fuzzy.
+  //
+  // Two independent audits of sibling projects tripped on this on 2026-08-20,
+  // both concluding a per-function fuzzy control had been violated when it had
+  // not: the per-function values were byte-identical and only this aggregate
+  // moved.
   float fuzzy_match_percent = 1;
   // Total size of code in bytes
   uint64 total_code = 2;
-  // Fully matched code size in bytes
+  // Fully matched code size in bytes.
+  //
+  // NOTE the ruler split, which is deliberate but easy to misread: this is
+  // credited on `match_percent` (FUZZY) == 100, while `matched_functions`
+  // below is credited on `match_percent_normalized` (CANONICAL) == 100. A
+  // change that moves only canonical scores therefore moves
+  // `matched_functions` while leaving `matched_code` exactly flat. Quote the
+  // function count for such a change; a flat `matched_code` is not evidence
+  // that nothing happened.
   uint64 matched_code = 3;
   // Fully matched code percent
   float matched_code_percent = 4;

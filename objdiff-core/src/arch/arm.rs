@@ -44,10 +44,13 @@ impl ArchArm {
                 && s.name() == Ok(".ARM.attributes")
         }) {
             let attr_data = arm_attrs.uncompressed_data()?;
-            let build_attrs = BuildAttrs::new(&attr_data, match file.endianness() {
-                object::Endianness::Little => arm_attr::Endian::Little,
-                object::Endianness::Big => arm_attr::Endian::Big,
-            })?;
+            let build_attrs = BuildAttrs::new(
+                &attr_data,
+                match file.endianness() {
+                    object::Endianness::Little => arm_attr::Endian::Little,
+                    object::Endianness::Big => arm_attr::Endian::Big,
+                },
+            )?;
             for subsection in build_attrs.subsections() {
                 let subsection = subsection?;
                 if !subsection.is_aeabi() {
@@ -490,7 +493,9 @@ impl ArgsFormatter<'_> {
     }
 
     fn write_opaque<F>(&mut self, value: F) -> core::fmt::Result
-    where F: unarm::FormatValue {
+    where
+        F: unarm::FormatValue,
+    {
         let mut string_fmt = unarm::StringFormatter::new(self.options);
         value.write(&mut string_fmt)?;
         self.write(InstructionPart::opaque(string_fmt.into_string()))?;
@@ -499,11 +504,15 @@ impl ArgsFormatter<'_> {
 }
 
 impl Write for ArgsFormatter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result { self.write(InstructionPart::basic(s)) }
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(InstructionPart::basic(s))
+    }
 }
 
 impl unarm::FormatIns for ArgsFormatter<'_> {
-    fn options(&self) -> &unarm::Options { self.options }
+    fn options(&self) -> &unarm::Options {
+        self.options
+    }
 
     fn write_ins(&mut self, ins: &unarm::Ins) -> core::fmt::Result {
         let mut string_fmt = unarm::StringFormatter::new(self.options);
@@ -522,7 +531,9 @@ impl unarm::FormatIns for ArgsFormatter<'_> {
         }
     }
 
-    fn write_separator(&mut self) -> core::fmt::Result { self.write(InstructionPart::separator()) }
+    fn write_separator(&mut self) -> core::fmt::Result {
+        self.write(InstructionPart::separator())
+    }
 
     fn write_uimm(&mut self, uimm: u32) -> core::fmt::Result {
         if let Some(resolved) = self.resolved.relocation
@@ -553,7 +564,9 @@ impl unarm::FormatIns for ArgsFormatter<'_> {
         self.write(InstructionPart::branch_dest(branch_target.addr))
     }
 
-    fn write_reg(&mut self, reg: unarm::Reg) -> core::fmt::Result { self.write_opaque(reg) }
+    fn write_reg(&mut self, reg: unarm::Reg) -> core::fmt::Result {
+        self.write_opaque(reg)
+    }
 
     fn write_status_reg(&mut self, status_reg: unarm::StatusReg) -> core::fmt::Result {
         self.write_opaque(status_reg)
@@ -583,11 +596,17 @@ impl unarm::FormatIns for ArgsFormatter<'_> {
         self.write_opaque(endianness)
     }
 
-    fn write_sreg(&mut self, sreg: unarm::Sreg) -> core::fmt::Result { self.write_opaque(sreg) }
+    fn write_sreg(&mut self, sreg: unarm::Sreg) -> core::fmt::Result {
+        self.write_opaque(sreg)
+    }
 
-    fn write_dreg(&mut self, dreg: unarm::Dreg) -> core::fmt::Result { self.write_opaque(dreg) }
+    fn write_dreg(&mut self, dreg: unarm::Dreg) -> core::fmt::Result {
+        self.write_opaque(dreg)
+    }
 
-    fn write_fpscr(&mut self, fpscr: unarm::Fpscr) -> core::fmt::Result { self.write_opaque(fpscr) }
+    fn write_fpscr(&mut self, fpscr: unarm::Fpscr) -> core::fmt::Result {
+        self.write_opaque(fpscr)
+    }
 
     fn write_addr_ldr_str(&mut self, addr_ldr_str: unarm::AddrLdrStr) -> core::fmt::Result {
         addr_ldr_str.write(self)?;

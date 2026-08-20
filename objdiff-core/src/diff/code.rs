@@ -925,11 +925,24 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
 /// exists to forgive register allocation, and this IS register allocation.
 fn is_regalloc_save_helper(reloc: Option<ResolvedRelocation<'_>>) -> bool {
     let Some(reloc) = reloc else { return false };
-    let name = reloc.symbol.name.strip_prefix('_').unwrap_or(&reloc.symbol.name);
-    let Some(rest) = name.strip_prefix('_') else { return false };
-    for stem in ["savegprlr_", "restgprlr_", "savefprlr_", "restfprlr_", "savegpr_", "restgpr_",
-                 "savefpr_", "restfpr_", "savevmx_", "restvmx_"]
-    {
+    // Strip ALL leading underscores. MSVC/Xenon spells these `__savegprlr_25`
+    // (two) and CodeWarrior spells them `_savegpr_14` (one). Requiring exactly
+    // two silently excluded every CodeWarrior target: measured on RB3, 188
+    // sites of pure register-allocation noise were charged into the canonical
+    // score that an MSVC target would have forgiven.
+    let rest = reloc.symbol.name.trim_start_matches('_');
+    for stem in [
+        "savegprlr_",
+        "restgprlr_",
+        "savefprlr_",
+        "restfprlr_",
+        "savegpr_",
+        "restgpr_",
+        "savefpr_",
+        "restfpr_",
+        "savevmx_",
+        "restvmx_",
+    ] {
         if let Some(n) = rest.strip_prefix(stem) {
             return !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
         }
@@ -973,11 +986,18 @@ fn local_static_ordinal_only_diff(
 fn is_placeholder_symbol_name(name: &str) -> bool {
     // Tolerate a single leading underscore (i386 PE cdecl decoration).
     let name = name.strip_prefix('_').unwrap_or(name);
-    ["fn_", "lbl_", "jumptable_", "code_", "data_", "bss_", "rdata_"].iter().any(|prefix| {
-        name.strip_prefix(prefix).is_some_and(|rest| {
-            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_')
-        })
-    })
+    // `vftable_<hex>` is the same splitter-generated placeholder shape as
+    // `lbl_`/`data_`: an unnamed .rdata vtable the splitter numbered by address
+    // because no symbol name was recovered for it. Omitting it charged 34 sites
+    // across 16 RB3-Xenon functions purely for how that project's splitter
+    // spells an anonymous vtable.
+    ["fn_", "lbl_", "jumptable_", "code_", "data_", "bss_", "rdata_", "vftable_"].iter().any(
+        |prefix| {
+            name.strip_prefix(prefix).is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_')
+            })
+        },
+    )
 }
 
 /// True for a compiler-generated name whose numeric suffix is a per-TU

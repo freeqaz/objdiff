@@ -4617,6 +4617,11 @@ mod tests {
             base_size: 100,
             fuzzy_match_percent: Some(90.0),
             normalized_match_percent: Some(90.0),
+            // Deliberately NOT 90.0: the canonical (argument-normalized) score
+            // and the fuzzy score are different rulers, and this helper backs
+            // the markdown-rendering tests, which have to be able to tell them
+            // apart. See the header-rendering assertions below.
+            canonical_match_percent: Some(94.0),
             raw_match_percent: Some(85.0),
             diff_score: None,
             build_status: None,
@@ -4643,7 +4648,22 @@ mod tests {
         let output = make_test_output(instructions, None, None);
         let options = MarkdownOptions { concise: true, ..Default::default() };
         let md = render_diff_markdown(&output, &options);
-        assert!(md.contains("Match: 90.0%"));
+        // The header renders the CANONICAL score (94.0), not the fuzzy one
+        // (90.0). This assertion used to read `Match: 90.0%` and it passed --
+        // back when the header really did print fuzzy under the name
+        // "normalized", which is the defect ae19080 fixed. The test could not
+        // be updated at the time because it stopped COMPILING in the same
+        // commit (`canonical_match_percent` was added to `DiffOutput` but not
+        // to this helper), so the whole `objdiff-cli` test binary has been
+        // un-buildable, and these 153 tests un-run, ever since.
+        assert!(
+            md.contains("Match: 94.0% canonical"),
+            "header must render the canonical score and say so; got:\n{md}"
+        );
+        assert!(
+            !md.contains("Match: 90.0%"),
+            "the fuzzy score must not be presented AS the match; got:\n{md}"
+        );
         assert!(md.contains("**Instructions**"));
         // Concise mode should not include instruction table
         assert!(!md.contains("| Index |"));

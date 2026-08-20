@@ -67,12 +67,15 @@ fn build_object_named(callee: &str, func_name: &str) -> Vec<u8> {
         flags: SymbolFlags::None,
     });
 
-    obj.add_relocation(text, Relocation {
-        offset: func_off,
-        symbol: callee_sym,
-        addend: 0,
-        flags: object::RelocationFlags::Elf { r_type: object::elf::R_PPC_REL24 },
-    })
+    obj.add_relocation(
+        text,
+        Relocation {
+            offset: func_off,
+            symbol: callee_sym,
+            addend: 0,
+            flags: object::RelocationFlags::Elf { r_type: object::elf::R_PPC_REL24 },
+        },
+    )
     .expect("add bl relocation");
 
     obj.write().expect("write ELF object")
@@ -111,8 +114,7 @@ fn diff_func_full(
             .expect("diff objects");
 
     let target_diff = result.left.as_ref().expect("target diff present");
-    let idx =
-        target_obj.symbols.iter().position(|s| s.name == sym_name).expect("symbol present");
+    let idx = target_obj.symbols.iter().position(|s| s.name == sym_name).expect("symbol present");
     let sym = &target_diff.symbols[idx];
 
     (
@@ -251,6 +253,84 @@ fn namecheck_regalloc_save_helper_stays_folded() {
 }
 
 #[test]
+fn namecheck_codewarrior_save_helper_stays_folded() {
+    // CARVE-OUT 1, non-MSVC spelling. CodeWarrior emits `_savegpr_14` — ONE
+    // leading underscore and no `lr` — where MSVC/Xenon emits `__savegprlr_25`.
+    // The original matcher stripped one underscore and then REQUIRED a second,
+    // so it silently excluded every CodeWarrior target: measured on RB3, 188
+    // sites of pure register-allocation noise were charged into the canonical
+    // score that an otherwise identical MSVC target would have forgiven.
+    //
+    // Same rationale as the MSVC case: WHICH helper is called is a direct
+    // function of how many callee-save registers the allocator chose.
+    let target = build_object("_savegpr_14");
+    let base = build_object("_savegpr_18");
+
+    let (fuzzy, norm, _, _) =
+        diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
+    assert!(fuzzy < 100.0, "fuzzy still charges the save-helper difference: {fuzzy}");
+    assert_eq!(
+        norm, 100.0,
+        "a CodeWarrior register-save-helper difference is register allocation and must \
+         stay folded out of the normalized score, exactly as the MSVC spelling is; got {norm}"
+    );
+}
+
+#[test]
+fn namecheck_a_real_symbol_that_merely_starts_like_a_helper_is_still_charged() {
+    // Negative control for the underscore-stripping relaxation above. Widening
+    // the matcher must not swallow a genuine symbol: the suffix still has to be
+    // all digits, so `_saveguard_state` is NOT a helper and stays charged.
+    let target = build_object("_saveguard_state");
+    let base = build_object("_saveguard_other");
+
+    let (_, norm, _, _) =
+        diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
+    assert!(
+        norm < 100.0,
+        "a real symbol that merely shares a prefix with a save helper must still be \
+         charged; got {norm}"
+    );
+}
+
+#[test]
+fn namecheck_anonymous_vftable_placeholder_stays_folded() {
+    // CARVE-OUT 2, sibling spelling. RB3-Xenon's splitter names an unrecovered
+    // .rdata vtable `vftable_<hex>` — the same address-numbered placeholder
+    // shape as `lbl_`/`data_`, and just as meaningless to compare by name.
+    // Omitting it from the placeholder list charged 34 sites across 16
+    // functions purely for how that project's splitter spells an anonymous
+    // vtable.
+    let target = build_object("vftable_82016268");
+    let base = build_object("vftable_8201D76C");
+
+    let (_, norm, _, _) =
+        diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
+    assert_eq!(
+        norm, 100.0,
+        "two address-numbered vtable placeholders carry no comparable name and must \
+         stay folded; got {norm}"
+    );
+}
+
+#[test]
+fn namecheck_a_named_vtable_is_still_charged() {
+    // Negative control for the vftable_ placeholder. The suffix must be hex, so
+    // a REAL vtable symbol is unaffected and a genuine wrong-vtable reference
+    // still reaches the canonical score.
+    let target = build_object("??_7RndMat@@6B@");
+    let base = build_object("??_7RndFont@@6B@");
+
+    let (_, norm, _, _) =
+        diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
+    assert!(
+        norm < 100.0,
+        "referencing a different NAMED vtable is a real divergence and must be \
+         charged; got {norm}"
+    );
+}
+
+#[test]
 fn namecheck_funclet_pairing_stays_folded() {
     // CARVE-OUT 2. MSVC EH funclets are split as `fn_<addr>` and objdiff pairs
     // them BY BYTE SIGNATURE — a heuristic. Charging relocation names on a
@@ -279,7 +359,10 @@ fn namecheck_local_static_scope_ordinal_stays_folded() {
 
     let (_fuzzy, norm, _, _) =
         diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
-    assert_eq!(norm, 100.0, "a moved local-static scope ordinal is a counter, not a bug; got {norm}");
+    assert_eq!(
+        norm, 100.0,
+        "a moved local-static scope ordinal is a counter, not a bug; got {norm}"
+    );
 }
 
 #[test]
@@ -293,5 +376,8 @@ fn namecheck_local_static_in_a_different_function_is_charged() {
 
     let (_fuzzy, norm, _, _) =
         diff_func_full(&target, &base, diff::FunctionRelocDiffs::NameCheck, "func");
-    assert!(norm < 100.0, "a local static in a DIFFERENT function is a real divergence; got {norm}");
+    assert!(
+        norm < 100.0,
+        "a local static in a DIFFERENT function is a real divergence; got {norm}"
+    );
 }

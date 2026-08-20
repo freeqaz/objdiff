@@ -93,9 +93,13 @@ impl SymbolEquivalences {
     }
 
     /// Number of names that appear in at least one multi-symbol group.
-    pub fn len(&self) -> usize { self.adjacency.len() }
+    pub fn len(&self) -> usize {
+        self.adjacency.len()
+    }
 
-    pub fn is_empty(&self) -> bool { self.adjacency.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.adjacency.is_empty()
+    }
 
     /// Record one address group's assertion: every pair of names in `group` may
     /// stand in for each other.

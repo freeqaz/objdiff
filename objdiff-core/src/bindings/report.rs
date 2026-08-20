@@ -229,16 +229,19 @@ impl Report {
                     .map(|c| c[category.id.len() + 1..].to_string())
                     .collect();
             }
-            reports.push((category.id.clone(), Report {
-                measures: category.measures,
-                units: sub_units,
-                version: self.version,
-                categories: sub_categories,
-                // A per-category slice was measured by the same instrument as
-                // the whole, so it carries the same provenance. Its cache_hits
-                // /cache_misses still describe the whole run, not this slice.
-                provenance: self.provenance.clone(),
-            }));
+            reports.push((
+                category.id.clone(),
+                Report {
+                    measures: category.measures,
+                    units: sub_units,
+                    version: self.version,
+                    categories: sub_categories,
+                    // A per-category slice was measured by the same instrument as
+                    // the whole, so it carries the same provenance. Its cache_hits
+                    // /cache_misses still describe the whole run, not this slice.
+                    provenance: self.provenance.clone(),
+                },
+            ));
         }
         reports
     }
@@ -310,7 +313,9 @@ impl AddAssign for Measures {
 /// Allows [collect](Iterator::collect) to be used on an iterator of [Measures].
 impl FromIterator<Measures> for Measures {
     fn from_iter<T>(iter: T) -> Self
-    where T: IntoIterator<Item = Measures> {
+    where
+        T: IntoIterator<Item = Measures>,
+    {
         let mut measures = Measures::default();
         for other in iter {
             measures += other;
@@ -448,13 +453,17 @@ impl From<LegacyReportItem> for ReportItem {
 
 #[cfg(feature = "serde")]
 fn serialize_hex<S>(x: &Option<u64>, s: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     if let Some(x) = x { s.serialize_str(&format!("{x:#x}")) } else { s.serialize_none() }
 }
 
 #[cfg(feature = "serde")]
 fn deserialize_hex<'de, D>(d: D) -> Result<Option<u64>, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     use serde::Deserialize;
     let s = String::deserialize(d)?;
     if s.is_empty() {
