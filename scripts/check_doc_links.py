@@ -42,11 +42,26 @@ DC3_REQUIRED_ANCHORS = [
 
 
 def slugify(heading: str) -> str:
-    """GitHub's heading -> anchor transformation (close enough for our docs)."""
+    """GitHub's heading -> anchor transformation (close enough for our docs).
+
+    The final substitution is `\\s` and NOT `\\s+`, and that is the whole point.
+    github-slugger replaces whitespace ONE CHARACTER AT A TIME, so a heading
+    like `## Dead Store Elimination / Destructor Merging` slugs to
+    `dead-store-elimination--destructor-merging` — the dropped `/` leaves two
+    adjacent spaces behind, and two spaces become two hyphens.
+
+    This function used to collapse runs with `\\s+`, which made the checker
+    blind in the worst possible direction: it computed the SAME wrong slug that
+    the URLs under test were written against, so it reported OK on four URLs
+    that GitHub serves as 404s (three in dc3-decomp, one in rb3). A checker that
+    reproduces the bug it is checking for cannot fail. Every heading whose
+    anchor is a single run of spaces is unaffected, which is why 51 of 55 URLs
+    were and remain green.
+    """
     s = heading.strip().lower()
     s = re.sub(r"[`*]", "", s)
     s = re.sub(r"[^\w\s-]", "", s)
-    return re.sub(r"\s+", "-", s)
+    return re.sub(r"\s", "-", s)
 
 
 def headings(path: str) -> set[str]:
