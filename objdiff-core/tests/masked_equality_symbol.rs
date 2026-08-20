@@ -145,15 +145,12 @@ fn build_bl_obj(funcs: &[(&str, &str)]) -> Vec<u8> {
             section: SymbolSection::Undefined,
             flags: SymbolFlags::None,
         });
-        obj.add_relocation(
-            text,
-            Relocation {
-                offset: off,
-                symbol: callee_sym,
-                addend: 0,
-                flags: object::RelocationFlags::Elf { r_type: object::elf::R_PPC_REL24 },
-            },
-        )
+        obj.add_relocation(text, Relocation {
+            offset: off,
+            symbol: callee_sym,
+            addend: 0,
+            flags: object::RelocationFlags::Elf { r_type: object::elf::R_PPC_REL24 },
+        })
         .expect("add bl relocation");
     }
     obj.write().expect("write ELF object")
