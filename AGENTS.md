@@ -26,7 +26,20 @@ In general, do NOT use `--workspace`, as it will include the WASM crate and like
 Pre-commit tasks:
 
 - `cargo test` to run the test suite
-- `cargo +nightly fmt --all` to format code (nightly required)
+- `scripts/fmt.sh` to format code. **Never `cargo fmt`.**
+
+  `rustfmt.toml` uses six nightly-only options. A stable rustfmt does not decline
+  them: it prints a warning per option, **exits 0**, and reformats every
+  construct they govern the OTHER way. So `cargo fmt` on stable does not leave
+  the tree unformatted, it actively *un*formats it — and reports success. On
+  2026-08-20 exactly that rewrote 20 files a change had no business touching.
+  `scripts/fmt.sh` runs the nightly one and fails loudly if it is unavailable.
+
+  Run `scripts/setup-hooks.sh` once per clone. It installs a pre-commit hook
+  that blocks staged `.rs` files formatted by the wrong toolchain, because the
+  four guards that existed before it were all advisory and none of them could
+  say no. It self-tests on install; a failed self-test is a hard error, not a
+  warning.
 - `cargo +nightly clippy --all-targets --all-features --workspace -- -D warnings` to lint code (nightly required)
 - `cargo deny check` (`cargo install --locked cargo-deny` if needed) if dependencies change
 

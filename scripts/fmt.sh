@@ -34,12 +34,19 @@
 # and it would be a permanent divergence from upstream (encounter/objdiff), which
 # ships the identical rustfmt.toml and no toolchain pin.
 #
-# Running this is not cosmetic. Two consequences of the drift:
-#   - The CI fmt job is RED today. It pins nightly and runs
-#     `cargo fmt --all --check`, which our main fails at 224 hunks.
-#   - Reformatting moves the fork TOWARD upstream, not away: across the 32
-#     files we share with upstream/main, `git diff upstream/main` shrinks
-#     14,540 -> 13,200 lines (-1,340). It is conflict-reducing.
+# Running this is not cosmetic. Reformatting moves the fork TOWARD upstream,
+# not away: across the 32 files we share with upstream/main, `git diff
+# upstream/main` shrank 14,540 -> 13,200 lines (-1,340). It is conflict-reducing.
+#
+# STATUS 2026-08-20: the backlog this script was written to clear is GONE --
+# `scripts/fmt.sh --check` reports 0 hunks and the CI fmt job is green. The
+# older note here (\"CI is RED today ... our main fails at 224 hunks\") described
+# 2026-08-16 and is kept only as history; do not quote it as current.
+#
+# ENFORCEMENT: this script is advisory on its own -- nothing makes anyone run
+# it, and on 2026-08-20 a reflexive `cargo fmt` on stable rewrote 20 unrelated
+# files anyway. `scripts/setup-hooks.sh` installs a pre-commit hook that
+# actually blocks that. Run it once per clone.
 #
 # USAGE
 #   scripts/fmt.sh            # format the workspace in place
