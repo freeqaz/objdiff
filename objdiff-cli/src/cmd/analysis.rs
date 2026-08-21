@@ -118,8 +118,36 @@ static REGISTER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([rf]\d+)\
 /// out of 21, which is why it survived: 20 of 21 agreed by coincidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternType {
-    /// Calls to linker-merged functions (ICF — source-immune at the call site)
+    /// Calls to linker-merged functions (ICF — source-immune at the call site).
+    ///
+    /// EVIDENCE-BEARING ONLY. A name matching [`MERGED_FUNC_RE`] is a splitter's
+    /// own record that it found several symbols at one address; nothing else in
+    /// a diff proves a fold happened. Until v4.2.6 this variant also absorbed
+    /// every `bl` whose two sides merely named different symbols, which is a
+    /// different (and largely fixable) thing — see [`PatternType::WrongCallee`].
     LinkerMerged,
+    /// A `bl`/`b` where the two sides name genuinely different callees, with no
+    /// evidence of a fold. This is the wrong-callee class, and it is FIXABLE:
+    /// the usual causes are an overload picked by the wrong argument type, a
+    /// `Handle` where the target used `Export`, or a mangling divergence.
+    WrongCallee,
+    /// Same template, different template arguments (`?$Foo@VA@@` vs `?$Foo@VB@@`).
+    /// A real source-level type disagreement at the call site, not a fold.
+    /// MakeString instantiations are excluded — [`PatternType::MakeStringTemplateMismatch`]
+    /// owns those, and letting both fire made the MakeString finding suppress
+    /// itself (see the `has_linker_merged` gate in `compute_verdict`).
+    TemplateInstantiationMismatch,
+    /// `bl __savegprlr_28` vs `bl __savegprlr_29` and friends. WHICH out-of-line
+    /// register save/restore helper a function calls is decided entirely by
+    /// register allocation, so this is regalloc noise, not a call-target bug.
+    /// The canonical score already forgives it (`is_regalloc_save_helper`).
+    RegisterSaveHelperMismatch,
+    /// One or both sides name a symbol the splitter never identified
+    /// (`fn_82331360`, `lbl_…`, `vftable_…`). The names disagree, but the
+    /// disagreement is unverifiable from the diff: it is usually the same
+    /// function under a placeholder name, and the fix (if any) is in the split
+    /// config, not the source.
+    UnverifiableCalleeName,
     /// Bool return masking with clrlwi/rlwinm (permuter-class)
     BoolMask,
     /// Consistent register allocation swaps. Usually a *symptom*, not a cause:
@@ -175,6 +203,10 @@ impl PatternType {
     /// the set without repeating it.
     pub const ALL: &'static [PatternType] = &[
         PatternType::LinkerMerged,
+        PatternType::WrongCallee,
+        PatternType::TemplateInstantiationMismatch,
+        PatternType::RegisterSaveHelperMismatch,
+        PatternType::UnverifiableCalleeName,
         PatternType::BoolMask,
         PatternType::RegisterSwap,
         PatternType::ComparisonStyle,
@@ -200,6 +232,10 @@ impl PatternType {
     pub fn as_str(&self) -> &'static str {
         match self {
             PatternType::LinkerMerged => "LINKER_MERGED",
+            PatternType::WrongCallee => "WRONG_CALLEE",
+            PatternType::TemplateInstantiationMismatch => "TEMPLATE_INSTANTIATION_MISMATCH",
+            PatternType::RegisterSaveHelperMismatch => "REGISTER_SAVE_HELPER_MISMATCH",
+            PatternType::UnverifiableCalleeName => "UNVERIFIABLE_CALLEE_NAME",
             PatternType::BoolMask => "BOOL_MASK",
             PatternType::RegisterSwap => "REGISTER_SWAP",
             PatternType::ComparisonStyle => "COMPARISON_STYLE",
@@ -276,6 +312,19 @@ pub enum Fixability {
 #[derive(Debug, Clone, Serialize)]
 pub struct MergedFunctionCount {
     pub name: String,
+    pub count: usize,
+}
+
+/// A call site where the two sides name different callees.
+///
+/// Both names are kept, unlike [`MergedFunctionCount`], because for every class
+/// except a genuine fold the QUESTION is which of the two is right — a single
+/// name cannot express that, and the old `ICF:<name> (cross-function merge)`
+/// string threw the target's name away.
+#[derive(Debug, Clone, Serialize)]
+pub struct DivergentCalleeInfo {
+    pub target_symbol: String,
+    pub base_symbol: String,
     pub count: usize,
 }
 
@@ -406,6 +455,9 @@ pub struct SignednessMismatchEntry {
 pub enum PatternDetails {
     /// Merged function call counts
     MergedFunctions { merged_functions: Vec<MergedFunctionCount> },
+    /// Call sites whose two sides name different callees (wrong callee,
+    /// template instantiation, register-save helper, placeholder name)
+    DivergentCallees { divergent_callees: Vec<DivergentCalleeInfo> },
     /// Bool mask bit positions detected
     BoolMask { bit_positions: Vec<u8> },
     /// Register swap mappings with occurrence counts
@@ -672,6 +724,28 @@ impl Pattern {
                     one_line,
                     top_details,
                     truncated: merged_functions.len() > 3,
+                    total_items: unique,
+                }
+            }
+            PatternDetails::DivergentCallees { divergent_callees } => {
+                let total_calls: usize = divergent_callees.iter().map(|c| c.count).sum();
+                let unique = divergent_callees.len();
+                let one_line =
+                    format!("{} call site(s) naming {} different callee(s)", total_calls, unique);
+                let top_details: Vec<String> = divergent_callees
+                    .iter()
+                    .take(3)
+                    .map(|c| {
+                        format!(
+                            "target `{}` vs base `{}`: {} call(s)",
+                            c.target_symbol, c.base_symbol, c.count
+                        )
+                    })
+                    .collect();
+                PatternSummary {
+                    one_line,
+                    top_details,
+                    truncated: divergent_callees.len() > 3,
                     total_items: unique,
                 }
             }
@@ -1228,6 +1302,10 @@ pub fn compute_diff_regions(
                         PatternType::OffsetSwap => "offset swaps",
                         PatternType::ControlFlow => "control flow",
                         PatternType::LinkerMerged => "merged calls",
+                        PatternType::WrongCallee => "wrong callee",
+                        PatternType::TemplateInstantiationMismatch => "template instantiation",
+                        PatternType::RegisterSaveHelperMismatch => "register-save helper",
+                        PatternType::UnverifiableCalleeName => "unverifiable callee name",
                         PatternType::BoolMask => "bool masks",
                         PatternType::ComparisonStyle => "comparison style",
                         PatternType::CommutativeOpOrder => "commutative ops",
@@ -1351,6 +1429,25 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
                                     .as_ref()
                                     .is_some_and(|a| MERGED_FUNC_RE.is_match(a.trim()))
                         })
+                })
+                .count()
+        }
+        PatternDetails::DivergentCallees { divergent_callees } => {
+            // Count the exact (target, base) pairs this pattern owns. Matching
+            // on "any bl with differing args" would double-count every sibling
+            // callee-divergence pattern into every region.
+            instructions
+                .iter()
+                .filter(|i| {
+                    if i.match_type != "diff_arg" {
+                        return false;
+                    }
+                    let (Some(t), Some(b)) = (&i.target, &i.base) else { return false };
+                    let t_args = t.args.as_deref().unwrap_or("").trim();
+                    let b_args = b.args.as_deref().unwrap_or("").trim();
+                    divergent_callees
+                        .iter()
+                        .any(|c| c.target_symbol == t_args && c.base_symbol == b_args)
                 })
                 .count()
         }
@@ -1634,6 +1731,10 @@ pub enum DocLink {
     SignedVsUnsignedComparison,
     /// Signedness/width type disagreements.
     SignednessWidth,
+    /// Telling a real wrong callee from relocation-name noise.
+    RelocationNameDivergence,
+    /// Checking the split config before believing a name disagreement.
+    RelocationNameInstrumentCheck,
 }
 
 /// Per-project location of a [`DocLink`]. `None` means the project has no
@@ -1768,6 +1869,15 @@ fn doc_entry(link: DocLink) -> DocEntry {
             dc3: "fixable-casting.md#sizeof-signedness",
             rb3: "fixable-casting.md#int-cast-for-signed-arithmetic-shift"
         ),
+        // RB3 has no counterpart document, and `DocEntry` exists precisely so
+        // that "no document" is expressible: emitting a dc3 path to an RB3
+        // reader would be worse than emitting nothing.
+        DocLink::RelocationNameDivergence => {
+            e!(dc3: "relocation-names-are-unmetered.md#the-discriminator")
+        }
+        DocLink::RelocationNameInstrumentCheck => {
+            e!(dc3: "relocation-names-are-unmetered.md#check-the-instrument-first")
+        }
     }
 }
 
@@ -1803,11 +1913,17 @@ pub const ALL_DOC_LINKS: &[DocLink] = &[
     DocLink::FloatToIntToFloat,
     DocLink::SignedVsUnsignedComparison,
     DocLink::SignednessWidth,
+    DocLink::RelocationNameDivergence,
+    DocLink::RelocationNameInstrumentCheck,
 ];
 
 /// Every [`PatternType`], for exhaustive checking.
 pub const ALL_PATTERN_TYPES: &[PatternType] = &[
     PatternType::LinkerMerged,
+    PatternType::WrongCallee,
+    PatternType::TemplateInstantiationMismatch,
+    PatternType::RegisterSaveHelperMismatch,
+    PatternType::UnverifiableCalleeName,
     PatternType::BoolMask,
     PatternType::RegisterSwap,
     PatternType::ComparisonStyle,
@@ -2016,6 +2132,20 @@ pub fn run_doc_links(args: DocLinksArgs) -> anyhow::Result<()> {
 pub fn pattern_doc_links(pattern: PatternType) -> &'static [DocLink] {
     match pattern {
         PatternType::LinkerMerged => &[DocLink::IcfVerifiable, DocLink::IcfAtLimit],
+        // Deliberately NOT the ICF docs. Those say "accept the match, the
+        // linker did this" — which is the wrong instruction for a call that
+        // simply goes somewhere else. The discriminator comes first, the
+        // "check the split config before believing it" warning second: three of
+        // the loudest findings in this class turned out to be config defects.
+        PatternType::WrongCallee | PatternType::TemplateInstantiationMismatch => {
+            &[DocLink::RelocationNameDivergence, DocLink::RelocationNameInstrumentCheck]
+        }
+        // Same story as PROLOGUE_MISMATCH: the helper's suffix is the first
+        // register spilled, so this is a live-range budget difference.
+        PatternType::RegisterSaveHelperMismatch => {
+            &[DocLink::PrecomputeRefsBeforeCalls, DocLink::RegallocCascades]
+        }
+        PatternType::UnverifiableCalleeName => &[DocLink::RelocationNameInstrumentCheck],
         PatternType::BoolMask => &[DocLink::BoolMask, DocLink::BoolMaterialization],
         // REGISTER_SWAP reads as "the allocator picked different registers",
         // which invites a declaration-order edit. Measured on MSVC/PowerPC
@@ -2102,9 +2232,91 @@ fn msvc_template_base(mangled: &str) -> Option<&str> {
     Some(&mangled[idx..idx + 2 + end])
 }
 
-pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
-    let mut merged_calls: HashMap<String, usize> = HashMap::new();
-    let mut icf_template_count = 0usize;
+/// What a `bl`/`b` whose two sides name different symbols actually is.
+///
+/// Until v4.2.6 every one of these was reported as `LINKER_MERGED` with
+/// `RarelyHandFixable`. Measured over 1,052 reproducible `has_linker_merged`
+/// rows in dc3-decomp, that population was **20.7%** register save/restore
+/// helpers, **6.3%** MakeString instantiations, **37.5%** template spelling,
+/// **38.1%** cross-function — and only **1.9%** actually named a splitter's
+/// synthetic fold name. So ~98% of what the detector called a linker merge was
+/// not one, and the largest single slice (a `bl` to a genuinely different
+/// symbol) is the WRONG-CALLEE class this project mines for real bugs. Telling
+/// an agent "ICF, rarely hand fixable" about it is not merely noisy, it is
+/// pointing away from a fixable bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CalleeDivergence {
+    /// A splitter-synthesised fold name — the only evidence-bearing case.
+    LinkerMerged,
+    /// Both sides spell the same template with different arguments.
+    TemplateInstantiation,
+    /// `__savegprlr_28` vs `__savegprlr_29`: register allocation, not a callee.
+    RegisterSaveHelper,
+    /// At least one side is a splitter placeholder (`fn_<hex>`, `lbl_<hex>`, …).
+    UnverifiableName,
+    /// Two real, different, identified symbols.
+    WrongCallee,
+}
+
+/// Classify one call site's `(target, base)` operand pair.
+///
+/// `None` means "not a callee divergence at all" — equal names, an empty side,
+/// or a MakeString instantiation, which [`detect_makestring_template_mismatch`]
+/// owns. Letting MakeString fall in here was self-defeating: `compute_verdict`
+/// downgrades a MakeString finding to an artifact when `LINKER_MERGED` is also
+/// present, and the MakeString call site was itself what made `LINKER_MERGED`
+/// fire. The finding suppressed itself.
+fn classify_callee_divergence(t_args: &str, b_args: &str) -> Option<CalleeDivergence> {
+    if MERGED_FUNC_RE.is_match(t_args) {
+        return Some(CalleeDivergence::LinkerMerged);
+    }
+    if t_args == b_args || t_args.is_empty() || b_args.is_empty() {
+        return None;
+    }
+    // Shared with the canonical score's carve-out (objdiff-core), so the two
+    // cannot disagree about how a toolchain spells these. Covers MSVC/Xenon's
+    // `__savegprlr_25` and CodeWarrior/Wii's `_savegpr_14` alike.
+    if objdiff_core::diff::code::is_regalloc_save_helper_name(t_args)
+        && objdiff_core::diff::code::is_regalloc_save_helper_name(b_args)
+    {
+        return Some(CalleeDivergence::RegisterSaveHelper);
+    }
+    if objdiff_core::diff::code::is_placeholder_symbol_name(t_args)
+        || objdiff_core::diff::code::is_placeholder_symbol_name(b_args)
+    {
+        return Some(CalleeDivergence::UnverifiableName);
+    }
+    if MAKESTRING_RE.is_match(t_args) || MAKESTRING_RE.is_match(b_args) {
+        return None;
+    }
+    if let (Some(t_base), Some(b_base)) = (msvc_template_base(t_args), msvc_template_base(b_args))
+        && t_base == b_base
+    {
+        return Some(CalleeDivergence::TemplateInstantiation);
+    }
+    // Both sides must look like a symbol rather than a bare address or an
+    // immediate; a numeric branch destination is a control-flow diff, not a
+    // callee diff, and CONTROL_FLOW owns it.
+    let is_symbol = |s: &str| {
+        s.starts_with('?')
+            || s.starts_with('_')
+            || s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    };
+    if is_symbol(t_args) && is_symbol(b_args) {
+        return Some(CalleeDivergence::WrongCallee);
+    }
+    None
+}
+
+/// Detect calls whose two sides name different callees, split by what the
+/// disagreement actually is. See [`CalleeDivergence`].
+///
+/// Returns one [`Pattern`] per class that fired, so a function with a genuine
+/// fold AND a wrong callee reports both instead of collapsing to the verdict of
+/// whichever branch happened to be checked first.
+pub fn detect_callee_divergences(instructions: &[InstructionDiffOutput]) -> Vec<Pattern> {
+    // (class, target, base) -> count.
+    let mut sites: HashMap<(CalleeDivergence, String, String), usize> = HashMap::new();
 
     for instr in instructions {
         if instr.match_type != "diff_arg" {
@@ -2121,69 +2333,119 @@ pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pa
         let t_args = target.args.as_deref().unwrap_or("").trim();
         let b_args = base.args.as_deref().unwrap_or("").trim();
 
-        // Check explicit merged_*/OnlyReturns/??_[EG] patterns
-        if MERGED_FUNC_RE.is_match(t_args) {
-            *merged_calls.entry(t_args.to_string()).or_insert(0) += 1;
-            continue;
-        }
-
-        // Check ICF merging: both sides call different symbols.
-        if t_args != b_args && !t_args.is_empty() && !b_args.is_empty() {
-            // Check if same template with different type args
-            if let (Some(t_base), Some(b_base)) =
-                (msvc_template_base(t_args), msvc_template_base(b_args))
-                && t_base == b_base
-            {
-                icf_template_count += 1;
-                *merged_calls.entry(format!("ICF:{} (template merge)", t_base)).or_insert(0) += 1;
-                continue;
-            }
-
-            // General ICF: bl/b to completely different symbols.
-            // At least one side must be a proper function name (not a label
-            // or number). This is likely ICF merging of unrelated functions
-            // with identical machine code.
-            let t_is_func = t_args.starts_with('?')
-                || t_args.starts_with('_')
-                || t_args.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
-            let b_is_func = b_args.starts_with('?')
-                || b_args.starts_with('_')
-                || b_args.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
-            if t_is_func && b_is_func {
-                icf_template_count += 1;
-                *merged_calls
-                    .entry(format!("ICF:{} (cross-function merge)", b_args))
-                    .or_insert(0) += 1;
-            }
+        if let Some(class) = classify_callee_divergence(t_args, b_args) {
+            *sites.entry((class, t_args.to_string(), b_args.to_string())).or_insert(0) += 1;
         }
     }
 
-    if merged_calls.is_empty() {
-        return None;
+    if sites.is_empty() {
+        return Vec::new();
     }
 
-    let total_count: usize = merged_calls.values().sum();
+    let mut by_class: HashMap<CalleeDivergence, Vec<DivergentCalleeInfo>> = HashMap::new();
+    for ((class, target_symbol, base_symbol), count) in sites {
+        by_class.entry(class).or_default().push(DivergentCalleeInfo {
+            target_symbol,
+            base_symbol,
+            count,
+        });
+    }
 
-    // Count descending, then by name. The count key alone was NOT enough for
-    // "consistent output", which is what the comment here used to claim: the
-    // vec is built by draining a `HashMap`, `sort_by_key` is stable, so equal
-    // counts kept the hasher's order — and `std::collections::HashMap` reseeds
-    // per instance. Merged-call counts are overwhelmingly 1, so ties are the
-    // common case, not the corner: on a 1500-symbol rb3-xenon batch this list
-    // reordered on 16 of the 19 rows that differed between two runs of one
-    // binary, and `summarize()` publishes its head into the verdict text.
-    let mut merged_functions: Vec<MergedFunctionCount> =
-        merged_calls.into_iter().map(|(name, count)| MergedFunctionCount { name, count }).collect();
-    merged_functions.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    // Emit in a fixed class order, and sort within a class by count descending
+    // then by name. The count key alone was NOT enough for "consistent output",
+    // which is what the comment here used to claim: the vec is built by
+    // draining a `HashMap`, `sort_by_key` is stable, so equal counts kept the
+    // hasher's order — and `std::collections::HashMap` reseeds per instance.
+    // These counts are overwhelmingly 1, so ties are the common case, not the
+    // corner: on a 1500-symbol rb3-xenon batch this list reordered on 16 of the
+    // 19 rows that differed between two runs of one binary, and `summarize()`
+    // publishes its head into the verdict text.
+    let mut patterns = Vec::new();
+    for class in [
+        CalleeDivergence::LinkerMerged,
+        CalleeDivergence::WrongCallee,
+        CalleeDivergence::TemplateInstantiation,
+        CalleeDivergence::RegisterSaveHelper,
+        CalleeDivergence::UnverifiableName,
+    ] {
+        let Some(mut callees) = by_class.remove(&class) else { continue };
+        callees.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+                .then_with(|| a.base_symbol.cmp(&b.base_symbol))
+        });
+        let total_count: usize = callees.iter().map(|c| c.count).sum();
 
-    Some(Pattern {
-        pattern: PatternType::LinkerMerged,
-        confidence: if icf_template_count > 0 { Confidence::Medium } else { Confidence::High },
-        instruction_count: total_count,
-        fixability: Fixability::RarelyHandFixable,
-        details: PatternDetails::MergedFunctions { merged_functions },
-        doc_urls: pattern_doc_urls(PatternType::LinkerMerged),
-    })
+        let (pattern, confidence, fixability) = match class {
+            // A fold is a linker decision; no source edit moves it.
+            CalleeDivergence::LinkerMerged => {
+                (PatternType::LinkerMerged, Confidence::High, Fixability::RarelyHandFixable)
+            }
+            // The point of the split: this class is FIXABLE, and the old code
+            // told agents to give up on it.
+            CalleeDivergence::WrongCallee => {
+                (PatternType::WrongCallee, Confidence::High, Fixability::LikelyFixable)
+            }
+            CalleeDivergence::TemplateInstantiation => (
+                PatternType::TemplateInstantiationMismatch,
+                Confidence::High,
+                Fixability::LikelyFixable,
+            ),
+            CalleeDivergence::RegisterSaveHelper => (
+                PatternType::RegisterSaveHelperMismatch,
+                Confidence::High,
+                Fixability::RarelyHandFixable,
+            ),
+            // Medium: the names disagree, but a placeholder name is not
+            // evidence that the CALLEE disagrees.
+            CalleeDivergence::UnverifiableName => (
+                PatternType::UnverifiableCalleeName,
+                Confidence::Medium,
+                Fixability::RarelyHandFixable,
+            ),
+        };
+
+        // LINKER_MERGED keeps its original single-name details payload: it is
+        // the one class where the target's synthetic name is the whole story,
+        // and three downstream repos parse `merged_functions`.
+        let details = if class == CalleeDivergence::LinkerMerged {
+            let mut merged: HashMap<String, usize> = HashMap::new();
+            for c in &callees {
+                *merged.entry(c.target_symbol.clone()).or_insert(0) += c.count;
+            }
+            let mut merged_functions: Vec<MergedFunctionCount> = merged
+                .into_iter()
+                .map(|(name, count)| MergedFunctionCount { name, count })
+                .collect();
+            merged_functions
+                .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+            PatternDetails::MergedFunctions { merged_functions }
+        } else {
+            PatternDetails::DivergentCallees { divergent_callees: callees }
+        };
+
+        patterns.push(Pattern {
+            pattern,
+            confidence,
+            instruction_count: total_count,
+            fixability,
+            details,
+            doc_urls: pattern_doc_urls(pattern),
+        });
+    }
+    patterns
+}
+
+/// The `LINKER_MERGED` half of [`detect_callee_divergences`], kept as a named
+/// entry point because it is the pattern with an evidence test behind it.
+/// `analyze_instructions` calls the full detector, so this is reached only from
+/// tests — which want to assert precisely "this pair IS / IS NOT a fold".
+#[allow(dead_code)]
+pub fn detect_linker_merged(instructions: &[InstructionDiffOutput]) -> Option<Pattern> {
+    detect_callee_divergences(instructions)
+        .into_iter()
+        .find(|p| p.pattern == PatternType::LinkerMerged)
 }
 
 /// Check clrlwi for bool mask pattern using typed args or string fallback.
@@ -3823,10 +4085,10 @@ pub fn detect_signedness_mismatch(instructions: &[InstructionDiffOutput]) -> Opt
 pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis {
     let mut patterns = Vec::new();
 
-    // Run all detectors
-    if let Some(p) = detect_linker_merged(instructions) {
-        patterns.push(p);
-    }
+    // Run all detectors. The callee-divergence detector returns one pattern per
+    // class it found (LINKER_MERGED, WRONG_CALLEE, …) rather than filing them
+    // all under LINKER_MERGED.
+    patterns.extend(detect_callee_divergences(instructions));
     if let Some(p) = detect_bool_mask(instructions) {
         patterns.push(p);
     }
@@ -3902,6 +4164,10 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
         patterns,
         patterns_checked: vec![
             "LINKER_MERGED",
+            "WRONG_CALLEE",
+            "TEMPLATE_INSTANTIATION_MISMATCH",
+            "REGISTER_SAVE_HELPER_MISMATCH",
+            "UNVERIFIABLE_CALLEE_NAME",
             "BOOL_MASK",
             "REGISTER_SWAP",
             "COMPARISON_STYLE",
@@ -4004,7 +4270,14 @@ pub fn compute_verdict(
             p.fixability == Fixability::RarelyHandFixable
             // MakeString type mismatches become artifact-driven when co-detected
             // with LinkerMerged ICF — the different template is just the
-            // linker's ICF address choice, not a real source-level type diff
+            // linker's ICF address choice, not a real source-level type diff.
+            //
+            // This gate was circular until v4.2.6: a `bl ??$MakeString@…` whose
+            // two sides named different instantiations was itself what made
+            // LINKER_MERGED fire, so the MakeString finding suppressed itself
+            // and the function was filed as an ICF artifact. MakeString sites
+            // are now excluded from the callee-divergence detector, so
+            // `has_linker_merged` here means a genuine fold was ALSO present.
             || (p.pattern == PatternType::MakeStringTemplateMismatch && has_linker_merged)
         });
         // Truly source-immune patterns: linker-derived only (path hash, address
@@ -4220,6 +4493,64 @@ pub fn compute_verdict(
             }],
             doc_urls: verdict_doc_urls.clone(),
         };
+    }
+
+    // Check for wrong callees. This block exists because the merged-call block
+    // above used to swallow this class and answer "ICF, accept the match" —
+    // and a call that simply goes somewhere else is the most fixable thing a
+    // diff can contain. Note the score does NOT reliably show it: relocation
+    // penalties fold into `arg_diff_score`, so a wrong callee can sit under a
+    // displayed 100%.
+    let wrong_callee_count = analysis.pattern_instruction_count(PatternType::WrongCallee)
+        + analysis.pattern_instruction_count(PatternType::TemplateInstantiationMismatch);
+    if wrong_callee_count > 0 {
+        let wrong_callee_ratio = wrong_callee_count as f32 / total_mismatches as f32;
+        factors.push(VerdictFactor {
+            name: "wrong_callee_ratio",
+            value: serde_json::json!(wrong_callee_ratio),
+            threshold: Some(MERGED_RATIO_LIKELY_FIXABLE),
+            result: if wrong_callee_ratio >= MERGED_RATIO_LIKELY_FIXABLE {
+                "dominant"
+            } else {
+                "present"
+            },
+        });
+        if wrong_callee_ratio >= MERGED_RATIO_LIKELY_FIXABLE {
+            let detail = analysis
+                .patterns
+                .iter()
+                .find(|p| {
+                    p.pattern == PatternType::WrongCallee
+                        || p.pattern == PatternType::TemplateInstantiationMismatch
+                })
+                .map(|p| p.summarize())
+                .map(|s| format!(" ({})", s.one_line))
+                .unwrap_or_default();
+            return Verdict {
+                classification: VerdictClassification::LikelyFixable,
+                confidence: Confidence::High,
+                explanation: format!(
+                    "{:.1}% of mismatches are calls naming a different callee{}. \
+                     This is a source-level difference (overload resolution, an \
+                     Export/Handle mix-up, a template argument, a mangling \
+                     divergence), not a linker artifact.",
+                    wrong_callee_ratio * 100.0,
+                    detail
+                ),
+                factors,
+                recommendation: "Compare the two symbol names and find the source \
+                     construct that picks the target's. Check the split config first — \
+                     a symbol named at the wrong address produces the same signature."
+                    .to_string(),
+                suggestions: vec![Suggestion {
+                    action: "Identify which side's callee is correct, then find the \
+                             source-level construct that selects it."
+                        .to_string(),
+                    doc_url: doc_url(DocLink::RelocationNameDivergence),
+                }],
+                doc_urls: verdict_doc_urls.clone(),
+            };
+        }
     }
 
     // Check for address relocation noise (linker-layout artifact, similar to merged)
@@ -4636,14 +4967,14 @@ mod doc_link_tests {
         links.sort_by_key(|l| format!("{l:?}"));
         links.dedup_by_key(|l| format!("{l:?}"));
         assert_eq!(links.len(), ALL_DOC_LINKS.len(), "duplicate entry in ALL_DOC_LINKS");
-        assert_eq!(ALL_DOC_LINKS.len(), 30, "update ALL_DOC_LINKS when adding a DocLink");
+        assert_eq!(ALL_DOC_LINKS.len(), 32, "update ALL_DOC_LINKS when adding a DocLink");
         let mut patterns = ALL_PATTERN_TYPES.to_vec();
         patterns.sort_by_key(|p| p.as_str());
         patterns.dedup_by_key(|p| p.as_str());
         assert_eq!(patterns.len(), ALL_PATTERN_TYPES.len(), "duplicate in ALL_PATTERN_TYPES");
         assert_eq!(
             ALL_PATTERN_TYPES.len(),
-            21,
+            25,
             "update ALL_PATTERN_TYPES when adding a PatternType"
         );
     }
@@ -4827,7 +5158,7 @@ mod tests {
         // escaping the spelling check.
         assert_eq!(
             PatternType::ALL.len(),
-            21,
+            25,
             "a PatternType variant was added or removed — \
              add it to PatternType::ALL and update this count"
         );
