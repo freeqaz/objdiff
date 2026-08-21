@@ -925,12 +925,21 @@ fn normalize_mangled_array_sizes(name: &str) -> Option<String> {
 /// exists to forgive register allocation, and this IS register allocation.
 fn is_regalloc_save_helper(reloc: Option<ResolvedRelocation<'_>>) -> bool {
     let Some(reloc) = reloc else { return false };
+    is_regalloc_save_helper_name(&reloc.symbol.name)
+}
+
+/// The name-only half of [`is_regalloc_save_helper`], public so that consumers
+/// which only ever see a rendered instruction operand (objdiff-cli's pattern
+/// detectors read `bl __savegprlr_28` out of the diff text, never a
+/// `ResolvedRelocation`) test the SAME spelling list. Two copies of this list
+/// is how `v4.2.4` shipped a carve-out that only fired on MSVC.
+pub fn is_regalloc_save_helper_name(name: &str) -> bool {
     // Strip ALL leading underscores. MSVC/Xenon spells these `__savegprlr_25`
     // (two) and CodeWarrior spells them `_savegpr_14` (one). Requiring exactly
     // two silently excluded every CodeWarrior target: measured on RB3, 188
     // sites of pure register-allocation noise were charged into the canonical
     // score that an MSVC target would have forgiven.
-    let rest = reloc.symbol.name.trim_start_matches('_');
+    let rest = name.trim_start_matches('_');
     for stem in [
         "savegprlr_",
         "restgprlr_",
@@ -983,7 +992,10 @@ fn local_static_ordinal_only_diff(
     }
 }
 
-fn is_placeholder_symbol_name(name: &str) -> bool {
+/// Public for the same reason as [`is_regalloc_save_helper_name`]: objdiff-cli's
+/// pattern detectors have to recognise a splitter placeholder from the rendered
+/// operand text alone, and a second copy of this prefix list would drift.
+pub fn is_placeholder_symbol_name(name: &str) -> bool {
     // Tolerate a single leading underscore (i386 PE cdecl decoration).
     let name = name.strip_prefix('_').unwrap_or(name);
     // `vftable_<hex>` is the same splitter-generated placeholder shape as
