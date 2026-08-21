@@ -1,0 +1,26 @@
+# Deliberately OUTSIDE the objdiff workspace (note the empty `[workspace]`
+# table below). That is the whole point: inside the workspace, cargo unifies
+# features across every selected package, so objdiff-cli's `regex` (default
+# features) and `bindings` silently satisfy objdiff-core's under-declared
+# needs. Three real defects hid behind that unification until an external
+# consumer linked objdiff-core directly.
+#
+# Run via `scripts/check-standalone.sh`, not by hand.
+[workspace]
+
+[package]
+name = "objdiff-core-standalone-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# A realistic minimal external consumer: PPC targets, config + serde, std.
+# No `bindings`, and no `regex` entry to re-supply features objdiff-core
+# should be declaring itself.
+objdiff-core = { path = "../../objdiff-core", default-features = false, features = [
+    "std",
+    "config",
+    "serde",
+    "ppc",
+] }

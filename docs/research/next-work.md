@@ -70,28 +70,46 @@ All re-fetchable from `origin` (encounter/objdiff) if ever needed.
   format and depends on an external `encounter/object` fork branch; the branch is
   all `/* TODO */` stubs. Irrelevant to PPC targets (dc3/rb3).
 
-## Known defects (found 2026-08-21 by decomp-synth's score-server lane, first non-cli consumer of objdiff-core)
+## Standalone-consumer defects — FIXED 2026-08-21
 
-Both were found by linking `objdiff-core` directly from a new Rust consumer
-(decomp-synth `tools/score-server/`, lane `scoring-server`). objdiff-cli never
-hits either because cargo feature unification papers over them; any other
-consumer does.
+Found by linking `objdiff-core` directly from a new Rust consumer (decomp-synth
+`tools/score-server/`), the first thing other than objdiff-cli to depend on it.
+There were **three**, not the two first reported, and they shared one root
+cause: every CI job builds `--all-features --workspace`, under which cargo
+unifies features across packages and objdiff-cli's dependency declarations
+quietly satisfy what objdiff-core fails to declare for itself. No job built
+objdiff-core alone, so the crate's own declaration was never tested.
 
 - **`regex` declared featureless while `map_file.rs` needs Unicode classes.**
-  `objdiff-core`'s `regex` dependency disables default features, but
-  `map_file.rs` compiles patterns using `\s`/`\d` character classes, which
-  require the `unicode-perl` (or default) feature. Building the crate alone
-  and calling `parse_msvc_map` panics at pattern-compile time. objdiff-cli
-  survives only because another workspace dependency re-enables the regex
-  features via unification. Fix: declare the feature `objdiff-core` itself
-  needs.
-- **`bindings` feature referenced unconditionally.** Code reachable from a
-  plain `objdiff-core` dependency references items only present under the
-  `bindings` feature, forcing downstream consumers to enable a feature they
-  do not want. The score-server consumer carries `bindings` as a documented
-  deviation until this is fixed.
+  `obj/map_file.rs` compiles `^\s*\d{4}:...(\S+)...`, and regex-syntax rejects
+  those classes at `Regex::new` time unless `unicode-perl` is on — so
+  `parse_msvc_map` panicked on first use for any external consumer, taking ICF
+  alias parsing with it. Note this is a **runtime** failure: a build check
+  cannot see it. Fixed by declaring `unicode-perl` (and propagating
+  `regex?/std`).
+- **`crate::bindings::report` referenced from `std`-only-gated items.**
+  `reconcile_global_byte_matches`, `recalc_unit_measure_percents` and seven
+  supporting items were gated `#[cfg(feature = "std")]` but name types that
+  exist only under `bindings`, so a `std`-without-`bindings` build failed to
+  compile. Fixed by gating them on `all(std, bindings)`; the only caller is
+  objdiff-cli's report command, which has `bindings` on.
+- **`std` did not propagate to `serde_json`.** `serde_json` is declared
+  `features = ["alloc"]` and the `std` feature list forwarded `serde?/std` but
+  never `serde_json?/std`, so `from_reader`/`to_writer_pretty` were missing in
+  any std build that did not get `serde_json/std` from elsewhere. Fixed by
+  adding `serde_json?/std`.
 
-Follow-up from the same consumer, lower urgency: `FlowAnalysisResult` is
+**The guard is the deliverable, not the three fixes.** `scripts/check-standalone.sh`
+builds and *runs* `objdiff-core` from a crate deliberately outside this
+workspace (`scripts/standalone-check/`, note its empty `[workspace]` table),
+with a minimal feature set and no `regex`/`bindings` to unify against. It is
+wired into the CI `check` job. Verified against deliberately broken input: it
+fails on the unfixed tree with both compile errors, and — with the compile
+defects fixed but `regex` reverted to featureless — fails with the runtime
+`Unicode-aware Perl class not found` panic. That last arm is why the script
+runs the binary instead of only compiling it.
+
+Follow-up from the same consumer, **still open**: `FlowAnalysisResult` is
 `!Sync`, which forces per-connection (rather than global) parsed-object stores
 in any threaded server. An upstream `Sync` bound (or an audit of why it is
 `!Sync`) would let consumers share parsed objects across threads.
