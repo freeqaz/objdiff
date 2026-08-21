@@ -70,6 +70,32 @@ All re-fetchable from `origin` (encounter/objdiff) if ever needed.
   format and depends on an external `encounter/object` fork branch; the branch is
   all `/* TODO */` stubs. Irrelevant to PPC targets (dc3/rb3).
 
+## Known defects (found 2026-08-21 by decomp-synth's score-server lane, first non-cli consumer of objdiff-core)
+
+Both were found by linking `objdiff-core` directly from a new Rust consumer
+(decomp-synth `tools/score-server/`, lane `scoring-server`). objdiff-cli never
+hits either because cargo feature unification papers over them; any other
+consumer does.
+
+- **`regex` declared featureless while `map_file.rs` needs Unicode classes.**
+  `objdiff-core`'s `regex` dependency disables default features, but
+  `map_file.rs` compiles patterns using `\s`/`\d` character classes, which
+  require the `unicode-perl` (or default) feature. Building the crate alone
+  and calling `parse_msvc_map` panics at pattern-compile time. objdiff-cli
+  survives only because another workspace dependency re-enables the regex
+  features via unification. Fix: declare the feature `objdiff-core` itself
+  needs.
+- **`bindings` feature referenced unconditionally.** Code reachable from a
+  plain `objdiff-core` dependency references items only present under the
+  `bindings` feature, forcing downstream consumers to enable a feature they
+  do not want. The score-server consumer carries `bindings` as a documented
+  deviation until this is fixed.
+
+Follow-up from the same consumer, lower urgency: `FlowAnalysisResult` is
+`!Sync`, which forces per-connection (rather than global) parsed-object stores
+in any threaded server. An upstream `Sync` bound (or an audit of why it is
+`!Sync`) would let consumers share parsed objects across threads.
+
 ## Upstream follow-up (encounter/objdiff, low urgency)
 
 After fleet runs validate the immediate-diff tweak, merge
