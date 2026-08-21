@@ -39,6 +39,13 @@ jobs:
         run: cargo check --all-targets --all-features --workspace
       - name: Cargo clippy
         run: cargo clippy --all-targets --all-features --workspace
+      # Every check above is --all-features --workspace, under which cargo
+      # unifies features across packages and objdiff-cli's dependencies mask
+      # anything objdiff-core under-declares. This one builds and RUNS
+      # objdiff-core alone, outside the workspace, as an external consumer
+      # gets it. See scripts/check-standalone.sh.
+      - name: objdiff-core standalone (no feature unification)
+        run: scripts/check-standalone.sh
 
   fmt:
     name: Format

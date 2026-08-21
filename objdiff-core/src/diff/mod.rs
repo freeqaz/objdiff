@@ -6,7 +6,10 @@ use alloc::{
 };
 use core::{num::NonZeroU32, ops::Range};
 #[cfg(feature = "std")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+// Only the `bindings`-gated global byte-match pass uses HashSet.
+#[cfg(all(feature = "std", feature = "bindings"))]
+use std::collections::HashSet;
 
 use anyhow::Result;
 
@@ -944,6 +947,7 @@ pub const CASEB_STUB_MAX: u64 = 44;
 /// masks the bytes but DROPS the target names, so two >44B fns of identical
 /// instruction shape but different callees/strings mask-EQUAL. This carries the
 /// names so we can demand structural reloc equality.
+#[cfg(all(feature = "std", feature = "bindings"))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct RelocDesc {
     /// Byte offset of the reloc from the symbol's start.
@@ -960,6 +964,7 @@ pub(crate) struct RelocDesc {
 }
 
 /// Project a shared `RelocationFlags` to a totally-ordered scalar key.
+#[cfg(all(feature = "std", feature = "bindings"))]
 fn reloc_flags_key(flags: crate::obj::RelocationFlags) -> (u8, u32) {
     match flags {
         crate::obj::RelocationFlags::Elf(v) => (0, v),
@@ -970,6 +975,7 @@ fn reloc_flags_key(flags: crate::obj::RelocationFlags) -> (u8, u32) {
 /// The full honesty signature of a named code symbol: reloc-masked instruction
 /// bytes PLUS the ordered, name-resolved relocation descriptors. Two symbols are
 /// byte-identical for promotion iff BOTH components are equal (rule 5).
+#[cfg(all(feature = "std", feature = "bindings"))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct NamedSig {
     pub masked_bytes: Vec<u8>,
@@ -981,6 +987,7 @@ pub(crate) struct NamedSig {
 ///
 /// This is the honesty primitive for the global pass. Unlike `is_funclet_like`,
 /// it accepts ANY code symbol (the caller gates on name-ness / size / kind).
+#[cfg(all(feature = "std", feature = "bindings"))]
 pub(crate) fn named_symbol_signature(obj: &Object, sym_idx: usize) -> Option<NamedSig> {
     let masked_bytes = funclet_signature(obj, sym_idx)?;
     let symbol = obj.symbols.get(sym_idx)?;
@@ -1012,6 +1019,7 @@ pub(crate) fn named_symbol_signature(obj: &Object, sym_idx: usize) -> Option<Nam
 /// relation (see `SymbolEquivalences::canonical` for the exact semantics and
 /// the documented imprecision of representative-keying over a non-transitive
 /// relation). Returns a key suitable for cross-unit comparison.
+#[cfg(all(feature = "std", feature = "bindings"))]
 fn canonicalize_sig(
     sig: &NamedSig,
     equivalences: &crate::obj::map_file::SymbolEquivalences,
@@ -1033,6 +1041,7 @@ fn canonicalize_sig(
 /// dtk names every un-renamed carved retail body `fn_<VA>` where `<VA>` is its
 /// retail virtual address in hex — that is the authoritative VA source in this
 /// pipeline (the carved COFF objs carry no `.note.split` per-symbol VA array).
+#[cfg(all(feature = "std", feature = "bindings"))]
 fn parse_fn_va(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("fn_")?;
     if rest.len() != 8 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1046,6 +1055,7 @@ fn parse_fn_va(name: &str) -> Option<u64> {
 /// promoted (rule 3: no oracle name = no identity). Note `??__E`/`??__F` global
 /// init/dtor ARE mangled names, but they ICF-fold widely and carry no own-TU
 /// body, so we also exclude them here (the size>44B gate already filters most).
+#[cfg(all(feature = "std", feature = "bindings"))]
 fn is_anonymous_or_funclet(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("fn_") {
         return rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit());
@@ -1120,7 +1130,9 @@ pub type VaOracle = HashMap<u64, (String, f32)>;
 /// Oracle similarity floor for own-TU attribution (Rule 3).
 pub const CASEB_ORACLE_SIM_MIN: f32 = 0.5;
 
-#[cfg(feature = "std")]
+// Gated on `bindings` as well as `std`: the signature names
+// `bindings::report` types, so a `std`-only build cannot compile it.
+#[cfg(all(feature = "std", feature = "bindings"))]
 pub fn reconcile_global_byte_matches(
     units: &mut [crate::bindings::report::ReportUnit],
     unit_objs: &[UnitObjs],
@@ -1446,7 +1458,7 @@ pub fn reconcile_global_byte_matches(
     promotions
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "bindings"))]
 fn recalc_unit_measure_percents(m: &mut crate::bindings::report::Measures) {
     m.matched_code_percent =
         if m.total_code == 0 { 100.0 } else { m.matched_code as f32 / m.total_code as f32 * 100.0 };

@@ -80,7 +80,9 @@ std = [
     "num-traits?/std",
     "object/std",
     "prost?/std",
+    "regex?/std",
     "serde?/std",
+    "serde_json?/std",
     "similar?/std",
     "typed-arena?/std",
     "typed-path?/std",
@@ -135,7 +137,13 @@ num-traits = { version = "0.2", default-features = false, optional = true }
 object = { version = "0.37", default-features = false, features = ["read_core", "elf", "coff"] }
 pbjson = { version = "0.8", default-features = false, optional = true }
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
-regex = { version = "1.12", default-features = false, features = [], optional = true }
+# `unicode-perl` is REQUIRED, not optional polish: obj/map_file.rs compiles a
+# pattern using `\s`/`\d`/`\S`, and regex-syntax rejects those classes at
+# Regex::new time when the feature is off. Declaring `features = []` here
+# built fine inside this workspace only because objdiff-cli and objdiff-gui
+# depend on `regex` with default features and cargo unifies them — so the
+# panic was invisible here and fired for the first external consumer.
+regex = { version = "1.12", default-features = false, features = ["unicode-perl"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 similar = { git = "https://github.com/encounter/similar.git", branch = "no_std", default-features = false, features = ["hashbrown"], optional = true }
 typed-path = { version = "0.12", default-features = false, optional = true }
