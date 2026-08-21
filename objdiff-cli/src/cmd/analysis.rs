@@ -5208,6 +5208,294 @@ mod tests {
         }
     }
 
+    /// Which class a given `(target, base)` pair lands in, or `None`.
+    ///
+    /// Written as a helper over the real detector rather than over
+    /// `classify_callee_divergence`, so the test also exercises the grouping
+    /// and the fixability assignment, not just the predicate.
+    fn class_of(target: &str, base: &str) -> Option<(PatternType, Fixability)> {
+        let instructions =
+            vec![make_instr(0, "diff_arg", Some("bl"), Some(target), Some("bl"), Some(base))];
+        let patterns = detect_callee_divergences(&instructions);
+        assert!(patterns.len() <= 1, "one call site produced {} patterns", patterns.len());
+        patterns.first().map(|p| (p.pattern, p.fixability))
+    }
+
+    /// The core of the v4.2.6 fix, with its own negative control: a real fold
+    /// name MUST still be a fold, and the four shapes that are not folds MUST
+    /// NOT be. Weakening either half fails this test rather than no-opping it.
+    ///
+    /// Sabotage check performed when this test was written: restoring the old
+    /// single-pattern detector (every branch filing under LINKER_MERGED) turns
+    /// all five `assert_eq!`s below red except the `merged_` one — which is
+    /// exactly the point, since that one is what proves the fixture is real.
+    #[test]
+    fn callee_divergence_classes_are_split_by_evidence() {
+        // POSITIVE CONTROL. A splitter-synthesised fold name is the only
+        // evidence a diff can carry that ICF happened; it must stay LINKER_MERGED
+        // and stay rarely-hand-fixable.
+        assert_eq!(
+            class_of("merged_82331360", "?Draw@RndDrawable@@UAEXXZ"),
+            Some((PatternType::LinkerMerged, Fixability::RarelyHandFixable)),
+            "a dtk fold name is the one case with evidence behind it"
+        );
+        assert_eq!(
+            class_of("OnlyReturns", "?Poll@Foo@@QAEXXZ"),
+            Some((PatternType::LinkerMerged, Fixability::RarelyHandFixable))
+        );
+
+        // 20.7% of the old population: which save/restore helper you call is
+        // decided by register allocation. MSVC/Xenon spelling...
+        assert_eq!(
+            class_of("__savegprlr_28", "__savegprlr_29"),
+            Some((PatternType::RegisterSaveHelperMismatch, Fixability::RarelyHandFixable)),
+            "__savegprlr_28 vs _29 is regalloc, not a linker fold"
+        );
+        // ...and CodeWarrior/Wii spelling, which v4.2.4's carve-out missed.
+        assert_eq!(
+            class_of("_savegpr_14", "_savegpr_18"),
+            Some((PatternType::RegisterSaveHelperMismatch, Fixability::RarelyHandFixable)),
+            "the carve-out must cover mwcc's single-underscore spelling too"
+        );
+        assert_eq!(
+            class_of("__restfpr_20", "__restfpr_24"),
+            Some((PatternType::RegisterSaveHelperMismatch, Fixability::RarelyHandFixable))
+        );
+
+        // 38.1%: the class this project mines for real bugs. LIKELY fixable.
+        assert_eq!(
+            class_of("?Draw@RndText@@UAEXXZ", "?Draw@RndGroup@@UAEXXZ"),
+            Some((PatternType::WrongCallee, Fixability::LikelyFixable)),
+            "two different real symbols is a wrong callee, and it is fixable"
+        );
+
+        // 37.5%: same template, different arguments -- a source-level type
+        // disagreement, not the linker's address choice.
+        assert_eq!(
+            class_of(
+                "??$ObjRefConcrete@VRndDrawable@@@@QAEXXZ",
+                "??$ObjRefConcrete@VRndGroup@@@@QAEXXZ"
+            ),
+            Some((PatternType::TemplateInstantiationMismatch, Fixability::LikelyFixable))
+        );
+
+        // A name the splitter never recovered: the names disagree, but that is
+        // not evidence the CALLEES disagree.
+        assert_eq!(
+            class_of("fn_82345678", "?Draw@RndText@@UAEXXZ"),
+            Some((PatternType::UnverifiableCalleeName, Fixability::RarelyHandFixable))
+        );
+        assert_eq!(
+            class_of("?Draw@RndText@@UAEXXZ", "vftable_82345678"),
+            Some((PatternType::UnverifiableCalleeName, Fixability::RarelyHandFixable))
+        );
+
+        // 6.3%: MAKESTRING_TEMPLATE_MISMATCH owns these outright.
+        assert_eq!(
+            class_of(
+                "??$MakeString@PBD@@YA?AVString@@PBD0@Z",
+                "??$MakeString@VSymbol@@@@YA?AVString@@PBD0@Z"
+            ),
+            None,
+            "a MakeString instantiation is not a callee-divergence finding"
+        );
+
+        // NEGATIVE CONTROLS for the carve-outs: a real symbol that merely
+        // starts like a helper, or like a placeholder, is still charged.
+        assert_eq!(
+            class_of("__savegprlr_helper", "__savegprlr_other"),
+            Some((PatternType::WrongCallee, Fixability::LikelyFixable)),
+            "the helper carve-out requires an all-digits suffix"
+        );
+        assert_eq!(
+            class_of("fn_process_frame", "fn_process_input"),
+            Some((PatternType::WrongCallee, Fixability::LikelyFixable)),
+            "the placeholder carve-out requires an all-hex suffix"
+        );
+
+        // Not a callee divergence at all.
+        assert_eq!(class_of("?Draw@RndText@@UAEXXZ", "?Draw@RndText@@UAEXXZ"), None);
+        assert_eq!(class_of("0x82331360", "0x82331364"), None, "a bare address is CONTROL_FLOW's");
+    }
+
+    /// One function can carry several classes at once; they must be reported
+    /// separately rather than collapsing into whichever branch ran first.
+    #[test]
+    fn callee_divergences_are_reported_per_class() {
+        let instructions = vec![
+            make_instr(
+                0,
+                "diff_arg",
+                Some("bl"),
+                Some("__savegprlr_28"),
+                Some("bl"),
+                Some("__savegprlr_29"),
+            ),
+            make_instr(
+                1,
+                "diff_arg",
+                Some("bl"),
+                Some("merged_82331360"),
+                Some("bl"),
+                Some("?A@@YAXXZ"),
+            ),
+            make_instr(
+                2,
+                "diff_arg",
+                Some("bl"),
+                Some("?Draw@RndText@@UAEXXZ"),
+                Some("bl"),
+                Some("?Draw@RndGroup@@UAEXXZ"),
+            ),
+            make_instr(
+                3,
+                "diff_arg",
+                Some("bl"),
+                Some("?Draw@RndText@@UAEXXZ"),
+                Some("bl"),
+                Some("?Draw@RndGroup@@UAEXXZ"),
+            ),
+            make_instr(
+                4,
+                "diff_arg",
+                Some("b"),
+                Some("__restgprlr_28"),
+                Some("b"),
+                Some("__restgprlr_29"),
+            ),
+        ];
+        let patterns = detect_callee_divergences(&instructions);
+        let by_type: std::collections::BTreeMap<&str, usize> =
+            patterns.iter().map(|p| (p.pattern.as_str(), p.instruction_count)).collect();
+
+        assert_eq!(by_type.get("LINKER_MERGED"), Some(&1), "only the merged_ site is a fold");
+        assert_eq!(by_type.get("WRONG_CALLEE"), Some(&2));
+        assert_eq!(by_type.get("REGISTER_SAVE_HELPER_MISMATCH"), Some(&2));
+        assert_eq!(by_type.len(), 3);
+
+        // The wrong-callee payload keeps BOTH names -- the old
+        // `ICF:<name> (cross-function merge)` string threw the target's away,
+        // and which side is right is the whole question.
+        let wc = patterns.iter().find(|p| p.pattern == PatternType::WrongCallee).unwrap();
+        let PatternDetails::DivergentCallees { divergent_callees } = &wc.details else {
+            panic!("wrong details type for WRONG_CALLEE");
+        };
+        assert_eq!(divergent_callees.len(), 1);
+        assert_eq!(divergent_callees[0].target_symbol, "?Draw@RndText@@UAEXXZ");
+        assert_eq!(divergent_callees[0].base_symbol, "?Draw@RndGroup@@UAEXXZ");
+        assert_eq!(divergent_callees[0].count, 2);
+    }
+
+    /// The verdict half: a function whose mismatches are wrong callees must not
+    /// be told to accept the match. Control in the same test: the identical
+    /// shape with a real fold name still yields AtLimit.
+    #[test]
+    fn wrong_callee_verdict_is_not_at_limit_but_a_real_fold_still_is() {
+        let wrong_callee_instrs: Vec<_> = (0..5)
+            .map(|i| {
+                make_instr(
+                    i,
+                    "diff_arg",
+                    Some("bl"),
+                    Some("?Draw@RndText@@UAEXXZ"),
+                    Some("bl"),
+                    Some("?Draw@RndGroup@@UAEXXZ"),
+                )
+            })
+            .collect();
+        let analysis = analyze_instructions(&wrong_callee_instrs);
+        assert!(analysis.has_pattern(PatternType::WrongCallee));
+        assert!(!analysis.has_pattern(PatternType::LinkerMerged));
+        let summary = InstructionSummary { total: 10, equal: 5, diff_arg: 5, ..Default::default() };
+        let verdict = compute_verdict(&summary, &analysis, Some(99.0), 100, 100);
+        assert_eq!(
+            verdict.classification,
+            VerdictClassification::LikelyFixable,
+            "wrong callees are the fixable class; explanation was: {}",
+            verdict.explanation
+        );
+
+        // CONTROL: same shape, but the target names a fold. Still at_limit.
+        let merged_instrs: Vec<_> = (0..5)
+            .map(|i| {
+                make_instr(
+                    i,
+                    "diff_arg",
+                    Some("bl"),
+                    Some("merged_82331360"),
+                    Some("bl"),
+                    Some("?Draw@RndGroup@@UAEXXZ"),
+                )
+            })
+            .collect();
+        let merged_analysis = analyze_instructions(&merged_instrs);
+        assert!(merged_analysis.has_pattern(PatternType::LinkerMerged));
+        let merged_verdict = compute_verdict(&summary, &merged_analysis, Some(99.0), 100, 100);
+        assert_eq!(
+            merged_verdict.classification,
+            VerdictClassification::AtLimit,
+            "a real fold is still source-immune; explanation was: {}",
+            merged_verdict.explanation
+        );
+    }
+
+    /// The `has_linker_merged` gate in `compute_verdict` downgrades a MakeString
+    /// finding to an artifact. Until v4.2.6 the MakeString call site was itself
+    /// what made LINKER_MERGED fire, so the finding suppressed itself.
+    #[test]
+    fn makestring_finding_is_not_suppressed_by_its_own_call_site() {
+        let instrs: Vec<_> = (0..3)
+            .map(|i| {
+                make_instr(
+                    i,
+                    "diff_arg",
+                    Some("bl"),
+                    Some("??$MakeString@PBDPBD@@YA?AVString@@PBD00@Z"),
+                    Some("bl"),
+                    Some("??$MakeString@PBDVSymbol@@@@YA?AVString@@PBD00@Z"),
+                )
+            })
+            .collect();
+        let analysis = analyze_instructions(&instrs);
+        assert!(
+            analysis.has_pattern(PatternType::MakeStringTemplateMismatch),
+            "the MakeString detector must still fire"
+        );
+        for class in [
+            PatternType::LinkerMerged,
+            PatternType::WrongCallee,
+            PatternType::TemplateInstantiationMismatch,
+            PatternType::UnverifiableCalleeName,
+        ] {
+            assert!(
+                !analysis.has_pattern(class),
+                "a MakeString call site is not evidence of {}; the MakeString detector owns it",
+                class.as_str()
+            );
+        }
+        let summary = InstructionSummary { total: 6, equal: 3, diff_arg: 3, ..Default::default() };
+        let verdict = compute_verdict(&summary, &analysis, Some(98.0), 100, 100);
+        assert_eq!(
+            verdict.classification,
+            VerdictClassification::LikelyFixable,
+            "explanation was: {}",
+            verdict.explanation
+        );
+
+        // CONTROL: the gate itself is untouched -- add a genuine fold and
+        // `has_linker_merged` is true again, so the downgrade can still happen.
+        let mut with_fold = instrs;
+        with_fold.push(make_instr(
+            3,
+            "diff_arg",
+            Some("bl"),
+            Some("merged_82331360"),
+            Some("bl"),
+            Some("?Draw@RndGroup@@UAEXXZ"),
+        ));
+        assert!(analyze_instructions(&with_fold).has_pattern(PatternType::LinkerMerged));
+    }
+
     #[test]
     fn test_detect_bool_mask() {
         let instructions = vec![
