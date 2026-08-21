@@ -196,6 +196,31 @@ pub enum PatternType {
     /// source-level signedness/width type disagreement (e.g. `char` vs
     /// `unsigned char`, `int` vs `unsigned`, loop-index signedness).
     SignednessMismatch,
+    /// The two sides of this symbol were never asserted to be the same
+    /// function, so every OTHER finding on it is unfalsifiable.
+    ///
+    /// Two things put a symbol here, and the details say which:
+    ///
+    /// * **Byte-signature pairing.** This fork pairs MSVC EH funclets by masked
+    ///   byte signature when name-based matching fails (`pair_funclets_by_bytes`,
+    ///   v4.2.0), because the two sides number funclets independently and dtk's
+    ///   splitter loses the name entirely. Pass 3 of that pairing accepts 50%
+    ///   Hamming equality, so the counterpart routinely belongs to a *different
+    ///   parent function* — one measured pair was `RndRibbon`'s static guard
+    ///   against `RndFont`'s.
+    /// * **A placeholder enclosing name.** `fn_82E4DE20`, `lbl_…`: the splitter
+    ///   never identified the symbol, so there is no name to assert an identity
+    ///   with even if the pairing came from somewhere else.
+    ///
+    /// Deliberately NOT an exemption. The divergence is real — the two operands
+    /// genuinely differ — it is *unfalsifiable*, which is a different thing and
+    /// deserves to stay visible. What it must not do is present as work, so
+    /// every co-detected pattern on the symbol is downgraded to
+    /// [`Fixability::Unverifiable`]. Measured in dc3-decomp under `name_check`
+    /// with 4.2.6: 60 of the 143 LikelyFixable rows had a placeholder enclosing
+    /// symbol, worth 2,140 phantom "recoverable" bytes, and the census lane had
+    /// to hand-filter them.
+    UnverifiablePairing,
 }
 
 impl PatternType {
@@ -227,6 +252,7 @@ impl PatternType {
         PatternType::FselTernary,
         PatternType::FloatToIntToFloat,
         PatternType::SignednessMismatch,
+        PatternType::UnverifiablePairing,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -256,6 +282,7 @@ impl PatternType {
             PatternType::FselTernary => "FSEL_TERNARY",
             PatternType::FloatToIntToFloat => "FLOAT_TO_INT_TO_FLOAT",
             PatternType::SignednessMismatch => "SIGNEDNESS_MISMATCH",
+            PatternType::UnverifiablePairing => "UNVERIFIABLE_PAIRING",
         }
     }
 }
@@ -295,6 +322,16 @@ pub enum Confidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Fixability {
+    /// There is nothing to fix *that we can check*: the enclosing symbol's two
+    /// sides were never asserted to be the same function, so the finding is
+    /// unfalsifiable rather than false. See [`PatternType::UnverifiablePairing`].
+    ///
+    /// This is a separate variant, not a reuse of `RarelyHandFixable`, because
+    /// the two say different things. `RarelyHandFixable` says "hand-editing
+    /// won't converge, now run the permuter" — advice that burns a permuter
+    /// sweep on a diff between two unrelated funclets. `Unverifiable` says the
+    /// question is not answerable from this diff at all.
+    Unverifiable,
     /// Hand-editing is unlikely to converge. Either a genuine artifact
     /// (linker/path-derived) or a compiler decision typically fixed by the
     /// permuter. Run the permuter on the function before classifying as stuck.
@@ -498,6 +535,11 @@ pub enum PatternDetails {
     FloatToIntToFloat { count: usize },
     /// Signed/unsigned instruction-pair mismatches at aligned rows
     SignednessMismatch { mismatches: Vec<SignednessMismatchEntry> },
+    /// The enclosing symbol's pairing is not name-asserted, so nothing found
+    /// inside it is falsifiable. Carries the symbol and WHY, because "the
+    /// splitter never named it" and "objdiff paired it by bytes" are different
+    /// problems with different fixes (split config vs. nothing).
+    UnverifiablePairing { enclosing_symbol: String, reason: &'static str },
 }
 
 /// A detected pattern in the instruction diff.
@@ -1013,6 +1055,16 @@ impl Pattern {
                     total_items: mismatches.len(),
                 }
             }
+            PatternDetails::UnverifiablePairing { enclosing_symbol, reason } => PatternSummary {
+                one_line: format!(
+                    "enclosing symbol `{}` has no asserted identity ({}) — every finding \
+                     below is unfalsifiable, not fixable",
+                    enclosing_symbol, reason
+                ),
+                top_details: vec![],
+                truncated: false,
+                total_items: 1,
+            },
         }
     }
 }
@@ -1323,6 +1375,7 @@ pub fn compute_diff_regions(
                         PatternType::FselTernary => "fsel ternary",
                         PatternType::FloatToIntToFloat => "float-to-int-to-float",
                         PatternType::SignednessMismatch => "signed/unsigned mismatch",
+                        PatternType::UnverifiablePairing => "unverifiable pairing",
                     };
                     note_parts.push(format!("{} {}", region_instr_count, pname));
                 }
@@ -1557,6 +1610,12 @@ fn count_pattern_in_range(pattern: &Pattern, instructions: &[InstructionDiffOutp
             let start_idx = instructions.first().map(|i| i.index).unwrap_or(0);
             let end_idx = instructions.last().map(|i| i.index).unwrap_or(0);
             mismatches.iter().filter(|m| m.index >= start_idx && m.index <= end_idx).count()
+        }
+        // A symbol-level qualifier, not a set of call sites: it covers every
+        // mismatch in the symbol, so within any region it covers every mismatch
+        // in that region.
+        PatternDetails::UnverifiablePairing { .. } => {
+            instructions.iter().filter(|i| i.match_type != "equal").count()
         }
     }
 }
@@ -2199,6 +2258,15 @@ pub fn pattern_doc_links(pattern: PatternType) -> &'static [DocLink] {
         PatternType::SignednessMismatch => {
             &[DocLink::SignedVsUnsignedComparison, DocLink::SignednessWidth]
         }
+        // Deliberately empty. Neither DC3 nor RB3 currently has a pattern
+        // document about funclet byte-signature pairing with a stable anchor,
+        // and the policy on `DocEntry` is that no link beats a wrong one. Every
+        // existing candidate would mislead: the ICF docs say "accept the match,
+        // the linker did this" (it wasn't the linker) and the relocation-name
+        // docs send the reader to `symbols.txt` (naming the symbol would help,
+        // but it is not what makes THIS finding unfalsifiable — pass 3 of the
+        // pairing would still be a 50%-Hamming guess).
+        PatternType::UnverifiablePairing => &[],
     }
 }
 
@@ -4082,7 +4150,90 @@ pub fn detect_signedness_mismatch(instructions: &[InstructionDiffOutput]) -> Opt
 // =============================================================================
 
 /// Run all pattern detection on an instruction diff.
+/// What is known about the IDENTITY of the symbol whose diff is being analysed.
+///
+/// Every detector in this module reads instruction rows and nothing else, which
+/// silently assumes the two sides of the diff are the same source function. For
+/// a name-matched symbol that assumption is an assertion someone made. For a
+/// symbol this fork paired by masked byte signature it is a guess, and pass 3 of
+/// `pair_funclets_by_bytes` accepts 50% Hamming equality — one measured pair was
+/// `RndRibbon`'s static guard against `RndFont`'s.
+///
+/// This type is the fix's whole point, and it sits ABOVE the detectors on
+/// purpose. `classify_callee_divergence` was where the blindness was *measured*
+/// (dc3-decomp, 4.2.6, `name_check`: 60 of 143 LikelyFixable rows had a
+/// placeholder enclosing symbol), but it is not where the blindness *is*:
+/// `analyze_instructions` never received a symbol at all, so REGISTER_SWAP,
+/// OFFSET_SWAP, CONTROL_FLOW and the other 20 detectors are equally free to
+/// report a finding inside a pairing that was never asserted. Fixing only the
+/// callee detector would have left the family.
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolPairing<'a> {
+    /// Name of the symbol being analysed, as it appears in the object.
+    pub enclosing_symbol: &'a str,
+    /// This pair came from the MSVC EH funclet byte-signature fallback rather
+    /// than from a name match — objdiff-core's `SymbolDiff::masked_equal_symbol`.
+    pub masked_pairing: bool,
+}
+
+impl<'a> SymbolPairing<'a> {
+    /// A symbol whose identity IS asserted. The default for callers that have
+    /// no pairing information, and the value every pre-existing test uses.
+    ///
+    /// Reached only through [`analyze_instructions`], which is itself only
+    /// reached from tests — same situation as `detect_linker_merged` and
+    /// `PatternType::ALL`.
+    #[allow(dead_code)]
+    pub const ASSERTED: SymbolPairing<'static> =
+        SymbolPairing { enclosing_symbol: "", masked_pairing: false };
+
+    pub fn new(enclosing_symbol: &'a str, masked_pairing: bool) -> Self {
+        SymbolPairing { enclosing_symbol, masked_pairing }
+    }
+
+    /// Why this symbol's two sides cannot be asserted to be the same function,
+    /// or `None` when they can.
+    ///
+    /// Both arms are needed and neither implies the other. Byte-signature
+    /// pairing catches `__unwind$3` and `??__E…` — real names that
+    /// [`is_placeholder_symbol_name`] rejects — while the placeholder-name arm
+    /// catches a `fn_<hex>` that reached its partner some other way (a manual
+    /// mapping, or `fn_<hex>` present on both sides). The name predicate is
+    /// objdiff-core's, shared with the canonical score's carve-out, so the two
+    /// cannot drift apart the way the duplicated carve-out list did before
+    /// `19ee5fd`.
+    ///
+    /// [`is_placeholder_symbol_name`]: objdiff_core::diff::code::is_placeholder_symbol_name
+    pub fn unverified_reason(&self) -> Option<&'static str> {
+        if self.masked_pairing {
+            return Some("paired by masked byte signature, not by name");
+        }
+        if objdiff_core::diff::code::is_placeholder_symbol_name(self.enclosing_symbol) {
+            return Some("splitter placeholder name — no identity was ever asserted");
+        }
+        None
+    }
+}
+
+/// Analyse a diff whose symbol identity is taken on faith.
+///
+/// Equivalent to [`analyze_instructions_for`] with [`SymbolPairing::ASSERTED`].
+/// Prefer the `_for` variant wherever the symbol is in hand; this exists for
+/// callers (and tests) that are only ever handed rows. Every production call
+/// site in `diff.rs` has the symbol, so today that is the ~50 tests written
+/// before `SymbolPairing` existed — keeping this wrapper is what lets those
+/// keep asserting the un-qualified behaviour.
+#[allow(dead_code)]
 pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis {
+    analyze_instructions_for(instructions, SymbolPairing::ASSERTED)
+}
+
+/// Analyse a diff, qualifying the result by what is known about the symbol's
+/// identity. See [`SymbolPairing`] and [`PatternType::UnverifiablePairing`].
+pub fn analyze_instructions_for(
+    instructions: &[InstructionDiffOutput],
+    pairing: SymbolPairing<'_>,
+) -> Analysis {
     let mut patterns = Vec::new();
 
     // Run all detectors. The callee-divergence detector returns one pattern per
@@ -4153,6 +4304,44 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
     // Count total mismatches
     let total_mismatches = instructions.iter().filter(|i| i.match_type != "equal").count();
 
+    // Qualify the whole result when the two sides were never asserted to be the
+    // same function. This runs AFTER every detector so it can cover all of them
+    // — the blindness is not the callee detector's, it is this function's.
+    //
+    // Gated on `total_mismatches > 0` on purpose. A byte-signature pairing with
+    // zero mismatches has nothing to qualify: there is no finding, and
+    // objdiff-core already discloses the pairing itself as `masked_equal_symbol`.
+    // Without the gate this would fire on every cleanly-paired funclet in the
+    // binary — thousands of rows saying nothing.
+    if total_mismatches > 0
+        && let Some(reason) = pairing.unverified_reason()
+    {
+        // The findings are not withdrawn — they are real rows in a diff — but
+        // none of them is evidence about the SOURCE, so none may present as
+        // work. This is the line that keeps the phantom rows off a worklist
+        // ranked by recoverable bytes.
+        for p in patterns.iter_mut() {
+            p.fixability = Fixability::Unverifiable;
+        }
+        patterns.push(Pattern {
+            pattern: PatternType::UnverifiablePairing,
+            // High: this is a fact about provenance and naming, not an
+            // inference from instruction shape. Nothing about it is uncertain.
+            // (What is uncertain is everything else in the list.)
+            confidence: Confidence::High,
+            // A symbol-level qualifier covers every mismatch in the symbol, so
+            // the residue reported as `unattributed_mismatches` is zero: no
+            // part of this diff is attributable to source.
+            instruction_count: total_mismatches,
+            fixability: Fixability::Unverifiable,
+            details: PatternDetails::UnverifiablePairing {
+                enclosing_symbol: pairing.enclosing_symbol.to_string(),
+                reason,
+            },
+            doc_urls: pattern_doc_urls(PatternType::UnverifiablePairing),
+        });
+    }
+
     // Count attributed mismatches
     let attributed: usize = patterns.iter().map(|p| p.instruction_count).sum();
 
@@ -4188,6 +4377,7 @@ pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis 
             "FSEL_TERNARY",
             "FLOAT_TO_INT_TO_FLOAT",
             "SIGNEDNESS_MISMATCH",
+            "UNVERIFIABLE_PAIRING",
         ],
         unattributed_mismatches: unattributed,
     }
@@ -4257,6 +4447,47 @@ pub fn compute_verdict(
             recommendation: "No action needed.".to_string(),
             suggestions: vec![],
             doc_urls: vec![],
+        };
+    }
+
+    // The two sides may never have been the same function. Answered before any
+    // pattern-shaped question, because every one of them presupposes a "same
+    // function" this symbol does not have — including the two below, which
+    // would otherwise route a byte-signature-paired funclet to
+    // "run the source permuter (~250 builds)" on a diff against unrelated code.
+    if let Some(p) =
+        analysis.patterns.iter().find(|p| p.pattern == PatternType::UnverifiablePairing)
+    {
+        let reason = match &p.details {
+            PatternDetails::UnverifiablePairing { reason, .. } => *reason,
+            _ => "identity not asserted",
+        };
+        factors.push(VerdictFactor {
+            name: "unverifiable_pairing",
+            value: serde_json::json!(true),
+            threshold: None,
+            result: "at_limit_unverifiable",
+        });
+        return Verdict {
+            classification: VerdictClassification::AtLimit,
+            confidence: Confidence::High,
+            explanation: format!(
+                "All {} mismatch(es) are inside a symbol whose two sides were never asserted \
+                 to be the same function ({}). The differences are real; what they mean is not \
+                 decidable from this diff.",
+                total_mismatches, reason
+            ),
+            factors,
+            recommendation: "Do not treat as decomp work and do not run the permuter. If the \
+                 enclosing symbol is a splitter placeholder, naming it in the split config is \
+                 the only move that can turn this into a real finding."
+                .to_string(),
+            suggestions: vec![Suggestion {
+                action: "Name the enclosing symbol in the split config, or ignore this row."
+                    .to_string(),
+                doc_url: None,
+            }],
+            doc_urls: verdict_doc_urls.clone(),
         };
     }
 
@@ -5158,7 +5389,7 @@ mod tests {
         // escaping the spelling check.
         assert_eq!(
             PatternType::ALL.len(),
-            25,
+            26,
             "a PatternType variant was added or removed — \
              add it to PatternType::ALL and update this count"
         );
@@ -7402,5 +7633,271 @@ mod tests {
 
         let verdict = compute_verdict(&summary, &analysis, Some(80.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::MaybeFixable);
+    }
+
+    // =========================================================================
+    // Enclosing-symbol blindness (v4.2.7)
+    //
+    // Every detector in this file reads instruction rows and nothing else, so
+    // until `SymbolPairing` existed they all silently assumed the two sides of
+    // the diff were the same source function. This fork pairs MSVC EH funclets
+    // by MASKED BYTE SIGNATURE when name matching fails, and pass 3 of that
+    // pairing accepts 50% Hamming equality — one measured pair was RndRibbon's
+    // static guard against RndFont's. A "wrong callee" reported across such a
+    // pair is not false, it is UNFALSIFIABLE.
+    //
+    // SABOTAGE LOG — each defect below was reintroduced, the run recorded, then
+    // reverted. `scripts/`-free and reproducible by hand from these notes.
+    //
+    //   S1 `analyze_instructions_for` ignores `pairing` (the original bug).
+    //      RED (4): keeps_the_finding_and_kills_the_fixability, detector_family,
+    //      masked_byte_pairing, never_verdicts_as_work.
+    //   S2 The carve-out is put back INSIDE the callee detector — only the five
+    //      callee classes learn about the enclosing symbol, which is the
+    //      narrow fix this one deliberately is not.
+    //      RED (1): detector_family_not_just_the_callee_one, and ONLY that one.
+    //      That test is the entire argument for fixing this above the detector;
+    //      a callee-only test suite calls S2 a complete fix.
+    //   S3 `unverified_reason` drops its `masked_pairing` arm and goes back to
+    //      checking the name alone.
+    //      RED (1): masked_byte_pairing_is_unverifiable_under_a_real_name.
+    //   S4 The findings are DROPPED instead of downgraded — i.e. the "exempt
+    //      entirely" design this lane rejected.
+    //      RED (3): keeps_the_finding_and_kills_the_fixability, detector_family,
+    //      masked_byte_pairing. Note `never_verdicts_as_work` stays GREEN under
+    //      S4 (dropping the findings also stops them being work), which is why
+    //      the verdict test cannot be the only one.
+    //   S5 The carve-out is widened to fire on every symbol.
+    //      RED (7): every named control here, plus two PRE-EXISTING tests
+    //      (makestring_finding_is_not_suppressed_by_its_own_call_site,
+    //      wrong_callee_verdict_is_not_at_limit_but_a_real_fold_still_is).
+    //      A carve-out that swallows its own control is a failure mode this
+    //      project has shipped before; the controls live inside each test for
+    //      exactly this run.
+    //   S6 The `total_mismatches > 0` gate is removed.
+    //      RED (1): a_clean_pairing_has_no_finding_to_qualify.
+    // =========================================================================
+
+    /// One call site, one genuine wrong callee. The fixture is deliberately the
+    /// same on both runs; only the enclosing symbol changes.
+    fn wrong_callee_fixture() -> Vec<InstructionDiffOutput> {
+        vec![make_instr(
+            0,
+            "diff_arg",
+            Some("bl"),
+            Some("?IsLocal@LocalUser@@UBA_NXZ"),
+            Some("bl"),
+            Some("?DoHueConverge@RndPostProc@@QBA_NXZ"),
+        )]
+    }
+
+    fn find(a: &Analysis, t: PatternType) -> Option<&Pattern> {
+        a.patterns.iter().find(|p| p.pattern == t)
+    }
+
+    /// The exempt-vs-new-class decision, asserted in both directions, with the
+    /// negative control INSIDE the test.
+    ///
+    /// A placeholder enclosing symbol must NOT delete the finding (that would
+    /// be the exemption design, and it hides a row nobody can then audit) and
+    /// must NOT leave it presenting as work (that is the bug: 60 of dc3's 143
+    /// LikelyFixable rows, 2,140 phantom "recoverable" bytes, floated to the
+    /// top of a worklist ranked by recoverable bytes).
+    #[test]
+    fn unverifiable_pairing_keeps_the_finding_and_kills_the_fixability() {
+        let instrs = wrong_callee_fixture();
+
+        // NEGATIVE CONTROL, and it is the whole reason this test can fail
+        // usefully: a real mangled enclosing name must behave exactly as it did
+        // before. If a future widening of the carve-out swallows everything,
+        // this half goes red first.
+        let named = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("?CheckHueConverge@NgPostProc@@IAAXXZ", false),
+        );
+        assert!(
+            find(&named, PatternType::UnverifiablePairing).is_none(),
+            "a named symbol's pairing IS asserted; nothing to qualify"
+        );
+        assert_eq!(
+            find(&named, PatternType::WrongCallee).map(|p| p.fixability),
+            Some(Fixability::LikelyFixable),
+            "the control must still be actionable work"
+        );
+
+        // THE CASE. Same rows, enclosing symbol is a splitter placeholder.
+        let placeholder =
+            analyze_instructions_for(&instrs, SymbolPairing::new("fn_82E4DE20", false));
+        let wc = find(&placeholder, PatternType::WrongCallee)
+            .expect("the finding is UNFALSIFIABLE, not false — it must stay visible");
+        assert_eq!(
+            wc.fixability,
+            Fixability::Unverifiable,
+            "a divergence in an unasserted pairing must not present as fixable work"
+        );
+        assert_ne!(
+            wc.fixability,
+            Fixability::LikelyFixable,
+            "this is the assertion the phantom-worklist bug was hiding behind"
+        );
+        let q = find(&placeholder, PatternType::UnverifiablePairing)
+            .expect("the un-actionability must be stated, not merely implied");
+        assert_eq!(q.confidence, Confidence::High);
+        match &q.details {
+            PatternDetails::UnverifiablePairing { enclosing_symbol, reason } => {
+                assert_eq!(enclosing_symbol, "fn_82E4DE20");
+                assert!(reason.contains("placeholder"), "reason was {reason:?}");
+            }
+            other => panic!("wrong details type: {other:?}"),
+        }
+        assert_eq!(
+            placeholder.unattributed_mismatches, 0,
+            "no part of this diff is attributable to source"
+        );
+    }
+
+    /// The real finding: the blindness is NOT the callee detector's. Any
+    /// detector can fire inside a byte-signature-paired funclet, so the fix has
+    /// to sit above all of them. REGISTER_SWAP is used because it has nothing
+    /// whatever to do with call targets — sabotage S2 (carve-out pushed back
+    /// down into `classify_callee_divergence`) turns THIS test red and leaves
+    /// the callee test green.
+    #[test]
+    fn detector_family_not_just_the_callee_one() {
+        let mut instrs = Vec::new();
+        for rep in 0..MIN_REGISTER_SWAP_OCCURRENCES {
+            instrs.push(make_instr(
+                rep,
+                "diff_arg",
+                Some("add"),
+                Some("r30, r3, r4"),
+                Some("add"),
+                Some("r31, r3, r4"),
+            ));
+        }
+
+        // Control: named enclosing symbol, ordinary regswap fixability.
+        let named = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("?Draw@RndDrawable@@UAAXXZ", false),
+        );
+        let control = find(&named, PatternType::RegisterSwap)
+            .expect("fixture must actually produce a register swap");
+        assert_ne!(
+            control.fixability,
+            Fixability::Unverifiable,
+            "the control must keep its normal fixability, or the carve-out ate everything"
+        );
+
+        // The case: same rows, placeholder enclosing symbol.
+        let placeholder =
+            analyze_instructions_for(&instrs, SymbolPairing::new("fn_82A1B2C0", false));
+        assert_eq!(
+            find(&placeholder, PatternType::RegisterSwap).map(|p| p.fixability),
+            Some(Fixability::Unverifiable),
+            "REGISTER_SWAP is not a callee pattern, and it is just as unfalsifiable here"
+        );
+        assert!(find(&placeholder, PatternType::UnverifiablePairing).is_some());
+    }
+
+    /// The name check alone is not enough, and this locks the second arm.
+    ///
+    /// `__unwind$3` and `??__E…` are REAL names — `is_placeholder_symbol_name`
+    /// rejects both — yet `is_funclet_like` makes them eligible for byte-
+    /// signature pairing, so their partner can still be unrelated code. The
+    /// provenance flag (objdiff-core's `masked_equal_symbol`) is what catches
+    /// them. The control is the same name WITHOUT the flag: a name-matched
+    /// `__unwind$3` is asserted and must behave normally.
+    #[test]
+    fn masked_byte_pairing_is_unverifiable_under_a_real_name() {
+        let instrs = wrong_callee_fixture();
+
+        let name_matched =
+            analyze_instructions_for(&instrs, SymbolPairing::new("__unwind$3", false));
+        assert!(
+            find(&name_matched, PatternType::UnverifiablePairing).is_none(),
+            "a name-matched funclet IS asserted; the flag is what makes it not"
+        );
+        assert_eq!(
+            find(&name_matched, PatternType::WrongCallee).map(|p| p.fixability),
+            Some(Fixability::LikelyFixable)
+        );
+
+        let byte_paired = analyze_instructions_for(&instrs, SymbolPairing::new("__unwind$3", true));
+        let q = find(&byte_paired, PatternType::UnverifiablePairing)
+            .expect("byte-signature pairing must be caught even under a real name");
+        match &q.details {
+            PatternDetails::UnverifiablePairing { reason, .. } => {
+                assert!(reason.contains("byte signature"), "reason was {reason:?}");
+            }
+            other => panic!("wrong details type: {other:?}"),
+        }
+        assert_eq!(
+            find(&byte_paired, PatternType::WrongCallee).map(|p| p.fixability),
+            Some(Fixability::Unverifiable)
+        );
+    }
+
+    /// A clean pairing with nothing wrong has nothing to qualify. Without this
+    /// gate the pattern fires on every cleanly-paired funclet in the binary —
+    /// thousands of rows that say only "objdiff paired this by bytes", which
+    /// objdiff-core already discloses as `masked_equal_symbol`.
+    #[test]
+    fn a_clean_pairing_has_no_finding_to_qualify() {
+        let instrs = vec![make_instr(0, "equal", Some("blr"), Some(""), Some("blr"), Some(""))];
+        let a = analyze_instructions_for(&instrs, SymbolPairing::new("fn_82E4DE20", true));
+        assert!(
+            find(&a, PatternType::UnverifiablePairing).is_none(),
+            "zero mismatches means there is no finding to call unfalsifiable"
+        );
+        assert!(a.patterns.is_empty());
+    }
+
+    /// The verdict must not send anyone to work on this — by hand OR with the
+    /// permuter. A 1-mismatch funclet used to fall straight through to
+    /// `total_mismatches < MIN_MISMATCH_FOR_ANALYSIS` => LikelyFixable.
+    #[test]
+    fn unverifiable_pairing_never_verdicts_as_work() {
+        let instrs = wrong_callee_fixture();
+        let summary = InstructionSummary::from_instructions(&instrs);
+
+        // Control first: identical rows under a named symbol still route to a
+        // work-shaped verdict, so a green result below means the qualifier
+        // fired, not that the fixture was inert.
+        let named = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("?CheckHueConverge@NgPostProc@@IAAXXZ", false),
+        );
+        let control = compute_verdict(&summary, &named, Some(99.9), 180, 180);
+        assert_eq!(control.classification, VerdictClassification::LikelyFixable);
+
+        let placeholder =
+            analyze_instructions_for(&instrs, SymbolPairing::new("fn_82E4DE20", false));
+        let verdict = compute_verdict(&summary, &placeholder, Some(100.0), 44, 44);
+        assert_eq!(
+            verdict.classification,
+            VerdictClassification::AtLimit,
+            "an unfalsifiable finding is not fixable work"
+        );
+        assert!(
+            !verdict.recommendation.to_lowercase().contains("run the source permuter"),
+            "permuting a diff against unrelated code burns ~250 builds: {}",
+            verdict.recommendation
+        );
+        assert!(verdict.factors.iter().any(|f| f.name == "unverifiable_pairing"));
+    }
+
+    /// `analyze_instructions` is the no-information wrapper the pre-existing
+    /// tests use. It must keep meaning "identity asserted", or ~50 tests would
+    /// change behaviour silently.
+    #[test]
+    fn the_bare_wrapper_still_means_identity_asserted() {
+        let a = analyze_instructions(&wrong_callee_fixture());
+        assert!(find(&a, PatternType::UnverifiablePairing).is_none());
+        assert_eq!(
+            find(&a, PatternType::WrongCallee).map(|p| p.fixability),
+            Some(Fixability::LikelyFixable)
+        );
+        assert!(SymbolPairing::ASSERTED.unverified_reason().is_none());
     }
 }

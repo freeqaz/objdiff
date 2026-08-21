@@ -1146,7 +1146,12 @@ fn run_json(
 
     // Run pattern analysis if requested
     let analysis = if wants_analyze {
-        instructions.as_ref().map(|instrs| super::analysis::analyze_instructions(instrs))
+        instructions.as_ref().map(|instrs| {
+            super::analysis::analyze_instructions_for(
+                instrs,
+                super::analysis::SymbolPairing::new(&symbol.name, symbol_diff.masked_equal_symbol),
+            )
+        })
     } else {
         None
     };
@@ -2194,7 +2199,13 @@ fn run_batch(args: Args) -> Result<()> {
                                 &diff_config,
                             )?;
                             let fb_summary = InstructionSummary::from_instructions(&fb_instrs);
-                            let fb_analysis = super::analysis::analyze_instructions(&fb_instrs);
+                            let fb_analysis = super::analysis::analyze_instructions_for(
+                                &fb_instrs,
+                                super::analysis::SymbolPairing::new(
+                                    &symbol.name,
+                                    fb_sd.masked_equal_symbol,
+                                ),
+                            );
                             let fb_verdict = super::analysis::compute_verdict(
                                 &fb_summary,
                                 &fb_analysis,
@@ -2269,7 +2280,13 @@ fn run_batch(args: Args) -> Result<()> {
                 )?;
 
                 let instruction_summary = InstructionSummary::from_instructions(&instructions);
-                let analysis = super::analysis::analyze_instructions(&instructions);
+                let analysis = super::analysis::analyze_instructions_for(
+                    &instructions,
+                    super::analysis::SymbolPairing::new(
+                        &symbol.name,
+                        symbol_diff.masked_equal_symbol,
+                    ),
+                );
                 let verdict = super::analysis::compute_verdict(
                     &instruction_summary,
                     &analysis,
@@ -2989,7 +3006,10 @@ pub fn analyze_symbol(
 
     // Compute summary, analysis, verdict
     let instruction_summary = InstructionSummary::from_instructions(&instructions);
-    let analysis = super::analysis::analyze_instructions(&instructions);
+    let analysis = super::analysis::analyze_instructions_for(
+        &instructions,
+        super::analysis::SymbolPairing::new(&symbol.name, symbol_diff.masked_equal_symbol),
+    );
     let verdict = super::analysis::compute_verdict(
         &instruction_summary,
         &analysis,
