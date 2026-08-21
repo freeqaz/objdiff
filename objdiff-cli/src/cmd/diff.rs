@@ -2202,7 +2202,7 @@ fn run_batch(args: Args) -> Result<()> {
                             let fb_analysis = super::analysis::analyze_instructions_for(
                                 &fb_instrs,
                                 super::analysis::SymbolPairing::new(
-                                    symbol_name,
+                                    &symbol.name,
                                     fb_sd.masked_equal_symbol,
                                 ),
                             );
@@ -2283,7 +2283,7 @@ fn run_batch(args: Args) -> Result<()> {
                 let analysis = super::analysis::analyze_instructions_for(
                     &instructions,
                     super::analysis::SymbolPairing::new(
-                        symbol_name,
+                        &symbol.name,
                         symbol_diff.masked_equal_symbol,
                     ),
                 );
