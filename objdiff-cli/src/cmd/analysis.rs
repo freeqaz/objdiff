@@ -1640,6 +1640,27 @@ pub enum VerdictClassification {
     NeedsInvestigation,
     /// Base has no code (unimplemented stub)
     Stub,
+    /// **Nothing was measured.** There were no instruction rows to examine, so
+    /// no statement about fixability is possible.
+    ///
+    /// This is not a degree of "fixable" — it is the absence of a measurement,
+    /// and it exists because the alternative was reporting it as [`Complete`].
+    /// `total_mismatches == summary.total - summary.equal` is `0` when
+    /// `summary.total` is `0`, so an empty instruction list used to arrive at
+    /// the `Complete` arm and be published as `COMPLETE` / `High` /
+    /// "Function matches 100%." / "No action needed."
+    ///
+    /// Measured on dc3-decomp 2026-08-22, `??_7UIListSubList@@6B@` with
+    /// `--include-data --verdict`: the data diff in the SAME document reported
+    /// `match_percent: 73.07`, 4 mismatched bytes and two wrong vtable slots
+    /// (`??_G` vs `??_E`, `OnlyReturns` vs `?RefOwner@Object@Hmx@@UBAPAV12@XZ`)
+    /// while `instruction_summary.mismatch_percent` read `100.0` and
+    /// `canonical_match_percent` was `null`. Three numbers, one document, and
+    /// the verdict — the field an agent reads — was the only one that said the
+    /// symbol was fine.
+    ///
+    /// [`Complete`]: VerdictClassification::Complete
+    NotMeasured,
 }
 
 /// A factor that contributed to the verdict.
@@ -4432,6 +4453,54 @@ pub fn compute_verdict(
         urls.into_iter().collect()
     };
 
+    // NOTHING WAS MEASURED. Must precede the `total_mismatches == 0` arm below,
+    // which it would otherwise fall into: `total - equal` is 0 when `total` is
+    // 0, so "no rows" and "every row equal" were indistinguishable and both
+    // published as "Function matches 100%." with `Confidence::High`.
+    //
+    // Reached by any symbol with no instruction rows:
+    //   * every DATA symbol — `diff_data_symbol` fills `data_rows` and never
+    //     `instruction_rows`, so a vtable at 73% with wrong slots landed here;
+    //   * both symbol indices absent (`build_instruction_diffs` returns an
+    //     empty vec for `(None, None)`);
+    //   * both sides size 0, which slips past the `Stub` guard above because
+    //     that requires `target_size > 0`.
+    //
+    // `match_percent` is consulted here and NOT in the `Complete` arm, which is
+    // the other half of the defect: the parameter was accepted and never read,
+    // so a `None` percent (never measured) and a `Some(100.0)` percent produced
+    // identical verdicts.
+    if summary.total == 0 {
+        return Verdict {
+            classification: VerdictClassification::NotMeasured,
+            confidence: Confidence::High,
+            explanation: match match_percent {
+                Some(pct) => format!(
+                    "No instruction rows to analyse — this is not a code-symbol comparison. \
+                     The symbol's own match percent is {pct:.2}%; read that, the data diff \
+                     (--include-data) or the section score instead. No fixability verdict \
+                     is possible from an empty instruction list."
+                ),
+                None => "No instruction rows to analyse, and no match percent was produced \
+                         either — nothing about this symbol was measured. Common causes: it \
+                         is a data symbol (use --include-data), or it exists on only one \
+                         side. This is the absence of a result, not a passing one."
+                    .to_string(),
+            },
+            factors: vec![VerdictFactor {
+                name: "instruction_rows",
+                value: serde_json::json!(0),
+                threshold: None,
+                result: "not_measured",
+            }],
+            recommendation: "Do not read this as a match. Measure the symbol on a surface \
+                             that applies to it."
+                .to_string(),
+            suggestions: vec![],
+            doc_urls: vec![],
+        };
+    }
+
     // Check for complete match
     if total_mismatches == 0 {
         return Verdict {
@@ -5931,6 +6000,94 @@ mod tests {
 
         let verdict = compute_verdict(&summary, &analysis, Some(100.0), 100, 100);
         assert_eq!(verdict.classification, VerdictClassification::Complete);
+    }
+
+    /// An empty instruction list is NOT a match, and the assertion that catches
+    /// a regression is the one on `Complete` — not merely "some verdict came
+    /// back".
+    ///
+    /// Sabotage that must turn this RED (verified 2026-08-22 by deleting the
+    /// `summary.total == 0` arm from `compute_verdict`): with the arm removed,
+    /// `total_mismatches = 0 - 0 = 0` falls into the `Complete` arm, and this
+    /// test fails on `assert_ne!(..., Complete)` with
+    /// "an empty instruction list must never be reported as a match".
+    ///
+    /// The NEGATIVE CONTROLS live inside the test on purpose. Asserting only
+    /// "empty ⇒ not Complete" is equally satisfied by a `compute_verdict` that
+    /// has been broken into never returning `Complete` at all, which is exactly
+    /// how a widened carve-out swallows its own control. So the same test also
+    /// pins the two neighbouring inputs that MUST still classify as before.
+    #[test]
+    fn empty_instruction_list_is_not_a_match() {
+        let no_patterns = Analysis {
+            patterns: vec![],
+            patterns_checked: vec!["LINKER_MERGED"],
+            unattributed_mismatches: 0,
+        };
+
+        // --- the defect -------------------------------------------------
+        // A data symbol: no instruction rows, and a real, poor match percent
+        // measured on another surface. This is `??_7UIListSubList@@6B@`.
+        let empty = InstructionSummary { total: 0, equal: 0, ..Default::default() };
+        let v = compute_verdict(&empty, &no_patterns, Some(73.07), 132, 132);
+        assert_ne!(
+            v.classification,
+            VerdictClassification::Complete,
+            "an empty instruction list must never be reported as a match"
+        );
+        assert_eq!(v.classification, VerdictClassification::NotMeasured);
+        assert!(
+            v.explanation.contains("73.07"),
+            "the real percent must reach the reader; `match_percent` was accepted and \
+             never consulted before. Got: {}",
+            v.explanation
+        );
+
+        // Nothing measured on ANY surface: no rows and no percent either.
+        let v = compute_verdict(&empty, &no_patterns, None, 0, 0);
+        assert_eq!(
+            v.classification,
+            VerdictClassification::NotMeasured,
+            "both sides size 0 slips past the Stub guard (which needs target_size > 0) \
+             and must not land on Complete"
+        );
+
+        // --- NEGATIVE CONTROL 1 -----------------------------------------
+        // A real, non-empty, fully equal code symbol must STILL be Complete.
+        // If this breaks, the guard above has been widened into swallowing
+        // every genuine match and the assertions above would still pass.
+        let all_equal = InstructionSummary { total: 10, equal: 10, ..Default::default() };
+        assert_eq!(
+            compute_verdict(&all_equal, &no_patterns, Some(100.0), 100, 100).classification,
+            VerdictClassification::Complete,
+            "NEGATIVE CONTROL: a genuine 10/10 match must still be Complete"
+        );
+
+        // --- NEGATIVE CONTROL 2 -----------------------------------------
+        // A real mismatch must still be classified as work, not as unmeasured.
+        let mismatched =
+            InstructionSummary { total: 10, equal: 5, diff_arg: 5, ..Default::default() };
+        let v = compute_verdict(&mismatched, &no_patterns, Some(50.0), 100, 100);
+        assert_ne!(
+            v.classification,
+            VerdictClassification::NotMeasured,
+            "NEGATIVE CONTROL: 5 real mismatches were measured; that is a result"
+        );
+        assert_ne!(
+            v.classification,
+            VerdictClassification::Complete,
+            "NEGATIVE CONTROL: 5 real mismatches are not a match"
+        );
+
+        // --- NEGATIVE CONTROL 3 -----------------------------------------
+        // The Stub guard runs BEFORE the new arm and must keep doing so: an
+        // unimplemented function has no rows either, and calling it
+        // "not measured" would lose a real, correct diagnosis.
+        assert_eq!(
+            compute_verdict(&empty, &no_patterns, None, 0, 96).classification,
+            VerdictClassification::Stub,
+            "NEGATIVE CONTROL: base 0 / target 96 is a stub, not an unmeasured symbol"
+        );
     }
 
     #[test]

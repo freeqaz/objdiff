@@ -103,6 +103,26 @@ message ReportProvenance {
   // Read a missing counter as 0, not as "unknown".)
   uint32 cache_hits = 10;
   uint32 cache_misses = 11;
+  // Units DECLARED in the project config but absent from this report:
+  // `measures.total_units + skipped_units` is the declared count.
+  //
+  // This exists because `total_units` is "units that SURVIVED". `report_object`
+  // returns `Ok(None)` for a unit with no target object (and not `complete`) or
+  // with neither object, the `None`s are flattened away, and the only trace was
+  // a `warn!` line on stderr. Nothing in the report said the denominator had
+  // shrunk, so a build that lost three quarters of its units produced a
+  // perfectly well-formed report -- measured 2026-08-22: 4 units declared, 3
+  // skipped, `total_units: 1`, exit 0, and the string "skip" appeared nowhere
+  // in the JSON.
+  //
+  // The declared count is deliberately NOT a second field. proto3 JSON omits
+  // zero-valued scalars, so a project that skips nothing -- dc3-decomp skips 0
+  // of its 2,224 -- writes no key at all and its report.json is byte-identical
+  // across this change, which is the control the release gate runs. A
+  // `declared_units` field would be non-zero for every project and would move
+  // every report on a change that measures nothing. Read a missing counter
+  // as 0, not as "unknown".
+  uint32 skipped_units = 12;
 }
 
 // Progress info for a report or unit
