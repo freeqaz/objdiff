@@ -565,6 +565,12 @@ fn generate(args: GenerateArgs) -> Result<()> {
             )
         })
         .collect::<Vec<_>>();
+    // Refuse a project whose config pairs objects with themselves before any
+    // measuring starts. `target_dir == base_dir` makes every unit a self-diff,
+    // which scores 100% by construction; the resulting report is a perfect
+    // score that nothing produced. See `cmd::self_diff`.
+    crate::cmd::diff::check_project_self_diff(objects.iter().map(|(c, _)| c), "report generate")?;
+
     info!(
         "Generating report for {} units (using {} threads)",
         objects.len(),

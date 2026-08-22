@@ -47,7 +47,7 @@ use serde::Serialize;
 use typed_path::{Utf8PlatformPath, Utf8PlatformPathBuf};
 
 use crate::{
-    cmd::apply_config_args,
+    cmd::{apply_config_args, self_diff},
     util::term::crossterm_panic_handler,
     views::{EventControlFlow, EventResult, UiView, function_diff::FunctionDiffUi},
 };
@@ -211,6 +211,40 @@ pub struct DiffOutput {
     /// Byte/relocation diff for data symbols (populated with --include-data).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_diff: Option<DataDiffOutput>,
+    /// Present ONLY when this row came from an object diffed against itself
+    /// (`--allow-self-diff`). Its presence is the reason every match percent
+    /// and `diff_score` are absent: a self-diff scores 100% by construction and
+    /// so cannot report a problem. Absent on every ordinary row, so old
+    /// consumers are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_diff: Option<SelfDiffOutput>,
+}
+
+/// Disclosure block for a self-diff. Carries no score, on purpose.
+#[derive(Serialize)]
+pub struct SelfDiffOutput {
+    /// Why the two sides are the same object.
+    pub reason: String,
+    /// Always `true`. A machine-readable "there is no measurement here" that a
+    /// consumer can test without string-matching `reason`.
+    pub scores_withheld: bool,
+}
+
+impl DiffOutput {
+    /// Strip every score from a self-diff row and replace it with a disclosure.
+    ///
+    /// Not `#[cfg(test)]`-only and not inlined at the call site: batch mode
+    /// needs the identical treatment, and two hand-written copies of "clear
+    /// these five fields" is how one of them ends up clearing four.
+    pub fn suppress_scores_for_self_diff(&mut self, kind: self_diff::SelfDiffKind) {
+        self.fuzzy_match_percent = None;
+        self.normalized_match_percent = None;
+        self.canonical_match_percent = None;
+        self.raw_match_percent = None;
+        self.diff_score = None;
+        self.self_diff =
+            Some(SelfDiffOutput { reason: kind.reason().to_string(), scores_withheld: true });
+    }
 }
 
 #[derive(Serialize)]
@@ -539,6 +573,11 @@ pub struct Args {
     #[argp(switch)]
     /// Batch mode: read symbols from stdin (one per line), group by unit, output JSONL
     batch: bool,
+    #[argp(switch)]
+    /// Permit diffing an object against itself, for reading its listing. Every
+    /// match percent and the diff score are OMITTED (a self-diff scores 100% by
+    /// construction); -f markdown, json and json-pretty only.
+    allow_self_diff: bool,
 }
 
 /// Resolve a `-u` / `--unit` argument to a position in `names`.
@@ -780,6 +819,20 @@ pub fn run(args: Args) -> Result<()> {
 
     let output_format = DiffOutputFormat::from_option(args.format.as_deref())?;
 
+    // Refuse to score an object against itself. See `cmd::self_diff` for the
+    // measurement and the four aliasing routes this covers.
+    //
+    // Placed AFTER path resolution so it covers the project form (`-p`/`-u`,
+    // where the two paths come from `objdiff.json`) as well as the explicit
+    // `-1`/`-2` form, and BEFORE `--build`, so a refused invocation does not
+    // first spend a compile.
+    let self_diff = detect_self_diff_for_pair(
+        target_path.as_deref(),
+        base_path.as_deref(),
+        args.allow_self_diff,
+        output_format,
+    )?;
+
     // Run the build if requested (builds the base/decompiled object, not the
     // target/reference).
     //
@@ -919,8 +972,58 @@ pub fn run(args: Args) -> Result<()> {
                 unit_options,
                 output_format,
                 project_dir,
+                self_diff,
             )
         }
+    }
+}
+
+/// Decide what to do about a target/base pair that turns out to be one object.
+///
+/// Returns `Ok(None)` for a normal pair, `Ok(Some(kind))` when the caller opted
+/// in and the scores must be suppressed downstream, and `Err` otherwise.
+///
+/// `--allow-self-diff` is honoured only for the formats whose scores this
+/// process can actually withhold — markdown, json and json-pretty, all of which
+/// are rendered from a `DiffOutput` we build here. The TUI paints its match
+/// percent from `ObjectDiff` deep inside the view layer and the proto format is
+/// a serialisation of `DiffResult` itself; neither has a chokepoint at which a
+/// score can be omitted, so for those the flag is refused rather than accepted
+/// and quietly ignored. A flag that is accepted and does nothing is the failure
+/// mode this whole change is about.
+fn detect_self_diff_for_pair(
+    target_path: Option<&Utf8PlatformPath>,
+    base_path: Option<&Utf8PlatformPath>,
+    allow: bool,
+    output_format: DiffOutputFormat,
+) -> Result<Option<self_diff::SelfDiffKind>> {
+    let (Some(target), Some(base)) = (target_path, base_path) else {
+        // A single-sided diff already reports no percent at all; nothing to guard.
+        return Ok(None);
+    };
+    let Some(kind) = self_diff::detect(target.as_str(), base.as_str(), self_diff::Depth::Contents)
+        .with_context(|| format!("Checking whether {} and {} are the same object", target, base))?
+    else {
+        return Ok(None);
+    };
+
+    if !allow {
+        return Err(self_diff::refuse_explicit_pair(kind, target.as_str(), base.as_str()));
+    }
+    match output_format {
+        DiffOutputFormat::Json | DiffOutputFormat::JsonPretty | DiffOutputFormat::Markdown => {
+            Ok(Some(kind))
+        }
+        DiffOutputFormat::Tui | DiffOutputFormat::Proto => bail!(
+            "--allow-self-diff is not supported with -f {}: this format's match percent\n\
+             cannot be withheld, and a self-diff's 100% is meaningless ({reason}).\n\
+             Use -f markdown, json or json-pretty, or drop -2 to read one object's listing.",
+            match output_format {
+                DiffOutputFormat::Tui => "tui",
+                _ => "proto",
+            },
+            reason = kind.reason(),
+        ),
     }
 }
 
@@ -1013,6 +1116,7 @@ fn run_json(
     unit_options: Option<ProjectOptions>,
     output_format: DiffOutputFormat,
     project_dir: Option<Utf8PlatformPathBuf>,
+    self_diff: Option<self_diff::SelfDiffKind>,
 ) -> Result<()> {
     use objdiff_core::diff::{DiffSide, diff_objs};
 
@@ -1268,7 +1372,7 @@ fn run_json(
     };
 
     // Build the output
-    let output = DiffOutput {
+    let mut output = DiffOutput {
         symbol: symbol_name.clone(),
         demangled: symbol.demangled_name.clone(),
         unit: args.unit.clone(),
@@ -1300,7 +1404,18 @@ fn run_json(
         reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
         masked_equal_symbol: symbol_diff.masked_equal_symbol,
         data_diff,
+        self_diff: None,
     };
+
+    // `--allow-self-diff`: keep the listing, withhold the number. The four
+    // percent fields and `diff_score` are `Option` with
+    // `skip_serializing_if = "Option::is_none"`, so this makes them ABSENT
+    // rather than zero -- the same shape a single-sided `diff -1 X <sym>`
+    // already produces, and a shape that makes a consumer indexing
+    // `d["canonical_match_percent"]` raise instead of quietly reading 100.
+    if let Some(kind) = self_diff {
+        output.suppress_scores_for_self_diff(kind);
+    }
 
     // Create markdown options
     let md_options = MarkdownOptions {
@@ -1496,9 +1611,26 @@ fn check_batch_args(args: &Args) -> Result<()> {
         full_listing: _, // honoured: implies instructions, as in one-shot
         concise: _,      // inert: markdown rendering only, as in `-f json`
         batch: _,        // read by `run` to get here
+        allow_self_diff,
     } = args;
 
     let mut refused: Vec<(&str, &str)> = Vec::new();
+
+    // `--allow-self-diff` buys a scoreless LISTING of one object. Batch mode
+    // emits nothing but scores, over many symbols at once, so there is no
+    // listing for the flag to preserve — honouring it here could only mean
+    // "emit a whole JSONL file with every percent withheld", which is an empty
+    // measurement wearing a result's shape. Batch is instead guarded at the
+    // project config (`check_project_self_diff`), which the flag cannot
+    // override: a bulk score run must never be scoring objects against
+    // themselves, opt-in or not.
+    if *allow_self_diff {
+        refused.push((
+            "--allow-self-diff",
+            "batch mode emits scores, not listings, so there is nothing for this flag \
+             to preserve; drop --batch to read a single object's listing",
+        ));
+    }
 
     // The object pair. Worse than the `-u` failure, because batch resolves
     // through the project and answers from whatever unit its index picked:
@@ -1571,6 +1703,39 @@ fn check_batch_args(args: &Args) -> Result<()> {
     bail!("--batch does not support these flags and would silently ignore them:\n{}", detail)
 }
 
+/// Refuse a project whose configuration pairs objects with themselves.
+///
+/// The configuration form of the self-diff is strictly worse than the
+/// command-line form: `target_dir == base_dir` in `objdiff.json` makes EVERY
+/// unit a self-diff at once, so the whole project measures 100% and nothing
+/// anywhere complains. Unlike `-1 X -2 X`, no human typed it, so there is no
+/// one to notice.
+///
+/// Metadata depth only — see `self_diff::SelfDiffKind::is_metadata_only`. A
+/// content comparison here would read every object in the build tree twice on
+/// every invocation, and the configuration mistake this catches is always an
+/// aliasing one.
+pub fn check_project_self_diff<'a>(
+    objects: impl IntoIterator<Item = &'a ObjectConfig>,
+    command: &str,
+) -> Result<()> {
+    let pairs: Vec<(&str, Option<&str>, Option<&str>)> = objects
+        .into_iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.target_path.as_ref().map(|p| p.as_str()),
+                c.base_path.as_ref().map(|p| p.as_str()),
+            )
+        })
+        .collect();
+    let found = self_diff::check_object_pairs(pairs);
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(self_diff::refuse_project_config(&found, command))
+}
+
 /// Is an unplaceable symbol `not_in_unit` (as opposed to `not_found`)?
 ///
 /// Only a SCOPED run can produce `not_in_unit`, and only for a symbol the
@@ -1637,6 +1802,8 @@ fn run_batch(args: Args) -> Result<()> {
         .collect();
 
     // Build a lookup config for demangling during symbol resolution
+    check_project_self_diff(object_configs.values().map(|(c, _)| c), "diff --batch")?;
+
     let mut lookup_config = DiffObjConfig {
         function_reloc_diffs: diff::FunctionRelocDiffs::DataValue,
         ..Default::default()
@@ -2261,6 +2428,10 @@ fn run_batch(args: Args) -> Result<()> {
                                 reloc_ignored_rows: fb_sd.reloc_ignored_rows,
                                 masked_equal_symbol: fb_sd.masked_equal_symbol,
                                 data_diff: None,
+                                // Unreachable: batch refuses --allow-self-diff
+                                // and `check_project_self_diff` has already
+                                // rejected a self-paired project config.
+                                self_diff: None,
                             };
                             lines.push(serde_json::to_string(&output)?);
                             continue;
@@ -2348,6 +2519,8 @@ fn run_batch(args: Args) -> Result<()> {
                     reloc_ignored_rows: symbol_diff.reloc_ignored_rows,
                     masked_equal_symbol: symbol_diff.masked_equal_symbol,
                     data_diff: None,
+                    // Unreachable: see the sibling site above.
+                    self_diff: None,
                 };
 
                 lines.push(serde_json::to_string(&output)?);
@@ -3078,6 +3251,21 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
     let mut md = String::new();
 
     let display_name = output.demangled.as_ref().unwrap_or(&output.symbol);
+
+    // Self-diff banner, FIRST, before any heading, in both concise and full
+    // mode. Suppressing the percent fields already stops markdown printing a
+    // number (the header falls back to `# {name}` when they are all `None`),
+    // but an absent number reads like an ordinary unmatched symbol. This says
+    // out loud that there is no measurement in this document.
+    if let Some(sd) = &output.self_diff {
+        writeln!(md, "> **SELF-DIFF — NO MATCH PERCENT IN THIS OUTPUT.**").unwrap();
+        writeln!(md, "> This object was diffed against itself ({}), which scores", sd.reason)
+            .unwrap();
+        writeln!(md, "> 100% by construction. Every match percent and the diff score have been")
+            .unwrap();
+        writeln!(md, "> withheld; the listing below is a disassembly, not a comparison.").unwrap();
+        writeln!(md).unwrap();
+    }
 
     if options.concise {
         // --- Concise mode: compact ~10-15 line output ---
@@ -4175,6 +4363,7 @@ mod tests {
             full_listing: false,
             concise: false,
             batch: true,
+            allow_self_diff: false,
         }
     }
 
@@ -4660,6 +4849,7 @@ mod tests {
             reloc_ignored_rows: 0,
             masked_equal_symbol: false,
             data_diff: None,
+            self_diff: None,
         }
     }
 
