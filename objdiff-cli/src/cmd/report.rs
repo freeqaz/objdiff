@@ -3267,6 +3267,110 @@ mod tests {
         );
     }
 
+    /// Every `ObjectConfig` field `report_object` reads must move the cache key.
+    ///
+    /// `metadata.complete` is the load-bearing one: it substitutes 100% for a
+    /// measurement on every section and every symbol of a unit, and it was not
+    /// in the key, so toggling it re-served the previous `ReportUnit` verbatim.
+    /// End-to-end on the 4.2.7 binary, one `-o`, objs and config untouched:
+    /// `complete:false` → `complete_code 0`; flip to `true` → cache HIT,
+    /// `complete_code` still 0; `--no-cache` on that same config →
+    /// `complete_code 2452`, `complete_code_percent 100.0`.
+    ///
+    /// Sabotage that must turn this RED (verified 2026-08-22 by deleting the
+    /// `object.metadata.complete` entry from the flag array in `hash_unit`):
+    /// the `metadata.complete` case below fails with
+    /// "metadata.complete substitutes 100% for a measurement...".
+    ///
+    /// The NEGATIVE CONTROL is inside the test because every positive assertion
+    /// here is `assert_ne!` on a hash — and `assert_ne!` on hashes is satisfied
+    /// just as well by a key that mixes in fresh entropy on every call, which
+    /// would silently disable the cache entirely while looking maximally
+    /// correct. The control pins that two identical configs still collide.
+    #[test]
+    fn test_hash_unit_key_covers_the_fields_that_fabricate_a_score() {
+        let global = key_global();
+        let config = report_base_diff_config();
+        let hash = |o: &ObjectConfig| ReportCache::hash_unit(o, &config, &global);
+
+        let base = ObjectConfig::default();
+
+        // --- NEGATIVE CONTROL, first, because everything below depends on it.
+        // Two separately-constructed but identical configs must produce the
+        // SAME key. Without this, every assert_ne! below passes trivially for a
+        // key that is simply nondeterministic — i.e. a cache that never hits.
+        assert_eq!(
+            hash(&base),
+            hash(&ObjectConfig::default()),
+            "NEGATIVE CONTROL: the key must be a function of the config alone. If this \
+             fails, every assert_ne! in this test is vacuous and the cache never hits."
+        );
+
+        let mut named = base.clone();
+        named.name = "some/other/unit".to_string();
+        assert_ne!(
+            hash(&base),
+            hash(&named),
+            "the key hashes obj CONTENTS, not paths, so two units with byte-identical \
+             objects collide; the survivor served the other unit's name and metadata"
+        );
+
+        let mut complete = base.clone();
+        complete.complete = Some(true);
+        assert_ne!(hash(&base), hash(&complete), "object.complete gates the 100% substitution");
+
+        let mut meta_complete = base.clone();
+        meta_complete.metadata.complete = Some(true);
+        assert_ne!(
+            hash(&base),
+            hash(&meta_complete),
+            "metadata.complete substitutes 100% for a measurement on every section and \
+             every symbol of the unit — the single most consequential field in the payload"
+        );
+
+        // `complete()` prefers metadata.complete over the deprecated
+        // top-level flag, so BOTH spellings must be hashed. Hashing only one
+        // leaves the other exactly as invisible as both used to be.
+        let mut meta_false = base.clone();
+        meta_false.metadata.complete = Some(false);
+        assert_ne!(
+            hash(&meta_complete),
+            hash(&meta_false),
+            "true and false must not collide with each other, nor either with unset"
+        );
+        assert_ne!(hash(&base), hash(&meta_false), "unset and Some(false) are different inputs");
+
+        let mut reverse = base.clone();
+        reverse.metadata.reverse_fn_order = Some(true);
+        assert_ne!(hash(&base), hash(&reverse), "reverse_fn_order changes function ordering");
+
+        let mut auto_gen = base.clone();
+        auto_gen.metadata.auto_generated = Some(true);
+        assert_ne!(hash(&base), hash(&auto_gen), "auto_generated rides in the unit metadata");
+
+        let mut source = base.clone();
+        source.metadata.source_path = Some("src/foo.cpp".into());
+        assert_ne!(hash(&base), hash(&source), "source_path rides in the unit metadata");
+
+        let mut categories = base.clone();
+        categories.metadata.progress_categories = Some(vec!["engine".to_string()]);
+        assert_ne!(
+            hash(&base),
+            hash(&categories),
+            "progress_categories decides which category totals this unit lands in"
+        );
+
+        // Two different category lists must not collide either — a length-only
+        // or count-only mix-in would pass every assertion above.
+        let mut categories_b = base.clone();
+        categories_b.metadata.progress_categories = Some(vec!["ui".to_string()]);
+        assert_ne!(
+            hash(&categories),
+            hash(&categories_b),
+            "category CONTENT must be hashed, not just its presence"
+        );
+    }
+
     #[test]
     fn test_render_diff_config_covers_every_property_in_a_stable_order() {
         use objdiff_core::diff::{ConfigEnum, ConfigPropertyId};

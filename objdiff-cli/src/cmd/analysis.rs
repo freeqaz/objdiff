@@ -6002,6 +6002,94 @@ mod tests {
         assert_eq!(verdict.classification, VerdictClassification::Complete);
     }
 
+    /// An empty instruction list is NOT a match, and the assertion that catches
+    /// a regression is the one on `Complete` — not merely "some verdict came
+    /// back".
+    ///
+    /// Sabotage that must turn this RED (verified 2026-08-22 by deleting the
+    /// `summary.total == 0` arm from `compute_verdict`): with the arm removed,
+    /// `total_mismatches = 0 - 0 = 0` falls into the `Complete` arm, and this
+    /// test fails on `assert_ne!(..., Complete)` with
+    /// "an empty instruction list must never be reported as a match".
+    ///
+    /// The NEGATIVE CONTROLS live inside the test on purpose. Asserting only
+    /// "empty ⇒ not Complete" is equally satisfied by a `compute_verdict` that
+    /// has been broken into never returning `Complete` at all, which is exactly
+    /// how a widened carve-out swallows its own control. So the same test also
+    /// pins the two neighbouring inputs that MUST still classify as before.
+    #[test]
+    fn empty_instruction_list_is_not_a_match() {
+        let no_patterns = Analysis {
+            patterns: vec![],
+            patterns_checked: vec!["LINKER_MERGED"],
+            unattributed_mismatches: 0,
+        };
+
+        // --- the defect -------------------------------------------------
+        // A data symbol: no instruction rows, and a real, poor match percent
+        // measured on another surface. This is `??_7UIListSubList@@6B@`.
+        let empty = InstructionSummary { total: 0, equal: 0, ..Default::default() };
+        let v = compute_verdict(&empty, &no_patterns, Some(73.07), 132, 132);
+        assert_ne!(
+            v.classification,
+            VerdictClassification::Complete,
+            "an empty instruction list must never be reported as a match"
+        );
+        assert_eq!(v.classification, VerdictClassification::NotMeasured);
+        assert!(
+            v.explanation.contains("73.07"),
+            "the real percent must reach the reader; `match_percent` was accepted and \
+             never consulted before. Got: {}",
+            v.explanation
+        );
+
+        // Nothing measured on ANY surface: no rows and no percent either.
+        let v = compute_verdict(&empty, &no_patterns, None, 0, 0);
+        assert_eq!(
+            v.classification,
+            VerdictClassification::NotMeasured,
+            "both sides size 0 slips past the Stub guard (which needs target_size > 0) \
+             and must not land on Complete"
+        );
+
+        // --- NEGATIVE CONTROL 1 -----------------------------------------
+        // A real, non-empty, fully equal code symbol must STILL be Complete.
+        // If this breaks, the guard above has been widened into swallowing
+        // every genuine match and the assertions above would still pass.
+        let all_equal = InstructionSummary { total: 10, equal: 10, ..Default::default() };
+        assert_eq!(
+            compute_verdict(&all_equal, &no_patterns, Some(100.0), 100, 100).classification,
+            VerdictClassification::Complete,
+            "NEGATIVE CONTROL: a genuine 10/10 match must still be Complete"
+        );
+
+        // --- NEGATIVE CONTROL 2 -----------------------------------------
+        // A real mismatch must still be classified as work, not as unmeasured.
+        let mismatched =
+            InstructionSummary { total: 10, equal: 5, diff_arg: 5, ..Default::default() };
+        let v = compute_verdict(&mismatched, &no_patterns, Some(50.0), 100, 100);
+        assert_ne!(
+            v.classification,
+            VerdictClassification::NotMeasured,
+            "NEGATIVE CONTROL: 5 real mismatches were measured; that is a result"
+        );
+        assert_ne!(
+            v.classification,
+            VerdictClassification::Complete,
+            "NEGATIVE CONTROL: 5 real mismatches are not a match"
+        );
+
+        // --- NEGATIVE CONTROL 3 -----------------------------------------
+        // The Stub guard runs BEFORE the new arm and must keep doing so: an
+        // unimplemented function has no rows either, and calling it
+        // "not measured" would lose a real, correct diagnosis.
+        assert_eq!(
+            compute_verdict(&empty, &no_patterns, None, 0, 96).classification,
+            VerdictClassification::Stub,
+            "NEGATIVE CONTROL: base 0 / target 96 is a stub, not an unmeasured symbol"
+        );
+    }
+
     #[test]
     fn test_verdict_at_limit_merged() {
         let summary = InstructionSummary { total: 10, equal: 5, diff_arg: 5, ..Default::default() };
