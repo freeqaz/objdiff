@@ -1907,8 +1907,35 @@ fn run_batch(args: Args) -> Result<()> {
     // copy of each COMDAT, while our own BASE build emits every copy. Keeping
     // the whole candidate list rather than a first-wins winner is what lets the
     // resolver below prefer a unit where both sides define the symbol.
-    let index_side = |target_side: bool| {
+    // Counts the two outcomes the old `if let Ok(..)` collapsed into one.
+    //
+    // `list_function_symbols` errors when the object is MISSING as readily as
+    // when it is malformed, and both were discarded with no warning, no counter
+    // and no effect. Point `--batch` at a project whose `target_dir` has never
+    // been built -- or pass the wrong `-p` -- and the target index came out
+    // EMPTY, every symbol on stdin fell through both lookups, `by_unit` was
+    // empty, and so `obj::read::read` (the call that WOULD have raised the real
+    // "Failed to open" error) was never reached. Reproduced 2026-08-22:
+    //
+    //     $ echo '?random@@YAJJ@Z' | objdiff-cli diff --batch -p <unbuilt>
+    //     Symbol index built in 0.0s: 0 target mangled, 20 base
+    //     Resolved: 0 symbols across 0 units (1 not found)
+    //     {"error":"not_found","symbol":"?random@@YAJJ@Z"}
+    //     exit 0
+    //
+    // "That symbol does not exist" is the caller's-typo diagnosis, delivered at
+    // exit 0, for a build that never ran. The symbol exists.
+    struct IndexOutcome {
+        index: HashMap<String, Vec<u32>>,
+        declared: usize,
+        unreadable: usize,
+        first_error: Option<String>,
+    }
+    let index_side = |target_side: bool| -> IndexOutcome {
         let mut index: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut declared = 0usize;
+        let mut unreadable = 0usize;
+        let mut first_error = None;
         for (pos, (_, unit_name)) in units_in_order.iter().enumerate() {
             let Some((obj_config, _)) = object_configs.get(*unit_name) else { continue };
             let path = if target_side {
@@ -1916,22 +1943,66 @@ fn run_batch(args: Args) -> Result<()> {
             } else {
                 obj_config.base_path.as_deref()
             };
-            if let Some(path) = path
-                && let Ok(syms) = obj::read::list_function_symbols(path.as_ref())
-            {
-                for sym in syms {
-                    let entry: &mut Vec<u32> = index.entry(sym).or_default();
-                    // Ascending by construction: units are visited in order.
-                    if entry.last() != Some(&(pos as u32)) {
-                        entry.push(pos as u32);
+            // A unit that declares no path on this side is not an error: half
+            // the units in a decomp legitimately have no base object yet. Only
+            // a path that IS declared and cannot be read is counted.
+            let Some(path) = path else { continue };
+            declared += 1;
+            match obj::read::list_function_symbols(path.as_ref()) {
+                Ok(syms) => {
+                    for sym in syms {
+                        let entry: &mut Vec<u32> = index.entry(sym).or_default();
+                        // Ascending by construction: units are visited in order.
+                        if entry.last() != Some(&(pos as u32)) {
+                            entry.push(pos as u32);
+                        }
+                    }
+                }
+                Err(e) => {
+                    unreadable += 1;
+                    if first_error.is_none() {
+                        first_error = Some(format!("{path}: {e}"));
                     }
                 }
             }
         }
-        index
+        IndexOutcome { index, declared, unreadable, first_error }
     };
-    let target_mangled_index = index_side(true);
-    let base_symbol_index = index_side(false);
+    let target_index = index_side(true);
+    let base_index = index_side(false);
+
+    // Refuse when a whole side is unreadable. This is the "measured nothing"
+    // shape: with no target objects there is nothing to score against, and
+    // every row batch could still emit would be an absence dressed as a result.
+    // Partial unreadability is reported and continues -- a half-built tree is a
+    // real state to work in, and the rows that do resolve are real.
+    for (side, outcome) in [("target", &target_index), ("base", &base_index)] {
+        if outcome.declared > 0 && outcome.unreadable == outcome.declared {
+            bail!(
+                "none of the {n} declared {side} object(s) could be read, so no symbol can be \
+                 resolved and every row would come back `not_found` — which reads as \"your \
+                 symbols do not exist\" when the real answer is \"this tree has not been \
+                 built\".\n\nFirst failure: {err}\n\n\
+                 Check that `-p` names the right project and that its {side}_dir has been built.",
+                n = outcome.declared,
+                side = side,
+                err = outcome.first_error.as_deref().unwrap_or("<none recorded>"),
+            );
+        }
+        if outcome.unreadable > 0 {
+            eprintln!(
+                "WARNING: {} of {} declared {} object(s) could not be read and contributed no \
+                 symbols; rows for symbols they define will be reported as not_found. First: {}",
+                outcome.unreadable,
+                outcome.declared,
+                side,
+                outcome.first_error.as_deref().unwrap_or("<none recorded>"),
+            );
+        }
+    }
+
+    let target_mangled_index = target_index.index;
+    let base_symbol_index = base_index.index;
 
     eprintln!(
         "Symbol index built in {:.1}s: {} target mangled, {} base",

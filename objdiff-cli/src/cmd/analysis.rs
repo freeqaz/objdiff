@@ -1640,6 +1640,27 @@ pub enum VerdictClassification {
     NeedsInvestigation,
     /// Base has no code (unimplemented stub)
     Stub,
+    /// **Nothing was measured.** There were no instruction rows to examine, so
+    /// no statement about fixability is possible.
+    ///
+    /// This is not a degree of "fixable" — it is the absence of a measurement,
+    /// and it exists because the alternative was reporting it as [`Complete`].
+    /// `total_mismatches == summary.total - summary.equal` is `0` when
+    /// `summary.total` is `0`, so an empty instruction list used to arrive at
+    /// the `Complete` arm and be published as `COMPLETE` / `High` /
+    /// "Function matches 100%." / "No action needed."
+    ///
+    /// Measured on dc3-decomp 2026-08-22, `??_7UIListSubList@@6B@` with
+    /// `--include-data --verdict`: the data diff in the SAME document reported
+    /// `match_percent: 73.07`, 4 mismatched bytes and two wrong vtable slots
+    /// (`??_G` vs `??_E`, `OnlyReturns` vs `?RefOwner@Object@Hmx@@UBAPAV12@XZ`)
+    /// while `instruction_summary.mismatch_percent` read `100.0` and
+    /// `canonical_match_percent` was `null`. Three numbers, one document, and
+    /// the verdict — the field an agent reads — was the only one that said the
+    /// symbol was fine.
+    ///
+    /// [`Complete`]: VerdictClassification::Complete
+    NotMeasured,
 }
 
 /// A factor that contributed to the verdict.
@@ -4431,6 +4452,54 @@ pub fn compute_verdict(
         }
         urls.into_iter().collect()
     };
+
+    // NOTHING WAS MEASURED. Must precede the `total_mismatches == 0` arm below,
+    // which it would otherwise fall into: `total - equal` is 0 when `total` is
+    // 0, so "no rows" and "every row equal" were indistinguishable and both
+    // published as "Function matches 100%." with `Confidence::High`.
+    //
+    // Reached by any symbol with no instruction rows:
+    //   * every DATA symbol — `diff_data_symbol` fills `data_rows` and never
+    //     `instruction_rows`, so a vtable at 73% with wrong slots landed here;
+    //   * both symbol indices absent (`build_instruction_diffs` returns an
+    //     empty vec for `(None, None)`);
+    //   * both sides size 0, which slips past the `Stub` guard above because
+    //     that requires `target_size > 0`.
+    //
+    // `match_percent` is consulted here and NOT in the `Complete` arm, which is
+    // the other half of the defect: the parameter was accepted and never read,
+    // so a `None` percent (never measured) and a `Some(100.0)` percent produced
+    // identical verdicts.
+    if summary.total == 0 {
+        return Verdict {
+            classification: VerdictClassification::NotMeasured,
+            confidence: Confidence::High,
+            explanation: match match_percent {
+                Some(pct) => format!(
+                    "No instruction rows to analyse — this is not a code-symbol comparison. \
+                     The symbol's own match percent is {pct:.2}%; read that, the data diff \
+                     (--include-data) or the section score instead. No fixability verdict \
+                     is possible from an empty instruction list."
+                ),
+                None => "No instruction rows to analyse, and no match percent was produced \
+                         either — nothing about this symbol was measured. Common causes: it \
+                         is a data symbol (use --include-data), or it exists on only one \
+                         side. This is the absence of a result, not a passing one."
+                    .to_string(),
+            },
+            factors: vec![VerdictFactor {
+                name: "instruction_rows",
+                value: serde_json::json!(0),
+                threshold: None,
+                result: "not_measured",
+            }],
+            recommendation: "Do not read this as a match. Measure the symbol on a surface \
+                             that applies to it."
+                .to_string(),
+            suggestions: vec![],
+            doc_urls: vec![],
+        };
+    }
 
     // Check for complete match
     if total_mismatches == 0 {

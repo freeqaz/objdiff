@@ -249,6 +249,56 @@ impl ReportCache {
             combined.push(0xFE);
             combined.extend_from_slice(property.as_bytes());
         }
+        // (5), the 2026-08-22 fix: the `ObjectConfig` fields that the CACHED
+        // PAYLOAD is built from. The key covered every input to the *diff* and
+        // no input to the `ReportUnit` around it, and `report_object` reads
+        // several -- `complete()` most consequentially, which substitutes 100%
+        // for a measurement on every section and every symbol of the unit.
+        //
+        // Reproduced end-to-end on the 4.2.7 binary, one `-o`, objs and config
+        // untouched, only `metadata.complete` flipped false -> true:
+        //
+        //     run 1 (complete:false)  0 hits, 1 miss   complete_code 0
+        //     run 2 (complete:true)   1 HIT,  0 misses complete_code 0
+        //     run 2 with --no-cache   0 hits, 1 miss   complete_code 2452,
+        //                                              complete_code_percent 100.0
+        //
+        // An edit taking a unit from 0% to 100% complete measured as +0. Worse,
+        // the cache's own "nothing was re-diffed" warning asserts that "the key
+        // covers the objs, the resolved config, the map file and this binary,
+        // so this means those are all unchanged" -- true, and it made the stale
+        // answer MORE credible rather than less, because the listed inputs
+        // really were unchanged and the one that mattered was not on the list.
+        //
+        // `name` is included too: the key hashes obj CONTENTS, not paths, so two
+        // units pointing at byte-identical objects collide, and the survivor
+        // served the other unit's name and metadata.
+        combined.push(0xFD);
+        combined.extend_from_slice(object.name.as_bytes());
+        // Both spellings of every flag. `report_object` reads `object.complete`
+        // for the section/symbol 100% substitution and `metadata.complete` for
+        // the completion measures, and they are separate fields; hashing only
+        // one would leave the other exactly as invisible as both were.
+        for flag in [
+            object.complete,
+            object.metadata.complete,
+            object.metadata.reverse_fn_order,
+            object.metadata.auto_generated,
+        ] {
+            combined.push(match flag {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            });
+        }
+        combined.push(0xFC);
+        if let Some(source_path) = &object.metadata.source_path {
+            combined.extend_from_slice(source_path.as_str().as_bytes());
+        }
+        for category in object.metadata.progress_categories.iter().flatten() {
+            combined.push(0xFA);
+            combined.extend_from_slice(category.as_bytes());
+        }
         xxh3_64(&combined)
     }
 }
@@ -815,7 +865,46 @@ fn generate(args: GenerateArgs) -> Result<()> {
         }
     }
 
-    let measures = units.iter().flat_map(|u| u.measures.into_iter()).collect();
+    let measures: Measures = units.iter().flat_map(|u| u.measures.into_iter()).collect();
+
+    // REFUSE A REPORT THAT MEASURED NOTHING.
+    //
+    // `Measures::calc_fuzzy_match_percent` and `calc_matched_percent` answer
+    // `100.0` for a zero denominator -- six separate percent fields do -- so an
+    // empty measurement and a perfect one are the same output. This is the
+    // primitive underneath the whole defect class: 100% is the ONLY answer an
+    // empty report can give, which makes a clean report from one unfalsifiable.
+    //
+    // Measured 2026-08-22 on the 4.2.7 binary: a project config with
+    // `"units": []` produced `fuzzy_match_percent: 100.0`,
+    // `matched_code_percent: 100.0`, `matched_data_percent: 100.0`,
+    // `matched_functions_percent: 100.0`, `complete_code_percent: 100.0`,
+    // `complete_data_percent: 100.0`, and exit 0. A typo'd `units` key, a
+    // config generator that emitted an empty list, or a project whose units
+    // were every one of them skipped all reach it.
+    //
+    // The zero-denominator convention itself is left alone -- it is upstream
+    // behaviour, and it is defensible for a per-CATEGORY total, where a
+    // category with no code genuinely is complete. What is not defensible is
+    // publishing it for a whole project, so the refusal is at the top level
+    // only, and it is stated in terms of what was measured rather than of the
+    // unit count, so a project full of units that all measured nothing is
+    // caught too.
+    if measures.total_code == 0 && measures.total_data == 0 && measures.total_functions == 0 {
+        bail!(
+            "refusing to write a report that measured nothing: {declared} unit(s) declared, \
+             {kept} in the report, and between them 0 code bytes, 0 data bytes and 0 \
+             functions.\n\n\
+             Every percentage in such a report is 100% by construction -- the zero-denominator \
+             branch of `Measures::calc_matched_percent` -- so it cannot report a problem and a \
+             clean result from it means nothing.\n\n\
+             Check that the project config's `units` list is non-empty and that `target_dir` / \
+             `base_dir` point at a tree that has been built.",
+            declared = objects.len(),
+            kept = units.len(),
+        );
+    }
+
     let mut categories = Vec::new();
     for category in project.progress_categories() {
         categories.push(ReportCategory {
@@ -852,6 +941,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
         map_file_entries,
         cache_hits: hits,
         cache_misses: misses,
+        skipped_units: (objects.len() - units.len()) as u32,
     };
     let mut report = Report {
         measures: Some(measures),
@@ -2103,7 +2193,21 @@ struct AnalyzeQuery {
 /// Summary statistics for the analyze command.
 #[derive(Serialize)]
 struct AnalyzeSummary {
+    /// Functions that were actually opened, diffed and given a verdict.
+    ///
+    /// NOT the candidate count. See `analyzed_count` at the loop for the
+    /// measured incident this distinction comes from.
     total_analyzed: usize,
+    /// Candidates selected from the report but never analysed. `total_selected
+    /// == total_analyzed + total_skipped` always. Always serialized, including
+    /// as `0`, so "nothing was dropped" is an assertion the output makes rather
+    /// than something a consumer infers from an absent key.
+    total_selected: usize,
+    total_skipped: usize,
+    /// Why they were skipped, so a skew between the report and the project
+    /// config is nameable rather than a shrug.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_reasons: BTreeMap<String, usize>,
     /// `BTreeMap`, so the serialized key order is the same on every run. A
     /// `HashMap` here published `std::collections::HashMap`'s per-instance
     /// iteration order straight into the JSON.
@@ -2244,11 +2348,24 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
         needs_investigation: Vec::new(),
     };
     let mut verdict_counts: BTreeMap<String, usize> = BTreeMap::new();
+    // Work actually done, as opposed to work selected. `total_analyzed` used to
+    // be `candidates.len()` -- the count taken BEFORE any object was opened --
+    // while the two `continue`s below dropped functions without decrementing
+    // anything. Point `report analyze` at a project that does not match the
+    // report (a stale report.json, a wrong `-p`) and every unit took the
+    // "Unit not found in project" branch, producing
+    // `{"summary":{"total_analyzed":17,"by_verdict":{}},"results":{...all
+    // empty}}` at exit 0. Reproduced on dc3-decomp 2026-08-22 with exactly
+    // those numbers: "17 analyzed, zero problems found", zero analysed.
+    let mut analyzed_count = 0usize;
+    let mut skipped_unit_not_in_project = 0usize;
+    let mut skipped_symbol_not_in_objects = 0usize;
 
     for (unit_name, functions) in by_unit {
         // Find object config
         let Some((object_config, unit_idx)) = object_configs.get(unit_name) else {
             warn!("Unit not found in project: {}", unit_name);
+            skipped_unit_not_in_project += functions.len();
             continue;
         };
 
@@ -2300,8 +2417,11 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
 
             let Some(result) = result else {
                 warn!("Symbol not found in objects: {} (unit: {})", func.name, unit_name);
+                skipped_symbol_not_in_objects += 1;
                 continue;
             };
+
+            analyzed_count += 1;
 
             // Record verdict
             let classification = result.verdict.classification;
@@ -2332,8 +2452,34 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
                 }
                 VerdictClassification::Complete => {} // Should not happen (filtered out)
                 VerdictClassification::Stub => {}     // Unimplemented, skip
+                // Nothing was measured. Deliberately NOT dropped like Complete
+                // and Stub: those two are outcomes, this is the absence of one,
+                // and silently discarding it is how the count below came to
+                // exceed the work done. `verdict_counts` above already saw it,
+                // so it stays visible in `by_verdict`.
+                VerdictClassification::NotMeasured => results.needs_investigation.push(analyzed),
             }
         }
+    }
+
+    // Selected work, did none of it. Counting is enough to make a PARTIAL drop
+    // legible, but a TOTAL one must not be emitted as a result at all: an empty
+    // `by_verdict` under a nonzero count is indistinguishable from "analysed
+    // everything, found nothing", which is the good news a caller is hoping
+    // for. Refuse instead, and name the two things that are out of step.
+    if total_to_analyze > 0 && analyzed_count == 0 {
+        bail!(
+            "analysed 0 of {} selected function(s) — every one was skipped, so this run \
+             measured nothing.\n  \
+             {} skipped: unit named in the report is absent from the project config\n  \
+             {} skipped: symbol absent from the unit's objects\n\n\
+             The report and the project config are describing different trees. Check that \
+             `-p` points at the project this report was generated from, and that the report \
+             is not stale.",
+            total_to_analyze,
+            skipped_unit_not_in_project,
+            skipped_symbol_not_in_objects,
+        );
     }
 
     // Build output
@@ -2343,7 +2489,22 @@ fn analyze(args: AnalyzeArgs) -> Result<()> {
             max_percent: args.max_percent,
             limit: args.limit,
         },
-        summary: AnalyzeSummary { total_analyzed: total_to_analyze, by_verdict: verdict_counts },
+        summary: AnalyzeSummary {
+            total_analyzed: analyzed_count,
+            total_selected: total_to_analyze,
+            total_skipped: skipped_unit_not_in_project + skipped_symbol_not_in_objects,
+            skipped_reasons: {
+                let mut m = BTreeMap::new();
+                if skipped_unit_not_in_project > 0 {
+                    m.insert("unit_not_in_project".to_string(), skipped_unit_not_in_project);
+                }
+                if skipped_symbol_not_in_objects > 0 {
+                    m.insert("symbol_not_in_objects".to_string(), skipped_symbol_not_in_objects);
+                }
+                m
+            },
+            by_verdict: verdict_counts,
+        },
         results,
     };
 
