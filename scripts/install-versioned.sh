@@ -19,6 +19,23 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"
 
+# --check: report whether the installed binary matches this checkout's HEAD.
+# Exit 0 = current, 1 = stale/missing (with a one-line diagnosis). No build.
+if [ "${1:-}" = "--check" ]; then
+    link="$HOME/.local/bin/objdiff-cli"
+    head_rev=$(git rev-parse --short=12 HEAD)
+    if ! command -v "$link" >/dev/null; then
+        echo "STALE: $link missing — run $0"; exit 1
+    fi
+    inst=$("$link" --version 2>/dev/null || true)
+    inst_rev=$(sed -n 's/.*(\([0-9a-f]\{6,\}\)[,)].*/\1/p' <<<"$inst")
+    if [ "$inst_rev" = "$head_rev" ]; then
+        echo "current: $inst"; exit 0
+    fi
+    echo "STALE: installed rev ${inst_rev:-<none>} != HEAD $head_rev — run $0"
+    exit 1
+fi
+
 # Match build.rs dirtiness semantics (--untracked-files=no): untracked files
 # cannot reach the build without a tracked edit referencing them.
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
