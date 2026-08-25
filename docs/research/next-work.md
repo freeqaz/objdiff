@@ -116,6 +116,32 @@ in any threaded server. An upstream `Sync` bound (or an audit of why it is
 
 ## Upstream follow-up (encounter/objdiff, low urgency)
 
+### `report generate` credits unpaired symbols 100% — fixed here, still live upstream
+
+`complete` substitutes 100% for a percent `diff_objs` did not compute. Upstream
+gates that on `object.complete` alone, so it also fires **per symbol** inside a
+*paired* object: a symbol with no counterpart is reported as fully matched, and
+the symptom is a higher progress number rather than an error. Precondition is
+two-part — unpaired symbol **and** `units[].metadata.complete == true` (note
+`metadata`; reading `unit["complete"]` returns 0 even on a tree that fires it).
+
+Fixed here in `3d51181` ("random changes", 2026-03-12) by adding the
+`base_is_none` term, which restricts the substitution to the whole-unit
+target-only case it was written for. That fix shipped unnamed and untested for
+five months; it is now factored into `complete_substitution_percent` with a
+truth table and a sabotage control in `objdiff-cli/src/cmd/report.rs`.
+
+Two things make this worth carrying upstream rather than leaving fork-local:
+
+- **A merge from upstream reverts it silently.** `upstream/main` still has the
+  old form at both sites, and the guard is one term in a match arm — no conflict
+  marker, no failing build, just a different number.
+- **Version cannot identify an affected build.** Fork tags `v4.1.0`+ carry the
+  fix, but `v4.1.0` did not bump `Cargo.toml`, so both boundary builds
+  self-report `4.0.0`. Consumers must pin by commit or test the behaviour.
+
+Affected build range, measured: **2.7.1 through 4.0.0 inclusive**.
+
 After fleet runs validate the immediate-diff tweak, merge
 `metric-honest-immediates` into encounter/objdiff `main`, and rename the CLI's
 confusingly-named `normalized_match_percent` — it actually measures
