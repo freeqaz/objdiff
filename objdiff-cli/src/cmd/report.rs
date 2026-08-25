@@ -1022,6 +1022,28 @@ fn build_unit_diff_config(
     Ok(diff_config)
 }
 
+/// Resolve a match percent that `diff_objs` did not compute.
+///
+/// `complete` substitutes 100% for a measurement that never happened, so it is
+/// licensed ONLY when there is no base object to measure against — the whole-unit
+/// "target-only, declared done" case. Inside a *paired* object an absent percent
+/// means the symbol had no counterpart, and crediting it 100% reports a score for
+/// a function objdiff never compared.
+///
+/// The `base_is_none` term is the entire fix. Upstream ≤4.0.0 gates on `complete`
+/// alone (still does at HEAD), so a merge from upstream reverts this silently: the
+/// symptom is a higher progress number, not an error, and `--version` cannot
+/// distinguish the two builds. `mod tests` pins the truth table.
+fn complete_substitution_percent(computed: Option<f32>, base_is_none: bool, complete: bool) -> f32 {
+    match computed {
+        Some(pct) => pct,
+        None if base_is_none && complete => 100.0,
+        // Either the unit is measurable (a base exists, so the symbol is simply
+        // unpaired) or it is not declared complete. Both score 0.
+        None => 0.0,
+    }
+}
+
 fn report_object(
     object: &ObjectConfig,
     diff_config: &diff::DiffObjConfig,
@@ -1127,11 +1149,11 @@ fn report_object(
         if section.kind == SectionKind::Unknown {
             continue;
         }
-        let section_match_percent = match section_diff.match_percent {
-            Some(pct) => pct,
-            None if base.is_none() && object.complete.unwrap_or(false) => 100.0,
-            None => 0.0,
-        };
+        let section_match_percent = complete_substitution_percent(
+            section_diff.match_percent,
+            base.is_none(),
+            object.complete.unwrap_or(false),
+        );
         sections.push(ReportItem {
             name: section.name.clone(),
             fuzzy_match_percent: section_match_percent,
@@ -1174,17 +1196,11 @@ fn report_object(
             {
                 continue;
             }
-            let match_percent = match symbol_diff.match_percent {
-                Some(pct) => pct,
-                None if base.is_none() && object.complete.unwrap_or(false) => {
-                    // No target object but unit is marked complete: assume 100% match
-                    100.0
-                }
-                None => {
-                    // Symbol exists in target but has no source implementation (0% match).
-                    0.0
-                }
-            };
+            let match_percent = complete_substitution_percent(
+                symbol_diff.match_percent,
+                base.is_none(),
+                object.complete.unwrap_or(false),
+            );
             let match_percent_normalized = match symbol_diff.match_percent_normalized {
                 Some(pct) => pct,
                 _ => match_percent,
@@ -2945,6 +2961,71 @@ mod tests {
     use objdiff_core::config::ProjectOptionValue;
 
     use super::*;
+
+    /// The `complete` 100% substitution, in full.
+    ///
+    /// Row 2 is the regression: an unpaired symbol inside a *paired* object. It
+    /// is the only row where a build without the `base_is_none` term differs,
+    /// and it scores a function that was never compared — so the symptom is a
+    /// silently higher progress number, never an error.
+    #[test]
+    fn test_complete_substitution_truth_table() {
+        // (base_is_none, complete) -> expected, for an uncomputed percent
+        assert_eq!(
+            complete_substitution_percent(None, true, true),
+            100.0,
+            "no base object + complete is the one licensed substitution"
+        );
+        assert_eq!(
+            complete_substitution_percent(None, false, true),
+            0.0,
+            "a base object exists, so an absent percent means UNPAIRED, not matched"
+        );
+        assert_eq!(
+            complete_substitution_percent(None, true, false),
+            0.0,
+            "no base object and not complete measures nothing"
+        );
+        assert_eq!(complete_substitution_percent(None, false, false), 0.0);
+    }
+
+    /// A computed percent is a measurement; the substitution must never displace
+    /// one. `Some(0.0)` is the case that would hide behind an `unwrap_or`-shaped
+    /// rewrite, since 0.0 and "absent" are easy to conflate.
+    #[test]
+    fn test_a_measured_percent_is_never_substituted() {
+        assert_eq!(complete_substitution_percent(Some(0.0), true, true), 0.0);
+        assert_eq!(complete_substitution_percent(Some(37.5), true, true), 37.5);
+        assert_eq!(complete_substitution_percent(Some(99.9), false, true), 99.9);
+    }
+
+    /// Sabotage control: the pre-fix predicate, inline. If it agreed with ours on
+    /// every row, the table above could not fail when the guard is reverted — and
+    /// an upstream merge reverts it without a conflict marker.
+    #[test]
+    fn test_the_pre_fix_predicate_is_distinguishable() {
+        // Upstream ≤4.0.0, still HEAD: gates on `complete` alone.
+        fn pre_fix(computed: Option<f32>, _base_is_none: bool, complete: bool) -> f32 {
+            match computed {
+                Some(pct) => pct,
+                None if complete => 100.0,
+                None => 0.0,
+            }
+        }
+        for &(base_is_none, complete) in &[(true, true), (true, false), (false, false)] {
+            assert_eq!(
+                pre_fix(None, base_is_none, complete),
+                complete_substitution_percent(None, base_is_none, complete),
+                "the two predicates must agree everywhere except the unpaired row"
+            );
+        }
+        assert_eq!(pre_fix(None, false, true), 100.0, "the defect, reproduced");
+        assert_eq!(
+            complete_substitution_percent(None, false, true),
+            0.0,
+            "and refused by the shipped predicate"
+        );
+    }
 
     /// The whole truth table, because the `--deduplicate` row is the one that
     /// has already been wrong once in a shipped build and the symptom was a
