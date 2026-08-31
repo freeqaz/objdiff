@@ -147,7 +147,18 @@ fn main() {
         SubCommand::DocLinks(c_args) => cmd::analysis::run_doc_links(c_args),
     });
     if let Err(e) = result {
-        eprintln!("Failed: {e:?}");
-        std::process::exit(1);
+        // The strict channel: an error carrying a `StrictFailure` exits with
+        // ITS code so a consumer can tell "the match regressed" from "the
+        // config is wrong" from "nothing was examined". Everything else exits
+        // 1, exactly as it always has — `exit_code_for` has a test pinning
+        // that, because silently re-mapping the existing failures would break
+        // three repos and a permuter fleet at once.
+        let code = cmd::strict::exit_code_for(&e);
+        if code == cmd::strict::EXIT_ERROR {
+            eprintln!("Failed: {e:?}");
+        } else {
+            eprintln!("{e}");
+        }
+        std::process::exit(code);
     }
 }

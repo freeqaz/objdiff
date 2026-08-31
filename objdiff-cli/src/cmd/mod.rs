@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod diff;
 pub mod report;
 pub mod self_diff;
+pub mod strict;
 
 use std::str::FromStr;
 

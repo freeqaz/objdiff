@@ -100,6 +100,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Cargo test
         run: cargo test --release --all-features --workspace
+      # The strict channel end to end on a real binary: argument parsing, the
+      # wiring at each call site, and main's exit-code mapping. Unit tests cover
+      # StrictConfig in isolation and cannot see any of that. Linux only --
+      # the script is bash and drives POSIX `sh -c` for the cwd-sensitive cases.
+      # Sabotage-verified: disabling StrictConfig::enabled turns 8 cases red,
+      # disarming the vacuity gate turns exactly the exit-4 case red.
+      - name: Strict-channel selftest
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          cargo build --release --bin objdiff-cli
+          scripts/strict-selftest.sh target/release/objdiff-cli
 
   build-cli:
     name: Build objdiff-cli

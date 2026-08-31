@@ -369,6 +369,13 @@ pub struct GenerateArgs {
     /// you want that belief measured rather than assumed, or when an input objdiff
     /// cannot see (a compiler wrapper, a generated header) may have moved.
     no_cache: bool,
+    #[argp(option)]
+    /// Fail on a MEASUREMENT, not just an error. Repeatable. Rules:
+    /// min-match=<pct> (exit 2 if matched_code_percent is below pct),
+    /// nonempty (exit 4 if the report measured nothing — always enforced by any
+    /// --strict). `detectors` is exit 5 here: `report generate` runs no pattern
+    /// detectors. Without --strict, exit codes are unchanged.
+    strict: Vec<String>,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -890,6 +897,32 @@ fn generate(args: GenerateArgs) -> Result<()> {
     // only, and it is stated in terms of what was measured rather than of the
     // unit count, so a project full of units that all measured nothing is
     // caught too.
+    // Strict, part 1: the vacuity gate, BEFORE the pre-existing refusal below.
+    //
+    // Both catch the same state; they differ in what the caller can do with the
+    // answer. The `bail!` is exit 1 — "something went wrong" — which a guard
+    // cannot distinguish from a missing file or a parse error. Under `--strict`
+    // the caller has asked to be told about measurement outcomes specifically,
+    // so the same state gets exit 4, "the check examined zero things", which is
+    // the code the consuming repos' guards reserve for it.
+    let strict = crate::cmd::strict::StrictConfig::parse(&args.strict)?;
+    if strict.wants_detectors() {
+        // `report generate` computes measures, not pattern analysis. There is
+        // no coverage table for this rule to read, and accepting it silently
+        // would hand the caller a green run in which the check never existed.
+        strict.reject_rule(
+            "detectors",
+            "`report generate` runs no pattern detectors — it computes measures. Use \
+             `objdiff-cli diff --analyze --strict detectors` for the coverage check.",
+        )?;
+    }
+    strict.check_examined(
+        measures.total_code as usize
+            + measures.total_data as usize
+            + measures.total_functions as usize,
+        "code bytes, data bytes and functions combined",
+    )?;
+
     if measures.total_code == 0 && measures.total_data == 0 && measures.total_functions == 0 {
         bail!(
             "refusing to write a report that measured nothing: {declared} unit(s) declared, \
@@ -954,6 +987,12 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let duration = start.elapsed();
     info!("Report generated in {}.{:03}s", duration.as_secs(), duration.subsec_millis());
     write_output(&report, args.output.as_deref(), output_format)?;
+
+    // Strict, part 2: the threshold, after the report is on disk. A guard that
+    // withholds the report explaining its own verdict gets routed around.
+    let matched_code_percent =
+        report.measures.as_ref().map(|m| m.matched_code_percent).filter(|p| p.is_finite());
+    strict.check_match_percent(matched_code_percent, "matched_code_percent")?;
     Ok(())
 }
 
