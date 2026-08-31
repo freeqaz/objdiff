@@ -581,6 +581,14 @@ pub struct Args {
     /// match percent and the diff score are OMITTED (a self-diff scores 100% by
     /// construction); -f markdown, json and json-pretty only.
     allow_self_diff: bool,
+    #[argp(option)]
+    /// Fail on a MEASUREMENT, not just an error. Repeatable. Rules:
+    /// min-match=<pct> (exit 2 if a match percent is below pct),
+    /// detectors (exit 3 if any pattern detector could not run; requires
+    /// --analyze), nonempty (exit 4 if nothing was examined — always enforced
+    /// by any --strict, spelled or not). Exit 5 means the strict config cannot
+    /// apply here. Without --strict, exit codes are unchanged.
+    strict: Vec<String>,
 }
 
 /// Resolve a `-u` / `--unit` argument to a position in `names`.
@@ -949,6 +957,28 @@ pub fn run(args: Args) -> Result<()> {
         bail!("--output can only be used with --format json, json-pretty, markdown, or proto");
     }
 
+    // `--strict` needs a measured result to adjudicate. The interactive TUI
+    // never produces one, and the proto path goes through upstream's oneshot
+    // writer, which computes no analysis. Accepting the flag there and doing
+    // nothing is the exact defect this channel was added to remove, so refuse
+    // instead — with the code that means "your configuration cannot apply
+    // here", not the one that means "your build is broken".
+    {
+        let strict = super::strict::StrictConfig::parse(&args.strict)?;
+        if strict.enabled()
+            && !matches!(
+                output_format,
+                DiffOutputFormat::Json | DiffOutputFormat::JsonPretty | DiffOutputFormat::Markdown
+            )
+        {
+            return strict.reject_rule(
+                "<any rule>",
+                "--strict needs a measured, non-interactive result. Use -f json, \
+                 -f json-pretty or -f markdown.",
+            );
+        }
+    }
+
     match output_format {
         DiffOutputFormat::Tui => {
             run_interactive(args, target_path, base_path, project_config, unit_options, project_dir)
@@ -1109,6 +1139,48 @@ fn build_config_from_args(
     }
 
     Ok((diff_config, mapping_config))
+}
+
+/// Apply the strict rules to one measured symbol.
+///
+/// Order matters and is not incidental: vacuity first, then the threshold, then
+/// coverage. A run that measured nothing must not be able to report itself as a
+/// threshold pass, which is what happens if the cheap numeric check goes first.
+fn apply_strict_to_output(cfg: &super::strict::StrictConfig, output: &DiffOutput) -> Result<()> {
+    if !cfg.enabled() {
+        return Ok(());
+    }
+    let subject = format!("`{}`", output.symbol);
+
+    if cfg.wants_detectors() && output.analysis.is_none() {
+        // Silently passing here would be the worst available outcome: the
+        // caller asked for a coverage guarantee and would receive a green run
+        // in which no coverage was ever computed.
+        return cfg.reject_rule(
+            "detectors",
+            "no pattern analysis was computed for this diff. Pass --analyze (or --verdict, \
+             which implies it).",
+        );
+    }
+
+    cfg.check_match_percent(output.canonical_match_percent, &subject)?;
+
+    if let Some(analysis) = &output.analysis {
+        let offenders: Vec<(&str, &str, String)> = analysis
+            .checks_that_could_not_run()
+            .iter()
+            .map(|c| {
+                let status = match c.status {
+                    super::analysis::CheckStatus::Starved => "starved",
+                    super::analysis::CheckStatus::NotApplicable => "not_applicable",
+                    super::analysis::CheckStatus::Ran => "ran",
+                };
+                (c.pattern, status, c.reason.clone().unwrap_or_default())
+            })
+            .collect();
+        cfg.check_detectors(&offenders, &subject)?;
+    }
+    Ok(())
 }
 
 fn run_json(
@@ -1428,8 +1500,16 @@ fn run_json(
         concise: args.concise,
     };
 
-    // Write output
+    // Write output FIRST, then adjudicate. A strict failure must not cost the
+    // caller the diff that explains it — a guard that suppresses its own
+    // evidence is a guard people route around.
     write_diff_output(&output, args.output.as_deref(), output_format, &md_options)?;
+
+    let strict = super::strict::StrictConfig::parse(&args.strict)?;
+    // One symbol was examined by construction: `run_json` bails long before
+    // here if the symbol could not be resolved.
+    strict.check_examined(1, "symbols")?;
+    apply_strict_to_output(&strict, &output)?;
 
     Ok(())
 }
@@ -1616,6 +1696,11 @@ fn check_batch_args(args: &Args) -> Result<()> {
         concise: _,      // inert: markdown rendering only, as in `-f json`
         batch: _,        // read by `run` to get here
         allow_self_diff,
+        // HONOURED. Batch is the natural home of exit 4: a sweep whose every
+        // symbol was `not_found` examined nothing and must not read as clean.
+        // `run_batch` collects a `StrictObservation` per symbol that produced a
+        // real diff row and adjudicates after the JSONL is flushed.
+        strict: _,
     } = args;
 
     let mut refused: Vec<(&str, &str)> = Vec::new();
@@ -2241,6 +2326,14 @@ fn run_batch(args: Args) -> Result<()> {
     let units_total = by_unit.len();
     let units_processed = AtomicUsize::new(0);
 
+    // Strict observations, collected only when `--strict` was given so a
+    // 48,000-symbol sweep pays nothing for a channel it did not ask for. One
+    // entry per symbol that produced a real diff row; `not_found` /
+    // `unit_not_found` error rows deliberately produce none, because a symbol
+    // that could not be diffed was not examined.
+    let strict = super::strict::StrictConfig::parse(&args.strict)?;
+    let strict_obs: std::sync::Mutex<Vec<StrictObservation>> = std::sync::Mutex::new(Vec::new());
+
     let unit_results: Vec<Result<Vec<String>>> = by_unit
         .par_iter()
         .map(|(unit_pos, unit_symbols)| -> Result<Vec<String>> {
@@ -2600,6 +2693,10 @@ fn run_batch(args: Args) -> Result<()> {
                     self_diff: None,
                 };
 
+                if strict.enabled() {
+                    strict_obs.lock().unwrap().push(StrictObservation::from_output(&output));
+                }
+
                 lines.push(serde_json::to_string(&output)?);
             }
 
@@ -2647,7 +2744,74 @@ fn run_batch(args: Args) -> Result<()> {
         symbols.len() - not_found.len() - not_in_unit.len(),
         by_unit.len(),
     );
+
+    // Adjudicate after the rows are written and flushed, for the same reason as
+    // the one-shot path: the caller keeps the corpus that explains the failure.
+    //
+    // The denominator is symbols that produced a DIFF, not symbols requested.
+    // A batch where every symbol was `not_found` examined nothing, and the
+    // whole point of exit 4 is that such a run must not read as clean — this is
+    // the "sweep exiting 0 having analysed nothing" case in its natural home.
+    let observations = strict_obs.into_inner().unwrap();
+    strict.check_examined(observations.len(), "symbols")?;
+    for obs in &observations {
+        obs.adjudicate(&strict)?;
+    }
     Ok(())
+}
+
+/// What the strict channel needs to remember about one batch row.
+///
+/// Batch serialises each `DiffOutput` to a string immediately and drops it, so
+/// this is the extract taken before that happens rather than a re-parse of the
+/// JSONL the tool just wrote.
+struct StrictObservation {
+    symbol: String,
+    canonical_match_percent: Option<f32>,
+    has_analysis: bool,
+    /// `(pattern, status, reason)` for every detector whose silence was not a
+    /// measurement.
+    coverage_offenders: Vec<(&'static str, &'static str, String)>,
+}
+
+impl StrictObservation {
+    fn from_output(output: &DiffOutput) -> Self {
+        let coverage_offenders = output
+            .analysis
+            .as_ref()
+            .map(|a| {
+                a.checks_that_could_not_run()
+                    .iter()
+                    .map(|c| {
+                        let status = match c.status {
+                            super::analysis::CheckStatus::Starved => "starved",
+                            super::analysis::CheckStatus::NotApplicable => "not_applicable",
+                            super::analysis::CheckStatus::Ran => "ran",
+                        };
+                        (c.pattern, status, c.reason.clone().unwrap_or_default())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        StrictObservation {
+            symbol: output.symbol.clone(),
+            canonical_match_percent: output.canonical_match_percent,
+            has_analysis: output.analysis.is_some(),
+            coverage_offenders,
+        }
+    }
+
+    fn adjudicate(&self, cfg: &super::strict::StrictConfig) -> Result<()> {
+        let subject = format!("`{}`", self.symbol);
+        if cfg.wants_detectors() && !self.has_analysis {
+            return cfg.reject_rule(
+                "detectors",
+                "batch mode computed no pattern analysis for this symbol. Pass --analyze.",
+            );
+        }
+        cfg.check_match_percent(self.canonical_match_percent, &subject)?;
+        cfg.check_detectors(&self.coverage_offenders, &subject)
+    }
 }
 
 fn build_unit_diff_config(
@@ -4480,6 +4644,7 @@ mod tests {
             concise: false,
             batch: true,
             allow_self_diff: false,
+            strict: Vec::new(),
         }
     }
 
