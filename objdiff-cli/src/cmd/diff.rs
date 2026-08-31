@@ -381,7 +381,10 @@ pub struct BranchTo {
     pub branch_idx: u32,
 }
 
-#[derive(Serialize)]
+/// `Clone` is here for the detector-coverage coupling test, which re-labels a
+/// fixture's `match_type` to a kind a detector disclaims and asserts it stays
+/// silent. Nothing in the production paths clones these.
+#[derive(Serialize, Clone)]
 pub struct InstructionDiffOutput {
     pub index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1254,6 +1257,7 @@ fn run_json(
             super::analysis::analyze_instructions_for(
                 instrs,
                 super::analysis::SymbolPairing::new(&symbol.name, symbol_diff.masked_equal_symbol),
+                diff_config.function_reloc_diffs,
             )
         })
     } else {
@@ -2443,6 +2447,7 @@ fn run_batch(args: Args) -> Result<()> {
                                     &symbol.name,
                                     fb_sd.masked_equal_symbol,
                                 ),
+                                diff_config.function_reloc_diffs,
                             );
                             let fb_verdict = super::analysis::compute_verdict(
                                 &fb_summary,
@@ -2528,6 +2533,7 @@ fn run_batch(args: Args) -> Result<()> {
                         &symbol.name,
                         symbol_diff.masked_equal_symbol,
                     ),
+                    diff_config.function_reloc_diffs,
                 );
                 let verdict = super::analysis::compute_verdict(
                     &instruction_summary,
@@ -3253,6 +3259,7 @@ pub fn analyze_symbol(
     let analysis = super::analysis::analyze_instructions_for(
         &instructions,
         super::analysis::SymbolPairing::new(&symbol.name, symbol_diff.masked_equal_symbol),
+        diff_config.function_reloc_diffs,
     );
     let verdict = super::analysis::compute_verdict(
         &instruction_summary,
@@ -3577,14 +3584,52 @@ fn render_diff_markdown(output: &DiffOutput, options: &MarkdownOptions) -> Strin
         }
         writeln!(md).unwrap();
 
-        // Analysis Summary (compact)
+        // Analysis Summary (compact).
+        //
+        // "Patterns checked: 26" used to be printed unconditionally, including
+        // for a diff where no detector could run. It now counts only the
+        // detectors whose silence is a measurement, and the detectors that could
+        // NOT run are named rather than absorbed into the same number.
+        let could_not_run = analysis.checks_that_could_not_run();
         writeln!(
             md,
-            "**Unattributed mismatches**: {} | **Patterns checked**: {}",
+            "**Unattributed mismatches**: {} | **Detectors that ran**: {}/{}",
             analysis.unattributed_mismatches,
-            analysis.patterns_checked.len()
+            analysis.patterns_checked.len(),
+            analysis.pattern_checks.len(),
         )
         .unwrap();
+        if !could_not_run.is_empty() {
+            writeln!(md).unwrap();
+            writeln!(
+                md,
+                "> {} detector(s) could NOT run on this symbol; a zero from them is not a \
+                 measurement:",
+                could_not_run.len()
+            )
+            .unwrap();
+            let starved: Vec<&str> = could_not_run
+                .iter()
+                .filter(|c| c.status == super::analysis::CheckStatus::Starved)
+                .map(|c| c.pattern)
+                .collect();
+            let na: Vec<&str> = could_not_run
+                .iter()
+                .filter(|c| c.status == super::analysis::CheckStatus::NotApplicable)
+                .map(|c| c.pattern)
+                .collect();
+            if !starved.is_empty() {
+                writeln!(
+                    md,
+                    ">   - starved by the configured relocation ruler: {}",
+                    starved.join(", ")
+                )
+                .unwrap();
+            }
+            if !na.is_empty() {
+                writeln!(md, ">   - no rows of the kind they read: {}", na.join(", ")).unwrap();
+            }
+        }
         writeln!(md).unwrap();
     }
 

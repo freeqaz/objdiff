@@ -554,11 +554,436 @@ pub struct Pattern {
     pub doc_urls: Vec<String>,
 }
 
+// =============================================================================
+// Detector coverage — what a zero from a detector is worth
+// =============================================================================
+
+/// Whether a detector's silence in this run is a measurement.
+///
+/// The three states exist because there are three genuinely different reasons a
+/// detector can report nothing, and collapsing them is the defect this type was
+/// added to close. A consumer ranking work off detector output must be able to
+/// tell "we looked and it is not there" from "we could not look".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    /// The detector had rows of the kind it reads, and the configured ruler did
+    /// not suppress the evidence class it reads. **A zero is a measurement.**
+    Ran,
+    /// The detector had rows, but the configured relocation ruler systematically
+    /// suppresses the evidence it reads: the differences it looks for are scored
+    /// `equal` upstream in `objdiff_core::diff::code::reloc_eq` and never reach
+    /// it as a `diff_arg` row. It is not *impossible* for such a detector to
+    /// fire — the evidence can ride along on a row that is `diff_arg` for some
+    /// other reason — which is exactly why this is a third state and not
+    /// [`CheckStatus::NotApplicable`]. **A zero is NOT a measurement.**
+    Starved,
+    /// The detector had zero rows of the kind it reads. It could not have fired
+    /// whatever the source says. **A zero is not a measurement, and not even a
+    /// weak one.**
+    NotApplicable,
+}
+
+/// One detector's coverage record for one analysed symbol.
+#[derive(Debug, Clone, Serialize)]
+pub struct PatternCheck {
+    /// The detector, spelled as [`PatternType::as_str`] spells it — the same
+    /// string that appears in `patterns[].pattern`.
+    pub pattern: &'static str,
+    pub status: CheckStatus,
+    /// Why the status is not `ran`. Always present for `starved` and
+    /// `not_applicable`, always absent for `ran`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// How many instruction-diff rows this detector was in a position to read:
+    /// rows whose `match_type` is one it consumes AND which carry the sides it
+    /// needs. `0` is the `not_applicable` case.
+    pub rows_examined: usize,
+}
+
+/// The kind of evidence a detector reads, which decides whether the relocation
+/// ruler can starve it.
+///
+/// The relevant upstream fact is in `objdiff_core::diff::code::reloc_eq`: under
+/// `functionRelocDiffs=none` it returns `true` before comparing anything, and
+/// under `name_check` it returns `true` when the TARGET-side relocation names a
+/// splitter placeholder. Either way the row is scored `equal`, so the difference
+/// never becomes a `diff_arg` row and never reaches a detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// Opcodes, registers, immediates and row structure only. No relocation is
+    /// involved, so no relocation ruler can hide anything from it.
+    Plain,
+    /// Reads relocation-derived text — a callee/data symbol NAME, or the address
+    /// a relocation resolves to — out of an instruction's arguments.
+    RelocText,
+    /// [`Evidence::RelocText`], and specifically needs a relocation whose target
+    /// carries a splitter PLACEHOLDER name to be charged. Starved by one more
+    /// ruler than `RelocText` is.
+    RelocPlaceholderName,
+}
+
+/// Which sides of a row a detector needs before it can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideNeed {
+    Both,
+    Target,
+    Base,
+    Either,
+}
+
+/// What one detector requires before its silence means anything.
+///
+/// **These are transcribed from the detector bodies, not invented**, and the
+/// transcription is held to the bodies by `detector_reqs_admit_every_firing_row`
+/// — a test that runs every detector over a corpus and fails if any detector
+/// fires on a symbol where its declared requirement says it had zero rows. A
+/// wrong entry here would be a *new* false statement (claiming a detector could
+/// not run when it did), so the coupling test is the deliverable, not the table.
+struct DetectorReq {
+    pattern: PatternType,
+    /// `match_type` values the detector's row loop accepts.
+    rows: &'static [&'static str],
+    sides: SideNeed,
+    evidence: Evidence,
+}
+
+/// Row/evidence requirements for the 25 row-driven detectors.
+///
+/// `UNVERIFIABLE_PAIRING` is deliberately absent: it is symbol-level, not
+/// row-driven, and [`detector_coverage`] handles it separately.
+const DETECTOR_REQS: &[DetectorReq] = &[
+    // detect_callee_divergences: `match_type != "diff_arg"` -> continue; then
+    // `let (Some(target), Some(base))`. All five classes share the loop.
+    DetectorReq {
+        pattern: PatternType::LinkerMerged,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    DetectorReq {
+        pattern: PatternType::WrongCallee,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    DetectorReq {
+        pattern: PatternType::TemplateInstantiationMismatch,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    DetectorReq {
+        pattern: PatternType::RegisterSaveHelperMismatch,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    DetectorReq {
+        pattern: PatternType::UnverifiableCalleeName,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocPlaceholderName,
+    },
+    // detect_bool_mask: `!matches!(match_type, "delete" | "insert")` -> continue;
+    // then iterates `[target, base]` flattened, so either side will do.
+    DetectorReq {
+        pattern: PatternType::BoolMask,
+        rows: &["delete", "insert"],
+        sides: SideNeed::Either,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::RegisterSwap,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::ComparisonStyle,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    // detect_control_flow: `!matches!(match_type, "diff_op" | "replace")` ->
+    // continue; reads `target.as_ref()` / `base.as_ref()` independently.
+    DetectorReq {
+        pattern: PatternType::ControlFlow,
+        rows: &["diff_op", "replace"],
+        sides: SideNeed::Either,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::CommutativeOpOrder,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::OffsetSwap,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    // Reads an anonymous-namespace TU hash out of a relocation's symbol name.
+    DetectorReq {
+        pattern: PatternType::AnonymousNamespaceHash,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    // Reads a `$S<n>` guard ordinal out of a relocation's symbol name.
+    DetectorReq {
+        pattern: PatternType::StaticGuardCounter,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    // detect_dynamic_cast_mismatch: `match_type != "insert"` -> continue; reads
+    // `instr.base` only.
+    DetectorReq {
+        pattern: PatternType::DynamicCastMismatch,
+        rows: &["insert"],
+        sides: SideNeed::Base,
+        evidence: Evidence::Plain,
+    },
+    // detect_dead_store_elimination: index-pair scan over `insert` rows reading
+    // `instructions[i].base`.
+    DetectorReq {
+        pattern: PatternType::DeadStoreElimination,
+        rows: &["insert"],
+        sides: SideNeed::Base,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::PrologueMismatch,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::AllocaMismatch,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    // Reads a `?<n>?` scope ordinal out of a relocation's symbol name.
+    DetectorReq {
+        pattern: PatternType::ScopeCounterMismatch,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    // Reads `??$MakeString@...` template arguments out of a relocation's name.
+    DetectorReq {
+        pattern: PatternType::MakeStringTemplateMismatch,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    // Its whole subject is the address a relocation resolves to.
+    DetectorReq {
+        pattern: PatternType::AddressRelocationNoise,
+        rows: &["diff_arg"],
+        sides: SideNeed::Both,
+        evidence: Evidence::RelocText,
+    },
+    DetectorReq {
+        pattern: PatternType::BooleanNegation,
+        rows: &["replace"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::FloatPrecisionMismatch,
+        rows: &["replace"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+    // detect_fsel_ternary / detect_float_to_int_to_float: `match_type !=
+    // "replace"` -> continue; then `let Some(target)` only.
+    DetectorReq {
+        pattern: PatternType::FselTernary,
+        rows: &["replace"],
+        sides: SideNeed::Target,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::FloatToIntToFloat,
+        rows: &["replace"],
+        sides: SideNeed::Target,
+        evidence: Evidence::Plain,
+    },
+    DetectorReq {
+        pattern: PatternType::SignednessMismatch,
+        rows: &["replace"],
+        sides: SideNeed::Both,
+        evidence: Evidence::Plain,
+    },
+];
+
+impl DetectorReq {
+    /// Rows this detector was in a position to read.
+    fn rows_examined(&self, instructions: &[InstructionDiffOutput]) -> usize {
+        instructions
+            .iter()
+            .filter(|i| self.rows.contains(&i.match_type.as_str()))
+            .filter(|i| match self.sides {
+                SideNeed::Both => i.target.is_some() && i.base.is_some(),
+                SideNeed::Target => i.target.is_some(),
+                SideNeed::Base => i.base.is_some(),
+                SideNeed::Either => i.target.is_some() || i.base.is_some(),
+            })
+            .count()
+    }
+
+    fn missing_rows_reason(&self) -> String {
+        let sides = match self.sides {
+            SideNeed::Both => "carrying both sides",
+            SideNeed::Target => "carrying a target side",
+            SideNeed::Base => "carrying a base side",
+            SideNeed::Either => "carrying either side",
+        };
+        format!(
+            "no `{}` row {} in this diff — the detector reads no other row kind, \
+             so it could not have fired",
+            self.rows.join("`/`"),
+            sides,
+        )
+    }
+}
+
+/// Whether the configured relocation ruler starves a detector reading `evidence`,
+/// and if so, why — in the ruler's own vocabulary, so a reader can act on it.
+fn starvation_reason(
+    evidence: Evidence,
+    ruler: objdiff_core::diff::FunctionRelocDiffs,
+) -> Option<String> {
+    use objdiff_core::diff::FunctionRelocDiffs as R;
+    match evidence {
+        Evidence::Plain => None,
+        Evidence::RelocText | Evidence::RelocPlaceholderName => match ruler {
+            R::None => Some(
+                "functionRelocDiffs=none: `reloc_eq` returns true before comparing \
+                 relocations, so a site whose two sides name different symbols is scored \
+                 `equal` and never reaches this detector as a `diff_arg` row. A zero here \
+                 is a property of the ruler, not of the build."
+                    .to_string(),
+            ),
+            _ if evidence == Evidence::RelocPlaceholderName && matches!(ruler, R::NameCheck) => {
+                Some(
+                    "functionRelocDiffs=name_check exempts a TARGET-side relocation whose \
+                     symbol carries a splitter placeholder name (`fn_<hex>`, `lbl_*`, ...) \
+                     before this detector runs, which is half of what it exists to find. \
+                     A zero here is mostly a property of the ruler."
+                        .to_string(),
+                )
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Build the per-detector coverage table for one analysed symbol.
+///
+/// `fired` names the detectors that actually produced a pattern. A detector that
+/// fired is [`CheckStatus::Ran`] by construction and no declaration can override
+/// that — which is the direction this table cannot lie in.
+fn detector_coverage(
+    instructions: &[InstructionDiffOutput],
+    fired: &[PatternType],
+    ruler: objdiff_core::diff::FunctionRelocDiffs,
+    pairing_is_checkable: bool,
+) -> Vec<PatternCheck> {
+    let mut checks = Vec::with_capacity(PatternType::ALL.len());
+    for pattern in PatternType::ALL {
+        if *pattern == PatternType::UnverifiablePairing {
+            // Symbol-level, and its gate is explicit in `analyze_instructions_for`:
+            // it is only consulted when the symbol has at least one mismatch row.
+            // With no mismatch there is nothing to qualify, so the check does not
+            // apply; with one, asking "is this pairing asserted?" and answering
+            // "yes" IS a measurement.
+            checks.push(PatternCheck {
+                pattern: pattern.as_str(),
+                status: if pairing_is_checkable {
+                    CheckStatus::Ran
+                } else {
+                    CheckStatus::NotApplicable
+                },
+                reason: (!pairing_is_checkable).then(|| {
+                    "no mismatched rows: a pairing with nothing to qualify is not \
+                     asked about"
+                        .to_string()
+                }),
+                rows_examined: instructions.iter().filter(|i| i.match_type != "equal").count(),
+            });
+            continue;
+        }
+        let Some(req) = DETECTOR_REQS.iter().find(|r| r.pattern == *pattern) else {
+            // Unreachable while DETECTOR_REQS covers ALL minus UnverifiablePairing,
+            // which `detector_reqs_cover_every_pattern_type` asserts. Reported as
+            // an unknown rather than silently omitted: a detector missing from the
+            // table is exactly the state this whole field exists to surface.
+            checks.push(PatternCheck {
+                pattern: pattern.as_str(),
+                status: CheckStatus::NotApplicable,
+                reason: Some(
+                    "no coverage requirement declared for this detector — its status is \
+                     unknown, which is not the same as clean"
+                        .to_string(),
+                ),
+                rows_examined: 0,
+            });
+            continue;
+        };
+        let rows = req.rows_examined(instructions);
+        let (status, reason) = if fired.contains(pattern) {
+            (CheckStatus::Ran, None)
+        } else if rows == 0 {
+            (CheckStatus::NotApplicable, Some(req.missing_rows_reason()))
+        } else if let Some(why) = starvation_reason(req.evidence, ruler) {
+            (CheckStatus::Starved, Some(why))
+        } else {
+            (CheckStatus::Ran, None)
+        };
+        checks.push(PatternCheck {
+            pattern: pattern.as_str(),
+            status,
+            reason,
+            rows_examined: rows,
+        });
+    }
+    checks
+}
+
 /// Full analysis results.
 #[derive(Debug, Clone, Serialize)]
 pub struct Analysis {
     pub patterns: Vec<Pattern>,
+    /// Detectors for which a zero IS a measurement: they had rows of the kind
+    /// they read, and nothing about the configured ruler suppressed the
+    /// evidence class they read.
+    ///
+    /// ⚠ **This field used to be a hardcoded list of all 26 detector names,
+    /// emitted unconditionally.** It said "26" for an empty diff, for a
+    /// one-sided diff, and for a run under `functionRelocDiffs=none` where the
+    /// five callee classes cannot see relocation evidence at all — so a
+    /// consumer reading `patterns_checked: 26` with an empty findings list
+    /// could not tell "26 checks ran and found nothing" from "nothing ran".
+    /// dc3-decomp's `scripts/analysis/pattern_census.py` printed exactly that
+    /// conflation, in those words: *"N of 26 checked patterns fired on ZERO
+    /// functions under this ruler (measured zero, not an unmeasured one)"*.
+    ///
+    /// It is now the subset of [`Analysis::pattern_checks`] whose status is
+    /// [`CheckStatus::Ran`], so that sentence is true as written. The full
+    /// per-detector table, including the ones that could NOT run and why, is
+    /// [`Analysis::pattern_checks`] — read that if you need to distinguish the
+    /// three states.
     pub patterns_checked: Vec<&'static str>,
+    /// Per-detector status for all 26 detectors: `ran`, `starved` or
+    /// `not_applicable`, each non-`ran` one carrying the reason it could not
+    /// produce a measurement. See [`PatternCheck`].
+    pub pattern_checks: Vec<PatternCheck>,
     pub unattributed_mismatches: usize,
 }
 
@@ -566,6 +991,15 @@ impl Analysis {
     /// Check if a specific pattern type was detected.
     pub fn has_pattern(&self, pattern_type: PatternType) -> bool {
         self.patterns.iter().any(|p| p.pattern == pattern_type)
+    }
+
+    /// Detectors that could not produce a measurement in this run, with their
+    /// reasons. Empty when every detector ran.
+    ///
+    /// This is what `--strict detectors` fails on, and what a consumer should
+    /// consult before reporting a detector's zero as a finding of absence.
+    pub fn checks_that_could_not_run(&self) -> Vec<&PatternCheck> {
+        self.pattern_checks.iter().filter(|c| c.status != CheckStatus::Ran).collect()
     }
 
     /// Get total instruction count attributed to a pattern type.
@@ -4246,14 +4680,29 @@ impl<'a> SymbolPairing<'a> {
 /// keep asserting the un-qualified behaviour.
 #[allow(dead_code)]
 pub fn analyze_instructions(instructions: &[InstructionDiffOutput]) -> Analysis {
-    analyze_instructions_for(instructions, SymbolPairing::ASSERTED)
+    analyze_instructions_for(instructions, SymbolPairing::ASSERTED, DEFAULT_ANALYSIS_RULER)
 }
+
+/// The relocation ruler [`analyze_instructions`] assumes when a caller does not
+/// name one.
+///
+/// `NameAddress` is objdiff-core's own `DiffObjConfig` default. Chosen because
+/// it starves nothing: a test that does not care about the ruler gets the
+/// answer where every detector is eligible, so a `starved` status in a test is
+/// always something the test asked for.
+pub const DEFAULT_ANALYSIS_RULER: objdiff_core::diff::FunctionRelocDiffs =
+    objdiff_core::diff::FunctionRelocDiffs::NameAddress;
 
 /// Analyse a diff, qualifying the result by what is known about the symbol's
 /// identity. See [`SymbolPairing`] and [`PatternType::UnverifiablePairing`].
+///
+/// `ruler` is the run's `functionRelocDiffs` setting. It does not change what
+/// any detector does — it changes what the ROWS can contain, and therefore
+/// whether a detector's silence is a measurement. See [`CheckStatus::Starved`].
 pub fn analyze_instructions_for(
     instructions: &[InstructionDiffOutput],
     pairing: SymbolPairing<'_>,
+    ruler: objdiff_core::diff::FunctionRelocDiffs,
 ) -> Analysis {
     let mut patterns = Vec::new();
 
@@ -4370,38 +4819,15 @@ pub fn analyze_instructions_for(
     // Note: patterns may overlap, so this can be negative (we clamp to 0)
     let unattributed = total_mismatches.saturating_sub(attributed);
 
-    Analysis {
-        patterns,
-        patterns_checked: vec![
-            "LINKER_MERGED",
-            "WRONG_CALLEE",
-            "TEMPLATE_INSTANTIATION_MISMATCH",
-            "REGISTER_SAVE_HELPER_MISMATCH",
-            "UNVERIFIABLE_CALLEE_NAME",
-            "BOOL_MASK",
-            "REGISTER_SWAP",
-            "COMPARISON_STYLE",
-            "CONTROL_FLOW",
-            "COMMUTATIVE_OP_ORDER",
-            "OFFSET_SWAP",
-            "ANONYMOUS_NAMESPACE_HASH",
-            "STATIC_GUARD_COUNTER",
-            "DYNAMIC_CAST_MISMATCH",
-            "DEAD_STORE_ELIMINATION",
-            "PROLOGUE_MISMATCH",
-            "ALLOCA_MISMATCH",
-            "SCOPE_COUNTER_MISMATCH",
-            "MAKESTRING_TEMPLATE_MISMATCH",
-            "ADDRESS_RELOCATION_NOISE",
-            "BOOLEAN_NEGATION",
-            "FLOAT_PRECISION_MISMATCH",
-            "FSEL_TERNARY",
-            "FLOAT_TO_INT_TO_FLOAT",
-            "SIGNEDNESS_MISMATCH",
-            "UNVERIFIABLE_PAIRING",
-        ],
-        unattributed_mismatches: unattributed,
-    }
+    // Coverage. `fired` is read from the patterns actually produced above, so
+    // "this detector found something" can never be reported as "this detector
+    // could not run".
+    let fired: Vec<PatternType> = patterns.iter().map(|p| p.pattern).collect();
+    let pattern_checks = detector_coverage(instructions, &fired, ruler, total_mismatches > 0);
+    let patterns_checked =
+        pattern_checks.iter().filter(|c| c.status == CheckStatus::Ran).map(|c| c.pattern).collect();
+
+    Analysis { patterns, patterns_checked, pattern_checks, unattributed_mismatches: unattributed }
 }
 
 // =============================================================================
@@ -5995,6 +6421,7 @@ mod tests {
         let analysis = Analysis {
             patterns: vec![],
             patterns_checked: vec!["LINKER_MERGED", "BOOL_MASK", "REGISTER_SWAP"],
+            pattern_checks: vec![],
             unattributed_mismatches: 0,
         };
 
@@ -6022,6 +6449,7 @@ mod tests {
         let no_patterns = Analysis {
             patterns: vec![],
             patterns_checked: vec!["LINKER_MERGED"],
+            pattern_checks: vec![],
             unattributed_mismatches: 0,
         };
 
@@ -6108,6 +6536,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["LINKER_MERGED", "BOOL_MASK", "REGISTER_SWAP"],
+            pattern_checks: vec![],
             unattributed_mismatches: 1,
         };
 
@@ -6281,15 +6710,49 @@ mod tests {
         assert_eq!(parse_comparison_immediate("r3, 0"), Some(0));
     }
 
+    /// A single `equal` row is the canonical "nothing could have run" input:
+    /// every detector's row loop skips it. This test used to assert the exact
+    /// opposite — that `patterns_checked` names COMPARISON_STYLE and
+    /// CONTROL_FLOW on this input — which is precisely the claim the field
+    /// could not support. It now asserts the honest answer.
     #[test]
-    fn test_analyze_instructions_includes_new_patterns() {
-        // Verify that analyze_instructions includes the new patterns in patterns_checked
+    fn nothing_can_run_on_an_all_equal_diff() {
         let instructions =
             vec![make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4"))];
 
         let analysis = analyze_instructions(&instructions);
-        assert!(analysis.patterns_checked.contains(&"COMPARISON_STYLE"));
-        assert!(analysis.patterns_checked.contains(&"CONTROL_FLOW"));
+        assert!(
+            analysis.patterns_checked.is_empty(),
+            "no detector can read an all-equal diff, so nothing may claim to have been \
+             checked; got {:?}",
+            analysis.patterns_checked
+        );
+        assert_eq!(
+            analysis.pattern_checks.len(),
+            PatternType::ALL.len(),
+            "the table must still account for every detector"
+        );
+        for check in &analysis.pattern_checks {
+            assert_eq!(
+                check.status,
+                CheckStatus::NotApplicable,
+                "{} should be not_applicable on an all-equal diff",
+                check.pattern
+            );
+            assert!(check.reason.is_some(), "{} must say why it could not run", check.pattern);
+            assert_eq!(check.rows_examined, 0, "{}", check.pattern);
+        }
+
+        // SABOTAGE CONTROL. If `patterns_checked` ever goes back to being a
+        // hardcoded vocabulary, the assertions above are the only thing standing
+        // between a consumer and "26 checks ran, nothing found" on an input where
+        // nothing ran. Restate that as an explicit inequality so the intent
+        // survives a refactor that keeps the field but drops the emptiness check.
+        assert_ne!(
+            analysis.patterns_checked.len(),
+            PatternType::ALL.len(),
+            "a full-vocabulary patterns_checked on an all-equal diff is the defect"
+        );
     }
 
     #[test]
@@ -6570,15 +7033,41 @@ mod tests {
         assert!(pattern.is_none(), "Should not detect non-symmetric offsets");
     }
 
+    /// A `diff_arg` row with both sides IS material for the arg-reading
+    /// detectors, so they are the ones entitled to say "checked, found nothing".
+    /// The `replace`-only and `insert`-only detectors are not, and this test
+    /// pins the boundary — it is the "ran and found nothing" half of the pair
+    /// with [`nothing_can_run_on_an_all_equal_diff`].
     #[test]
-    fn test_analyze_instructions_includes_all_patterns() {
-        // Verify that analyze_instructions includes all patterns in patterns_checked
-        let instructions =
-            vec![make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4"))];
+    fn arg_reading_detectors_ran_on_a_diff_arg_row() {
+        let instructions = vec![make_instr(
+            0,
+            "diff_arg",
+            Some("addi"),
+            Some("r3, r4, 8"),
+            Some("addi"),
+            Some("r3, r4, 12"),
+        )];
 
         let analysis = analyze_instructions(&instructions);
-        assert!(analysis.patterns_checked.contains(&"COMMUTATIVE_OP_ORDER"));
-        assert!(analysis.patterns_checked.contains(&"OFFSET_SWAP"));
+        // These read `diff_arg` rows with both sides and are not relocation-fed.
+        for name in ["COMMUTATIVE_OP_ORDER", "OFFSET_SWAP", "COMPARISON_STYLE", "REGISTER_SWAP"] {
+            assert!(
+                analysis.patterns_checked.contains(&name),
+                "{name} reads diff_arg rows and had one: its silence IS a measurement"
+            );
+        }
+        // These read row kinds this diff does not contain, and must say so
+        // rather than be counted as checked.
+        for name in ["BOOLEAN_NEGATION", "FSEL_TERNARY", "DYNAMIC_CAST_MISMATCH", "BOOL_MASK"] {
+            let check = analysis
+                .pattern_checks
+                .iter()
+                .find(|c| c.pattern == name)
+                .unwrap_or_else(|| panic!("{name} missing from the coverage table"));
+            assert_eq!(check.status, CheckStatus::NotApplicable, "{name}");
+            assert!(!analysis.patterns_checked.contains(&name), "{name}");
+        }
     }
 
     // =========================================================================
@@ -6970,8 +7459,12 @@ mod tests {
         let instructions: Vec<InstructionDiffOutput> = (0..10)
             .map(|i| make_instr(i, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4")))
             .collect();
-        let analysis =
-            Analysis { patterns: vec![], patterns_checked: vec![], unattributed_mismatches: 0 };
+        let analysis = Analysis {
+            patterns: vec![],
+            patterns_checked: vec![],
+            pattern_checks: vec![],
+            unattributed_mismatches: 0,
+        };
         let regions = compute_diff_regions(&instructions, &analysis);
         assert_eq!(regions.len(), 1);
         assert!((regions[0].match_percent - 100.0).abs() < 0.01);
@@ -7013,8 +7506,12 @@ mod tests {
                 Some("0x100"),
             ));
         }
-        let analysis =
-            Analysis { patterns: vec![], patterns_checked: vec![], unattributed_mismatches: 5 };
+        let analysis = Analysis {
+            patterns: vec![],
+            patterns_checked: vec![],
+            pattern_checks: vec![],
+            unattributed_mismatches: 5,
+        };
         let regions = compute_diff_regions(&instructions, &analysis);
         assert!(regions.len() >= 2, "Long equal run should split into multiple regions");
     }
@@ -7055,8 +7552,12 @@ mod tests {
                 Some("0x100"),
             ));
         }
-        let analysis =
-            Analysis { patterns: vec![], patterns_checked: vec![], unattributed_mismatches: 5 };
+        let analysis = Analysis {
+            patterns: vec![],
+            patterns_checked: vec![],
+            pattern_checks: vec![],
+            unattributed_mismatches: 5,
+        };
         let regions = compute_diff_regions(&instructions, &analysis);
         // Short equal run should merge into one region (non-matched spans merge)
         assert_eq!(regions.len(), 1, "Short equal run should not split into separate regions");
@@ -7065,8 +7566,12 @@ mod tests {
     #[test]
     fn test_regions_empty() {
         let instructions: Vec<InstructionDiffOutput> = vec![];
-        let analysis =
-            Analysis { patterns: vec![], patterns_checked: vec![], unattributed_mismatches: 0 };
+        let analysis = Analysis {
+            patterns: vec![],
+            patterns_checked: vec![],
+            pattern_checks: vec![],
+            unattributed_mismatches: 0,
+        };
         let regions = compute_diff_regions(&instructions, &analysis);
         assert!(regions.is_empty());
     }
@@ -7164,6 +7669,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["LINKER_MERGED"],
+            pattern_checks: vec![],
             unattributed_mismatches: 1,
         };
         let verdict = compute_verdict(&summary, &analysis, Some(97.0), 100, 100);
@@ -7198,6 +7704,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["CONTROL_FLOW"],
+            pattern_checks: vec![],
             unattributed_mismatches: 2,
         };
         let verdict = compute_verdict(&summary, &analysis, Some(85.0), 100, 100);
@@ -7614,18 +8121,402 @@ mod tests {
         assert!(analysis.has_pattern(PatternType::SignednessMismatch));
     }
 
+    /// The relocation ruler decides whether a relocation-fed detector's zero is
+    /// a measurement, and the field now says which.
+    ///
+    /// This is the case dc3-decomp's pattern census reports as
+    /// `UNVERIFIABLE_CALLEE_NAME 0` and CLAUDE.md annotates by hand as
+    /// "structural — the graded ruler exempts placeholder names before the
+    /// detector runs". That annotation lived in a human doc because the tool
+    /// could not say it. Now it can.
     #[test]
-    fn test_analyze_instructions_includes_phase4_patterns() {
-        let instructions =
-            vec![make_instr(0, "equal", Some("mr"), Some("r3, r4"), Some("mr"), Some("r3, r4"))];
+    fn the_ruler_decides_whether_a_reloc_fed_zero_is_a_measurement() {
+        use objdiff_core::diff::FunctionRelocDiffs as R;
+        // A diff_arg row with both sides: material for every arg-reading
+        // detector, so row availability is not what varies below.
+        let instructions = vec![make_instr(
+            0,
+            "diff_arg",
+            Some("addi"),
+            Some("r3, r4, 8"),
+            Some("addi"),
+            Some("r3, r4, 12"),
+        )];
+        let status_of = |ruler: R, name: &str| -> CheckStatus {
+            analyze_instructions_for(&instructions, SymbolPairing::ASSERTED, ruler)
+                .pattern_checks
+                .iter()
+                .find(|c| c.pattern == name)
+                .unwrap_or_else(|| panic!("{name} missing from the coverage table"))
+                .status
+        };
 
-        let analysis = analyze_instructions(&instructions);
-        assert!(analysis.patterns_checked.contains(&"MAKESTRING_TEMPLATE_MISMATCH"));
-        assert!(analysis.patterns_checked.contains(&"ADDRESS_RELOCATION_NOISE"));
-        assert!(analysis.patterns_checked.contains(&"BOOLEAN_NEGATION"));
-        assert!(analysis.patterns_checked.contains(&"FLOAT_PRECISION_MISMATCH"));
-        assert!(analysis.patterns_checked.contains(&"FSEL_TERNARY"));
-        assert!(analysis.patterns_checked.contains(&"FLOAT_TO_INT_TO_FLOAT"));
+        // functionRelocDiffs=none relaxes every relocation before the diff is
+        // scored, so no relocation-fed detector's zero means anything.
+        for name in [
+            "LINKER_MERGED",
+            "WRONG_CALLEE",
+            "TEMPLATE_INSTANTIATION_MISMATCH",
+            "REGISTER_SAVE_HELPER_MISMATCH",
+            "UNVERIFIABLE_CALLEE_NAME",
+            "MAKESTRING_TEMPLATE_MISMATCH",
+            "ADDRESS_RELOCATION_NOISE",
+            "ANONYMOUS_NAMESPACE_HASH",
+            "STATIC_GUARD_COUNTER",
+            "SCOPE_COUNTER_MISMATCH",
+        ] {
+            assert_eq!(status_of(R::None, name), CheckStatus::Starved, "{name} under none");
+        }
+
+        // name_check charges real relocation names, so the four verifiable
+        // callee classes ARE measured under it...
+        for name in [
+            "LINKER_MERGED",
+            "WRONG_CALLEE",
+            "TEMPLATE_INSTANTIATION_MISMATCH",
+            "REGISTER_SAVE_HELPER_MISMATCH",
+        ] {
+            assert_eq!(status_of(R::NameCheck, name), CheckStatus::Ran, "{name} under name_check");
+        }
+        // ...but it exempts placeholder-named targets before the detector runs,
+        // so THIS one's zero is not.
+        assert_eq!(
+            status_of(R::NameCheck, "UNVERIFIABLE_CALLEE_NAME"),
+            CheckStatus::Starved,
+            "name_check exempts target-side placeholder names in reloc_eq"
+        );
+
+        // NEGATIVE CONTROL, and the reason this test is not vacuous: under a
+        // ruler that starves nothing, every one of these must read `ran`. If
+        // `starvation_reason` were hardwired to always fire, the block above
+        // would still pass and this one would not.
+        for name in [
+            "LINKER_MERGED",
+            "WRONG_CALLEE",
+            "UNVERIFIABLE_CALLEE_NAME",
+            "MAKESTRING_TEMPLATE_MISMATCH",
+            "ADDRESS_RELOCATION_NOISE",
+        ] {
+            assert_eq!(
+                status_of(R::NameAddress, name),
+                CheckStatus::Ran,
+                "{name} under name_address: nothing suppresses relocation evidence there"
+            );
+        }
+        // And a plain detector must never be starved by any ruler.
+        for ruler in [R::None, R::NameOnly, R::NameCheck, R::NameAddress, R::DataValue, R::All] {
+            assert_eq!(
+                status_of(ruler, "OFFSET_SWAP"),
+                CheckStatus::Ran,
+                "OFFSET_SWAP reads immediates; no relocation ruler can hide them"
+            );
+        }
+    }
+
+    /// The coverage table must account for every detector, or a detector could
+    /// go silently unreported — the same shape of hole as the original defect.
+    #[test]
+    fn detector_reqs_cover_every_pattern_type() {
+        for pattern in PatternType::ALL {
+            if *pattern == PatternType::UnverifiablePairing {
+                continue; // symbol-level, handled explicitly in detector_coverage
+            }
+            assert!(
+                DETECTOR_REQS.iter().any(|r| r.pattern == *pattern),
+                "{} has no declared row requirement",
+                pattern.as_str()
+            );
+        }
+        assert_eq!(DETECTOR_REQS.len(), PatternType::ALL.len() - 1);
+    }
+
+    /// Every `match_type` objdiff emits. The relabelling test below needs the
+    /// complete set: a kind missing here is a kind no declaration is checked
+    /// against.
+    const ALL_MATCH_TYPES: &[&str] =
+        &["equal", "diff_arg", "diff_op", "replace", "insert", "delete"];
+
+    /// Dispatch a single detector by pattern type. An exhaustive `match`, so
+    /// adding a `PatternType` without wiring it here is a COMPILE error rather
+    /// than a silently unexercised detector.
+    fn detector_fires(pattern: PatternType, instrs: &[InstructionDiffOutput]) -> bool {
+        match pattern {
+            PatternType::LinkerMerged
+            | PatternType::WrongCallee
+            | PatternType::TemplateInstantiationMismatch
+            | PatternType::RegisterSaveHelperMismatch
+            | PatternType::UnverifiableCalleeName => {
+                detect_callee_divergences(instrs).iter().any(|p| p.pattern == pattern)
+            }
+            PatternType::BoolMask => detect_bool_mask(instrs).is_some(),
+            PatternType::RegisterSwap => detect_register_swap(instrs).is_some(),
+            PatternType::ComparisonStyle => detect_comparison_style(instrs).is_some(),
+            PatternType::ControlFlow => detect_control_flow(instrs).is_some(),
+            PatternType::CommutativeOpOrder => detect_commutative_op_order(instrs).is_some(),
+            PatternType::OffsetSwap => detect_offset_swap(instrs).is_some(),
+            PatternType::AnonymousNamespaceHash => {
+                detect_anonymous_namespace_hash(instrs).is_some()
+            }
+            PatternType::StaticGuardCounter => detect_static_guard_counter(instrs).is_some(),
+            PatternType::DynamicCastMismatch => detect_dynamic_cast_mismatch(instrs).is_some(),
+            PatternType::DeadStoreElimination => detect_dead_store_elimination(instrs).is_some(),
+            PatternType::PrologueMismatch => detect_prologue_mismatch(instrs).is_some(),
+            PatternType::AllocaMismatch => detect_alloca_mismatch(instrs).is_some(),
+            PatternType::ScopeCounterMismatch => detect_scope_counter_mismatch(instrs).is_some(),
+            PatternType::MakeStringTemplateMismatch => {
+                detect_makestring_template_mismatch(instrs).is_some()
+            }
+            PatternType::AddressRelocationNoise => {
+                detect_address_relocation_noise(instrs).is_some()
+            }
+            PatternType::BooleanNegation => detect_boolean_negation(instrs).is_some(),
+            PatternType::FloatPrecisionMismatch => {
+                detect_float_precision_mismatch(instrs).is_some()
+            }
+            PatternType::FselTernary => detect_fsel_ternary(instrs).is_some(),
+            PatternType::FloatToIntToFloat => detect_float_to_int_to_float(instrs).is_some(),
+            PatternType::SignednessMismatch => detect_signedness_mismatch(instrs).is_some(),
+            // Symbol-level, not row-driven; excluded from DETECTOR_REQS.
+            PatternType::UnverifiablePairing => false,
+        }
+    }
+
+    /// **The coupling test that has teeth**, and the one the first draft did
+    /// not: a corpus-walk alone was VACUOUS for any detector the corpus never
+    /// made fire. Sabotaging `FSEL_TERNARY`'s declared rows from `["replace"]`
+    /// to `["diff_arg"]` passed that draft, because the fsel fixture was missing
+    /// the preceding `fneg`/`fsubs` row the detector requires and so never fired
+    /// at all.
+    ///
+    /// This one does not depend on the corpus firing anything for a given
+    /// detector. For every detector and every `match_type` its declaration does
+    /// NOT claim to read, it re-labels each fixture's rows to that kind and
+    /// asserts the detector stays silent. A declaration narrower than the body
+    /// — the case that makes the tool report `not_applicable` about a detector
+    /// that ran, which is the original defect in a new costume — fires the
+    /// detector on a kind it disclaimed and fails here.
+    ///
+    /// Sabotage-verified in both directions; see the commit message.
+    #[test]
+    fn declared_rows_are_not_narrower_than_the_detector_bodies() {
+        let corpora = coupling_corpora();
+        for req in DETECTOR_REQS {
+            for kind in ALL_MATCH_TYPES {
+                if req.rows.contains(kind) {
+                    continue;
+                }
+                for instrs in &corpora {
+                    let relabelled: Vec<InstructionDiffOutput> = instrs
+                        .iter()
+                        .map(|i| {
+                            let mut c = i.clone();
+                            c.match_type = (*kind).to_string();
+                            c
+                        })
+                        .collect();
+                    assert!(
+                        !detector_fires(req.pattern, &relabelled),
+                        "{} fired on a `{}` row, but its DETECTOR_REQS entry only declares \
+                         `{}`. The coverage table would report `not_applicable` for a \
+                         detector that can run.",
+                        req.pattern.as_str(),
+                        kind,
+                        req.rows.join("`/`"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The corpus must keep making detectors fire, or the positive half of the
+    /// coupling goes quiet without anyone noticing. The covered set is pinned:
+    /// shrinking it fails, growing it fails until the list is updated, which is
+    /// the point — a coverage number that can only be edited deliberately.
+    #[test]
+    fn coupling_corpus_still_exercises_the_detectors_it_claims_to() {
+        let corpora = coupling_corpora();
+        let mut fired: Vec<&'static str> = Vec::new();
+        for req in DETECTOR_REQS {
+            if corpora.iter().any(|instrs| detector_fires(req.pattern, instrs)) {
+                fired.push(req.pattern.as_str());
+            }
+        }
+        fired.sort_unstable();
+        let expected = [
+            "ADDRESS_RELOCATION_NOISE",
+            "BOOL_MASK",
+            "COMPARISON_STYLE",
+            "CONTROL_FLOW",
+            "DYNAMIC_CAST_MISMATCH",
+            "FLOAT_PRECISION_MISMATCH",
+            "FLOAT_TO_INT_TO_FLOAT",
+            "FSEL_TERNARY",
+            "MAKESTRING_TEMPLATE_MISMATCH",
+            "PROLOGUE_MISMATCH",
+            "REGISTER_SAVE_HELPER_MISMATCH",
+            "SIGNEDNESS_MISMATCH",
+            "UNVERIFIABLE_CALLEE_NAME",
+            "WRONG_CALLEE",
+        ];
+        assert_eq!(
+            fired, expected,
+            "the coupling corpus's positive coverage changed; update the list DELIBERATELY \
+             (and note that the relabelling test above is exhaustive regardless)"
+        );
+        // Said plainly rather than left to be inferred: this corpus fires 14 of
+        // the 25 row-driven detectors. The other 11 are covered only by the
+        // exhaustive relabelling test above — which checks the direction that
+        // matters (a declaration narrower than its body) for all 25.
+        assert_eq!(fired.len(), 14);
+        assert_eq!(DETECTOR_REQS.len(), 25);
+    }
+
+    /// Fixtures for the two coupling tests. Kept in one place so the negative
+    /// (relabelling) and positive (coverage) halves are provably about the same
+    /// inputs.
+    fn coupling_corpora() -> Vec<Vec<InstructionDiffOutput>> {
+        // Fixtures chosen to make each row kind and each detector class fire.
+        let corpora: Vec<Vec<InstructionDiffOutput>> = vec![
+            vec![make_instr(
+                0,
+                "diff_arg",
+                Some("bl"),
+                Some("?Foo@@YAXXZ"),
+                Some("bl"),
+                Some("?Bar@@YAXXZ"),
+            )],
+            vec![make_instr(
+                0,
+                "diff_arg",
+                Some("bl"),
+                Some("__savegprlr_25"),
+                Some("bl"),
+                Some("__savegprlr_26"),
+            )],
+            vec![make_instr(
+                0,
+                "diff_arg",
+                Some("bl"),
+                Some("fn_82331360"),
+                Some("bl"),
+                Some("?Real@@YAXXZ"),
+            )],
+            vec![make_instr(
+                0,
+                "diff_arg",
+                Some("addi"),
+                Some("r3, r4, 8"),
+                Some("addi"),
+                Some("r3, r4, 12"),
+            )],
+            vec![
+                make_instr(
+                    0,
+                    "replace",
+                    Some("lha"),
+                    Some("r3, 0(r4)"),
+                    Some("lhz"),
+                    Some("r3, 0(r4)"),
+                ),
+                make_instr(
+                    1,
+                    "replace",
+                    Some("cmplw"),
+                    Some("cr0, r3, r4"),
+                    Some("cmpw"),
+                    Some("cr0, r3, r4"),
+                ),
+            ],
+            // fsel needs the preceding fneg/fsubs row; the first draft of this
+            // corpus omitted it, which is exactly why the FSEL_TERNARY sabotage
+            // slipped through.
+            vec![
+                make_instr(
+                    0,
+                    "replace",
+                    Some("fneg"),
+                    Some("f0, f1"),
+                    Some("fneg"),
+                    Some("f0, f1"),
+                ),
+                make_instr(
+                    1,
+                    "replace",
+                    Some("fsel"),
+                    Some("f1, f0, f12, f1"),
+                    Some("fsel"),
+                    Some("f1, f0, f12, f1"),
+                ),
+            ],
+            vec![
+                make_instr(
+                    0,
+                    "replace",
+                    Some("fctiwz"),
+                    Some("f1, f2"),
+                    Some("fmr"),
+                    Some("f1, f2"),
+                ),
+                make_instr(
+                    1,
+                    "replace",
+                    Some("stfd"),
+                    Some("f1, 8(r1)"),
+                    Some("fmr"),
+                    Some("f2, f1"),
+                ),
+            ],
+            vec![make_instr(
+                0,
+                "replace",
+                Some("fmuls"),
+                Some("f1, f2, f3"),
+                Some("fmul"),
+                Some("f1, f2, f3"),
+            )],
+            vec![make_instr(0, "insert", None, None, Some("bl"), Some("__dynamic_cast"))],
+            vec![
+                make_instr(0, "insert", None, None, Some("li"), Some("r3, 0")),
+                make_instr(1, "insert", None, None, Some("stw"), Some("r3, 0x10(r4)")),
+            ],
+            vec![make_instr(0, "delete", Some("clrlwi"), Some("r3, r3, 24"), None, None)],
+            vec![make_instr(0, "diff_op", Some("bne"), Some("0x10"), Some("beq"), Some("0x10"))],
+            vec![make_instr(
+                0,
+                "diff_arg",
+                Some("cmpwi"),
+                Some("cr0, r3, 5"),
+                Some("cmpwi"),
+                Some("cr0, r3, 6"),
+            )],
+            vec![make_instr(
+                0,
+                "diff_arg",
+                Some("bl"),
+                Some("??$MakeString@D@@YAPADPBD@Z"),
+                Some("bl"),
+                Some("??$MakeString@E@@YAPADPBD@Z"),
+            )],
+            vec![
+                make_instr(
+                    0,
+                    "diff_arg",
+                    Some("lis"),
+                    Some("r3, 0x8210"),
+                    Some("lis"),
+                    Some("r3, 0x8211"),
+                ),
+                make_instr(
+                    1,
+                    "diff_arg",
+                    Some("addi"),
+                    Some("r3, r3, 0x40"),
+                    Some("addi"),
+                    Some("r3, r3, 0x80"),
+                ),
+            ],
+        ];
+        corpora
     }
 
     #[test]
@@ -7687,6 +8578,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["ADDRESS_RELOCATION_NOISE"],
+            pattern_checks: vec![],
             unattributed_mismatches: 1,
         };
 
@@ -7723,6 +8615,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["MAKESTRING_TEMPLATE_MISMATCH"],
+            pattern_checks: vec![],
             unattributed_mismatches: 1,
         };
 
@@ -7755,6 +8648,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["REGISTER_SWAP"],
+            pattern_checks: vec![],
             unattributed_mismatches: 0,
         };
 
@@ -7785,6 +8679,7 @@ mod tests {
                 doc_urls: vec![],
             }],
             patterns_checked: vec!["REGISTER_SWAP"],
+            pattern_checks: vec![],
             unattributed_mismatches: 0,
         };
 
@@ -7871,6 +8766,7 @@ mod tests {
         let named = analyze_instructions_for(
             &instrs,
             SymbolPairing::new("?CheckHueConverge@NgPostProc@@IAAXXZ", false),
+            DEFAULT_ANALYSIS_RULER,
         );
         assert!(
             find(&named, PatternType::UnverifiablePairing).is_none(),
@@ -7883,8 +8779,11 @@ mod tests {
         );
 
         // THE CASE. Same rows, enclosing symbol is a splitter placeholder.
-        let placeholder =
-            analyze_instructions_for(&instrs, SymbolPairing::new("fn_82E4DE20", false));
+        let placeholder = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("fn_82E4DE20", false),
+            DEFAULT_ANALYSIS_RULER,
+        );
         let wc = find(&placeholder, PatternType::WrongCallee)
             .expect("the finding is UNFALSIFIABLE, not false — it must stay visible");
         assert_eq!(
@@ -7937,6 +8836,7 @@ mod tests {
         let named = analyze_instructions_for(
             &instrs,
             SymbolPairing::new("?Draw@RndDrawable@@UAAXXZ", false),
+            DEFAULT_ANALYSIS_RULER,
         );
         let control = find(&named, PatternType::RegisterSwap)
             .expect("fixture must actually produce a register swap");
@@ -7947,8 +8847,11 @@ mod tests {
         );
 
         // The case: same rows, placeholder enclosing symbol.
-        let placeholder =
-            analyze_instructions_for(&instrs, SymbolPairing::new("fn_82A1B2C0", false));
+        let placeholder = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("fn_82A1B2C0", false),
+            DEFAULT_ANALYSIS_RULER,
+        );
         assert_eq!(
             find(&placeholder, PatternType::RegisterSwap).map(|p| p.fixability),
             Some(Fixability::Unverifiable),
@@ -7969,8 +8872,11 @@ mod tests {
     fn masked_byte_pairing_is_unverifiable_under_a_real_name() {
         let instrs = wrong_callee_fixture();
 
-        let name_matched =
-            analyze_instructions_for(&instrs, SymbolPairing::new("__unwind$3", false));
+        let name_matched = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("__unwind$3", false),
+            DEFAULT_ANALYSIS_RULER,
+        );
         assert!(
             find(&name_matched, PatternType::UnverifiablePairing).is_none(),
             "a name-matched funclet IS asserted; the flag is what makes it not"
@@ -7980,7 +8886,11 @@ mod tests {
             Some(Fixability::LikelyFixable)
         );
 
-        let byte_paired = analyze_instructions_for(&instrs, SymbolPairing::new("__unwind$3", true));
+        let byte_paired = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("__unwind$3", true),
+            DEFAULT_ANALYSIS_RULER,
+        );
         let q = find(&byte_paired, PatternType::UnverifiablePairing)
             .expect("byte-signature pairing must be caught even under a real name");
         match &q.details {
@@ -8002,7 +8912,11 @@ mod tests {
     #[test]
     fn a_clean_pairing_has_no_finding_to_qualify() {
         let instrs = vec![make_instr(0, "equal", Some("blr"), Some(""), Some("blr"), Some(""))];
-        let a = analyze_instructions_for(&instrs, SymbolPairing::new("fn_82E4DE20", true));
+        let a = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("fn_82E4DE20", true),
+            DEFAULT_ANALYSIS_RULER,
+        );
         assert!(
             find(&a, PatternType::UnverifiablePairing).is_none(),
             "zero mismatches means there is no finding to call unfalsifiable"
@@ -8024,12 +8938,16 @@ mod tests {
         let named = analyze_instructions_for(
             &instrs,
             SymbolPairing::new("?CheckHueConverge@NgPostProc@@IAAXXZ", false),
+            DEFAULT_ANALYSIS_RULER,
         );
         let control = compute_verdict(&summary, &named, Some(99.9), 180, 180);
         assert_eq!(control.classification, VerdictClassification::LikelyFixable);
 
-        let placeholder =
-            analyze_instructions_for(&instrs, SymbolPairing::new("fn_82E4DE20", false));
+        let placeholder = analyze_instructions_for(
+            &instrs,
+            SymbolPairing::new("fn_82E4DE20", false),
+            DEFAULT_ANALYSIS_RULER,
+        );
         let verdict = compute_verdict(&summary, &placeholder, Some(100.0), 44, 44);
         assert_eq!(
             verdict.classification,
