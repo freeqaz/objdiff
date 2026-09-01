@@ -209,3 +209,51 @@ fn decode_ascii_strings_with_null_padding() {
         "Result from vr66",
     );
 }
+
+#[test]
+#[cfg(feature = "ppc")]
+fn msvc_eh_funclet_prefix_is_not_charged_to_the_previous_function() {
+    // MSVC X360 lays an EH-enabled function out inside its .text COMDAT as
+    //
+    //   0x00  .long __CxxFrameHandler          <- 8-byte EH prefix for ?Func
+    //   0x04  .long __ehfuncinfo$?Func@@YAXXZ
+    //   0x08  ?Func@@YAXXZ                     <- the function symbol
+    //   0x18  .long __CxxFrameHandler          <- EH prefix for the FUNCLET
+    //   0x1c  .long __ehfuncinfo$?Func@@YAXXZ
+    //   0x20  __catch$1                        <- catch funclet
+    //
+    // ?Func ends at 0x18. The only symbol MSVC puts there is a class-6
+    // IMAGE_SYM_CLASS_LABEL ($M1), which is correctly not treated as a boundary,
+    // so without the EH-prefix check size inference runs ?Func on to __catch$1 at
+    // 0x20 and the function swallows the funclet's prefix. The two relocated
+    // pointer words then disassemble as trailing `<illegal>` instructions that no
+    // change to the source can remove.
+    //
+    // ArchPpc::infer_function_size already trims trailing zero words, but it
+    // declines to trim any word carrying a relocation and both prefix words carry
+    // one, so that trim cannot reach this case.
+    let diff_config = diff::DiffObjConfig::default();
+    let obj = obj::read::parse(
+        include_object!("data/ppc/msvc_eh_funclet.obj"),
+        &diff_config,
+        diff::DiffSide::Base,
+    )
+    .unwrap();
+
+    let func = obj.symbols.iter().find(|s| s.name == "?Func@@YAXXZ").unwrap();
+    assert_eq!(func.address, 0x8);
+    // 0x10, not 0x18: the funclet's prefix at 0x18..0x20 belongs to __catch$1.
+    assert_eq!(func.size, 0x10, "?Func must not absorb the funclet's 8-byte EH prefix");
+
+    // The funclet keeps its own body. Its prefix is owned by nobody, exactly as
+    // on the target side, where the splitter carves the function without it.
+    let funclet = obj.symbols.iter().find(|s| s.name == "__catch$1").unwrap();
+    assert_eq!((funclet.address, funclet.size), (0x20, 0x8));
+
+    // The user-visible symptom: two trailing `<illegal>` rows on ?Func.
+    let idx = obj.symbols.iter().position(|s| s.name == "?Func@@YAXXZ").unwrap();
+    let diff = diff::code::no_diff_code(&obj, idx, &diff_config).unwrap();
+    let listing = common::display_diff(&obj, &diff, idx, &diff_config);
+    assert_eq!(diff.instruction_rows.len(), 4, "4 instructions, no prefix words");
+    assert!(!listing.contains("illegal"), "EH prefix disassembled as code:\n{listing}");
+}

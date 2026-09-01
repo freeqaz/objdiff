@@ -322,6 +322,47 @@ fn is_local_label(symbol: &Symbol) -> bool {
         && LABEL_PREFIXES.iter().any(|p| symbol.name.starts_with(p))
 }
 
+/// Size of the MSVC exception-handling prefix, in bytes: two 32-bit pointers.
+const MSVC_EH_PREFIX_SIZE: u64 = 8;
+
+/// True if `address` starts an MSVC exception-handling prefix: the 8-byte
+/// `{ __CxxFrameHandler, __ehfuncinfo$<function> }` pointer pair that the Microsoft compiler
+/// emits immediately *before* every EH-enabled function and before each of that function's
+/// catch funclets, inside the same `.text` COMDAT.
+///
+/// The pair is the header of the symbol that FOLLOWS it, but it carries no symbol of its own.
+/// Size inference runs a function to the address of the next function symbol, so without this
+/// check the prefix is charged to the function that PRECEDES it — which, for a function with a
+/// catch funclet, means the function is reported 8 bytes longer than it is and the two
+/// relocated pointer words are disassembled as trailing `<illegal>` instructions. They cannot
+/// be removed by any change to the source: the compiler decides where the pair goes.
+///
+/// `ArchPpc::infer_function_size` already trims trailing zero words, but it explicitly declines
+/// to trim any word carrying a relocation — and both words of this prefix carry one — so that
+/// trim cannot reach this case.
+///
+/// The three conditions are checked together, because each alone is weak: a zero-filled word is
+/// ordinary padding, and `__ehfuncinfo$` is also referenced from `.xdata`-style sections that
+/// are not code.
+fn msvc_eh_prefix_at(section: &Section, symbols: &[Symbol], address: u64) -> bool {
+    if section.data_range(address, MSVC_EH_PREFIX_SIZE as usize)
+        != Some(&[0u8; MSVC_EH_PREFIX_SIZE as usize][..])
+    {
+        return false;
+    }
+    let reloc_target = |offset: u64| -> Option<&str> {
+        let reloc = section.relocation_at(offset, 4)?;
+        // `relocation_at` will report a relocation *after* the requested address if it falls
+        // within `size`; the prefix words are exactly relocated, so require an exact hit.
+        if reloc.address != offset || !matches!(reloc.flags, RelocationFlags::Coff(_)) {
+            return None;
+        }
+        Some(symbols.get(reloc.target_symbol)?.name.as_str())
+    };
+    reloc_target(address).is_some_and(|n| n.starts_with("__CxxFrameHandler"))
+        && reloc_target(address + 4).is_some_and(|n| n.starts_with("__ehfuncinfo$"))
+}
+
 fn infer_symbol_sizes(arch: &dyn Arch, symbols: &mut [Symbol], sections: &[Section]) -> Result<()> {
     // Above, we've sorted the symbols by section and then by address.
 
@@ -369,8 +410,16 @@ fn infer_symbol_sizes(arch: &dyn Arch, symbols: &mut [Symbol], sections: &[Secti
             iter_idx += 1;
         };
         let section = &sections[section_idx];
-        let next_address =
+        let mut next_address =
             next_symbol.map(|s| s.address).unwrap_or_else(|| section.address + section.size);
+        // The 8-byte MSVC EH prefix is the header of the symbol that FOLLOWS it, so it must not be
+        // charged to the symbol that precedes it. See `msvc_eh_prefix_at`.
+        if section.kind == SectionKind::Code
+            && next_address >= symbol.address + MSVC_EH_PREFIX_SIZE
+            && msvc_eh_prefix_at(section, symbols, next_address - MSVC_EH_PREFIX_SIZE)
+        {
+            next_address -= MSVC_EH_PREFIX_SIZE;
+        }
         let new_size = if symbol.kind == SymbolKind::Section && section.kind == SectionKind::Data {
             // Data sections already have always-visible section symbols created by objdiff to allow
             // diffing them, so no need to unhide these.
