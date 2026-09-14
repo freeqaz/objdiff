@@ -820,10 +820,21 @@ fn matching_symbols(
     // by byte-equality when name-based pairing fails. The two sides number funclets
     // per-translation-unit, so the integers never agree, and the target side sometimes
     // loses the funclet name entirely (becomes `fn_<addr>`) when dtk's splitter sees a
-    // COMDAT name collision across object files. See
-    // docs/sessions/2026-05-26-msvc-funclet-pairing.md for the full investigation.
+    // COMDAT name collision across object files.
+    //
+    // (A comment here used to cite `docs/sessions/2026-05-26-msvc-funclet-pairing.md`
+    // for "the full investigation". That file has never existed in this repository;
+    // the citation is removed rather than left to send the next reader hunting.)
     if let (Some(left), Some(right)) = (left, right) {
-        pair_funclets_by_bytes(left, right, &mut left_used, &mut right_used, &mut matches);
+        pair_funclets_by_bytes(
+            left,
+            right,
+            &mut left_used,
+            &mut right_used,
+            &mut matches,
+            #[cfg(feature = "std")]
+            &mappings.symbol_equivalences,
+        );
     }
 
     if let Some(right) = right {
@@ -947,7 +958,10 @@ pub const CASEB_STUB_MAX: u64 = 44;
 /// masks the bytes but DROPS the target names, so two >44B fns of identical
 /// instruction shape but different callees/strings mask-EQUAL. This carries the
 /// names so we can demand structural reloc equality.
-#[cfg(all(feature = "std", feature = "bindings"))]
+///
+/// Un-gated from `feature = "bindings"` (4.2.9): `pair_funclets_by_bytes` now uses
+/// the same descriptors to break ties inside an ambiguous funclet signature class,
+/// and the core pairing must not depend on the bindings feature.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct RelocDesc {
     /// Byte offset of the reloc from the symbol's start.
@@ -964,7 +978,6 @@ pub(crate) struct RelocDesc {
 }
 
 /// Project a shared `RelocationFlags` to a totally-ordered scalar key.
-#[cfg(all(feature = "std", feature = "bindings"))]
 fn reloc_flags_key(flags: crate::obj::RelocationFlags) -> (u8, u32) {
     match flags {
         crate::obj::RelocationFlags::Elf(v) => (0, v),
@@ -975,7 +988,6 @@ fn reloc_flags_key(flags: crate::obj::RelocationFlags) -> (u8, u32) {
 /// The full honesty signature of a named code symbol: reloc-masked instruction
 /// bytes PLUS the ordered, name-resolved relocation descriptors. Two symbols are
 /// byte-identical for promotion iff BOTH components are equal (rule 5).
-#[cfg(all(feature = "std", feature = "bindings"))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct NamedSig {
     pub masked_bytes: Vec<u8>,
@@ -987,7 +999,6 @@ pub(crate) struct NamedSig {
 ///
 /// This is the honesty primitive for the global pass. Unlike `is_funclet_like`,
 /// it accepts ANY code symbol (the caller gates on name-ness / size / kind).
-#[cfg(all(feature = "std", feature = "bindings"))]
 pub(crate) fn named_symbol_signature(obj: &Object, sym_idx: usize) -> Option<NamedSig> {
     let masked_bytes = funclet_signature(obj, sym_idx)?;
     let symbol = obj.symbols.get(sym_idx)?;
@@ -1469,44 +1480,115 @@ fn recalc_unit_measure_percents(m: &mut crate::bindings::report::Measures) {
     };
 }
 
+/// Evidence — read off relocation TARGET NAMES — that two candidates inside one
+/// funclet byte-signature equivalence class are in fact the same funclet.
+///
+/// `funclet_signature` zeroes every relocation word and DROPS the target names,
+/// so a whole family of funclets that differ only in which destructor they call
+/// collapses onto one key. Inside such a class the assignment is many-to-many,
+/// and until this tiebreaker it was resolved by symbol-name sort order plus a
+/// greedy zip — i.e. arbitrarily. Measured on rb3-xenon retail (lane W16-T):
+/// `RockCentral`'s `subi r31,r12,0x90` + `addi r3,r31,0x50` class has 5 retail
+/// members and >= 5 of ours, and ALL FIVE retail rows scored 99.5 — 0/5 correct,
+/// which is exactly what an arbitrary assignment inside an equivalence class
+/// looks like. The relocation names are the only information left that
+/// distinguishes members, so use them.
+///
+/// Use them as EVIDENCE, never as a requirement:
+/// * `conflict` counts sites where both sides name a real, non-equivalent
+///   symbol — the pair is contradicted by the objects themselves;
+/// * `agree` counts sites where both name the same symbol (or two the map file
+///   asserts co-located).
+///
+/// A site whose TARGET-side name is a placeholder (`fn_<hex>`, `lbl_`, …)
+/// carries no identity and is skipped, exactly as `reloc_eq` forgives it under
+/// `name_check`. So is a site present on only one side: dtk-split target objects
+/// carry relocations per-site with no coverage guarantee, so a missing one is
+/// unverifiable, never evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NameEvidence {
+    agree: usize,
+    conflict: usize,
+}
+
+impl NameEvidence {
+    /// Usable as a tiebreak only when the names positively say something AND
+    /// nothing contradicts them. Silence is not agreement.
+    fn is_positive(&self) -> bool { self.conflict == 0 && self.agree > 0 }
+}
+
+/// Compare two candidates' name-resolved relocation descriptors. `left` is the
+/// target (retail) side, `right` the base (ours) — the asymmetry matters: only
+/// the target side's placeholder names are forgiven, mirroring `reloc_eq`.
+fn funclet_name_evidence(
+    left_sig: &NamedSig,
+    right_sig: &NamedSig,
+    #[cfg(feature = "std")] equivalences: &crate::obj::map_file::SymbolEquivalences,
+) -> NameEvidence {
+    let mut ev = NameEvidence::default();
+    for l in &left_sig.relocs {
+        // Match by OFFSET, not by index: the two sides can carry different
+        // relocation counts even when their masked bytes agree.
+        let Some(r) = right_sig.relocs.iter().find(|r| r.off_from_sym == l.off_from_sym) else {
+            continue;
+        };
+        if l.flags != r.flags {
+            ev.conflict += 1;
+            continue;
+        }
+        if crate::diff::code::is_placeholder_symbol_name(&l.target_name) {
+            continue;
+        }
+        if l.target_name == r.target_name {
+            ev.agree += 1;
+            continue;
+        }
+        #[cfg(feature = "std")]
+        if equivalences.aliases(&l.target_name, &r.target_name) {
+            ev.agree += 1;
+            continue;
+        }
+        ev.conflict += 1;
+    }
+    ev
+}
+
 fn pair_funclets_by_bytes(
     left: &Object,
     right: &Object,
     left_used: &mut BTreeSet<usize>,
     right_used: &mut BTreeSet<usize>,
     matches: &mut Vec<SymbolMatch>,
+    #[cfg(feature = "std")] equivalences: &crate::obj::map_file::SymbolEquivalences,
 ) {
-    // Collect unmatched funclet symbols on each side with their masked byte signature.
-    let mut left_candidates: Vec<(usize, alloc::vec::Vec<u8>)> = Vec::new();
-    for (idx, sym) in left.symbols.iter().enumerate() {
-        if left_used.contains(&idx) || sym.size == 0 || sym.flags.contains(SymbolFlag::Ignored) {
-            continue;
+    // Collect unmatched funclet symbols on each side with their masked byte
+    // signature AND their name-resolved relocation descriptors.
+    //
+    // The descriptors are BEST EFFORT: `named_symbol_signature` fails closed on an
+    // out-of-range relocation target, and that must never remove a funclet from the
+    // byte-signature pairing it already participated in. So fall back to "masked
+    // bytes, no name evidence" rather than dropping the candidate.
+    let collect = |obj: &Object, used: &BTreeSet<usize>| -> Vec<(usize, NamedSig)> {
+        let mut out: Vec<(usize, NamedSig)> = Vec::new();
+        for (idx, sym) in obj.symbols.iter().enumerate() {
+            if used.contains(&idx) || sym.size == 0 || sym.flags.contains(SymbolFlag::Ignored) {
+                continue;
+            }
+            if !is_funclet_like(&sym.name) {
+                continue;
+            }
+            if symbol_section_kind(obj, sym) != SectionKind::Code {
+                continue;
+            }
+            let Some(masked_bytes) = funclet_signature(obj, idx) else { continue };
+            let sig = named_symbol_signature(obj, idx)
+                .unwrap_or(NamedSig { masked_bytes, relocs: Vec::new() });
+            out.push((idx, sig));
         }
-        if !is_funclet_like(&sym.name) {
-            continue;
-        }
-        if symbol_section_kind(left, sym) != SectionKind::Code {
-            continue;
-        }
-        if let Some(sig) = funclet_signature(left, idx) {
-            left_candidates.push((idx, sig));
-        }
-    }
-    let mut right_candidates: Vec<(usize, alloc::vec::Vec<u8>)> = Vec::new();
-    for (idx, sym) in right.symbols.iter().enumerate() {
-        if right_used.contains(&idx) || sym.size == 0 || sym.flags.contains(SymbolFlag::Ignored) {
-            continue;
-        }
-        if !is_funclet_like(&sym.name) {
-            continue;
-        }
-        if symbol_section_kind(right, sym) != SectionKind::Code {
-            continue;
-        }
-        if let Some(sig) = funclet_signature(right, idx) {
-            right_candidates.push((idx, sig));
-        }
-    }
+        out
+    };
+    let mut left_candidates = collect(left, left_used);
+    let mut right_candidates = collect(right, right_used);
 
     // Make the greedy assignment below deterministic w.r.t. symbol-table order.
     //
@@ -1529,17 +1611,34 @@ fn pair_funclets_by_bytes(
     left_candidates.sort_by(|a, b| left.symbols[a.0].name.cmp(&left.symbols[b.0].name));
     right_candidates.sort_by(|a, b| right.symbols[a.0].name.cmp(&right.symbols[b.0].name));
 
+    use alloc::collections::BTreeMap;
+    // idx -> name-resolved signature, for the pass-2 / pass-2b tiebreaker.
+    let left_sigs: BTreeMap<usize, &NamedSig> =
+        left_candidates.iter().map(|(i, s)| (*i, s)).collect();
+    let right_sigs: BTreeMap<usize, &NamedSig> =
+        right_candidates.iter().map(|(i, s)| (*i, s)).collect();
+    let evidence = |l_idx: usize, r_idx: usize| -> NameEvidence {
+        match (left_sigs.get(&l_idx), right_sigs.get(&r_idx)) {
+            (Some(l), Some(r)) => funclet_name_evidence(
+                l,
+                r,
+                #[cfg(feature = "std")]
+                equivalences,
+            ),
+            _ => NameEvidence::default(),
+        }
+    };
+
     // Pass 1: exact byte-equality pairings, only when uniquely determined on both sides.
     // (If multiple left candidates share the same signature, defer them to pass 2; we
     // can't pick a winner without parent-association data.)
-    use alloc::collections::BTreeMap;
     let mut left_by_sig: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
     for (idx, sig) in &left_candidates {
-        left_by_sig.entry(sig.as_slice()).or_default().push(*idx);
+        left_by_sig.entry(sig.masked_bytes.as_slice()).or_default().push(*idx);
     }
     let mut right_by_sig: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
     for (idx, sig) in &right_candidates {
-        right_by_sig.entry(sig.as_slice()).or_default().push(*idx);
+        right_by_sig.entry(sig.masked_bytes.as_slice()).or_default().push(*idx);
     }
     for (sig, left_indices) in &left_by_sig {
         if left_indices.len() != 1 {
@@ -1566,14 +1665,55 @@ fn pair_funclets_by_bytes(
         right_used.insert(r_idx);
     }
 
-    // Pass 2: ambiguous exact-match groups. Greedily pair within each group.
+    // Pass 2: ambiguous exact-match groups.
+    //
+    // Every member of a signature class has the SAME masked bytes, so the bytes
+    // cannot choose a partner — but the relocation target names can. Phase A pairs
+    // the candidates whose names agree and nowhere conflict, strongest evidence
+    // first; phase B falls back to the historical name-sorted zip for whatever the
+    // names could not decide. Pass 1 is deliberately untouched: a forced choice has
+    // no tiebreak to make, and rewarding it with one could only add risk.
     let mut pass2_pairs: Vec<(usize, usize)> = Vec::new();
     for (sig, left_indices) in &left_by_sig {
         let Some(right_indices) = right_by_sig.get(sig) else { continue };
-        let l_remaining: Vec<usize> =
+        let mut l_remaining: Vec<usize> =
             left_indices.iter().copied().filter(|i| !left_used.contains(i)).collect();
-        let r_remaining: Vec<usize> =
+        let mut r_remaining: Vec<usize> =
             right_indices.iter().copied().filter(|i| !right_used.contains(i)).collect();
+
+        // Phase A: name-agreement tiebreak (only meaningful when there is a choice).
+        if l_remaining.len() > 1 || r_remaining.len() > 1 {
+            let mut scored: Vec<(usize, usize, usize)> = Vec::new(); // (agree, l, r)
+            for &l_idx in &l_remaining {
+                for &r_idx in &r_remaining {
+                    let ev = evidence(l_idx, r_idx);
+                    if ev.is_positive() {
+                        scored.push((ev.agree, l_idx, r_idx));
+                    }
+                }
+            }
+            // Strongest agreement first; ties broken by name so the assignment is a
+            // pure function of the object contents, never of symbol-table order.
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| left.symbols[a.1].name.cmp(&left.symbols[b.1].name))
+                    .then_with(|| right.symbols[a.2].name.cmp(&right.symbols[b.2].name))
+            });
+            let mut taken_l: BTreeSet<usize> = BTreeSet::new();
+            let mut taken_r: BTreeSet<usize> = BTreeSet::new();
+            for (_, l_idx, r_idx) in scored {
+                if taken_l.contains(&l_idx) || taken_r.contains(&r_idx) {
+                    continue;
+                }
+                pass2_pairs.push((l_idx, r_idx));
+                taken_l.insert(l_idx);
+                taken_r.insert(r_idx);
+            }
+            l_remaining.retain(|i| !taken_l.contains(i));
+            r_remaining.retain(|i| !taken_r.contains(i));
+        }
+
+        // Phase B: the historical greedy zip, over the undecided residue.
         for (l_idx, r_idx) in l_remaining.iter().zip(r_remaining.iter()) {
             pass2_pairs.push((*l_idx, *r_idx));
         }
@@ -1615,15 +1755,32 @@ fn pair_funclets_by_bytes(
     // bytes anyway). We DO mark the overflow target `left_used` so it never reaches the
     // fuzzy pass. Crucially this fires ONLY on an exact signature-key hit in
     // `right_by_sig`, so funclets that differ from every base symbol are untouched.
+    //
+    // ⚠ "identical bytes anyway" is true of the MASKED bytes and FALSE of the
+    // relocation names, which is precisely what `name_check` charges — so the choice
+    // of partner is not cosmetic here either. Prefer the partner whose target names
+    // agree; the name-sorted first index remains the fallback when none does.
     for (sig, left_indices) in &left_by_sig {
         let Some(right_indices) = right_by_sig.get(sig) else { continue };
         // A deterministic identical base partner for this signature: the name-sorted
         // first index (right_candidates were sorted by name, so right_by_sig vectors
         // preserve that order). Any of them is byte-identical by construction.
-        let Some(&partner) = right_indices.first() else { continue };
+        let Some(&fallback) = right_indices.first() else { continue };
         for &l_idx in left_indices.iter() {
             if left_used.contains(&l_idx) {
                 continue;
+            }
+            // Best name-agreeing partner, if any; `right_indices` is name-sorted and
+            // the comparison is strictly-greater, so the first best wins — the choice
+            // does not depend on symbol-table order.
+            let mut partner = fallback;
+            let mut best = 0usize;
+            for &r_idx in right_indices.iter() {
+                let ev = evidence(l_idx, r_idx);
+                if ev.is_positive() && ev.agree > best {
+                    best = ev.agree;
+                    partner = r_idx;
+                }
             }
             matches.push(SymbolMatch {
                 left: Some(l_idx),
@@ -1642,41 +1799,49 @@ fn pair_funclets_by_bytes(
 
     // Pass 3: same-size fuzzy match. For each remaining left funclet, find the best
     // unmatched right funclet of the same size by Hamming-equality of bytes.
-    let mut remaining_left: Vec<(usize, &alloc::vec::Vec<u8>)> = left_candidates
+    let remaining_left: Vec<(usize, &NamedSig)> = left_candidates
         .iter()
         .filter(|(i, _)| !left_used.contains(i))
         .map(|(i, s)| (*i, s))
         .collect();
-    let mut remaining_right: Vec<(usize, &alloc::vec::Vec<u8>)> = right_candidates
+    let remaining_right: Vec<(usize, &NamedSig)> = right_candidates
         .iter()
         .filter(|(i, _)| !right_used.contains(i))
         .map(|(i, s)| (*i, s))
         .collect();
     // Pair greedily: highest similarity first.
-    let mut scored: Vec<(usize, usize, usize)> = Vec::new(); // (matching_bytes, l, r)
+    let mut scored: Vec<(usize, usize, usize, usize)> = Vec::new(); // (matching_bytes, agree, l, r)
     for (l_idx, l_sig) in &remaining_left {
         for (r_idx, r_sig) in &remaining_right {
-            if l_sig.len() != r_sig.len() {
+            let (l_bytes, r_bytes) = (&l_sig.masked_bytes, &r_sig.masked_bytes);
+            if l_bytes.len() != r_bytes.len() {
                 continue;
             }
-            let matching = l_sig.iter().zip(r_sig.iter()).filter(|(a, b)| a == b).count();
+            let matching = l_bytes.iter().zip(r_bytes.iter()).filter(|(a, b)| a == b).count();
             // Require at least 50% byte equality after masking — purely a tunable
             // threshold; in practice the funclets either match cleanly (95%+) or
             // they're truly different code.
-            if matching * 2 >= l_sig.len() {
-                scored.push((matching, *l_idx, *r_idx));
+            if matching * 2 >= l_bytes.len() {
+                let ev = evidence(*l_idx, *r_idx);
+                scored.push((
+                    matching,
+                    if ev.is_positive() { ev.agree } else { 0 },
+                    *l_idx,
+                    *r_idx,
+                ));
             }
         }
     }
-    // Sort by descending byte-similarity, breaking ties by symbol name so the greedy
-    // assignment is fully deterministic w.r.t. symbol-table order (not relying on
-    // sort stability + insertion order).
+    // Sort by descending byte-similarity, then by descending name agreement, breaking
+    // remaining ties by symbol name so the greedy assignment is fully deterministic
+    // w.r.t. symbol-table order (not relying on sort stability + insertion order).
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
-            .then_with(|| left.symbols[a.1].name.cmp(&left.symbols[b.1].name))
-            .then_with(|| right.symbols[a.2].name.cmp(&right.symbols[b.2].name))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| left.symbols[a.2].name.cmp(&left.symbols[b.2].name))
+            .then_with(|| right.symbols[a.3].name.cmp(&right.symbols[b.3].name))
     });
-    for (_, l_idx, r_idx) in scored {
+    for (_, _, l_idx, r_idx) in scored {
         if left_used.contains(&l_idx) || right_used.contains(&r_idx) {
             continue;
         }
@@ -1691,9 +1856,6 @@ fn pair_funclets_by_bytes(
         left_used.insert(l_idx);
         right_used.insert(r_idx);
     }
-    let _ = (remaining_left.len(), remaining_right.len()); // suppress warning on no-op shrink
-    remaining_left.clear();
-    remaining_right.clear();
 }
 
 fn unmatched_symbols<'obj, 'used>(
@@ -1992,7 +2154,15 @@ mod tests {
         let mut right_used = BTreeSet::new();
         let mut matches = Vec::new();
 
-        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+        pair_funclets_by_bytes(
+            &left,
+            &right,
+            &mut left_used,
+            &mut right_used,
+            &mut matches,
+            #[cfg(feature = "std")]
+            &crate::obj::map_file::SymbolEquivalences::default(),
+        );
 
         assert_eq!(matches.len(), 1, "expected exactly one funclet pairing, got {}", matches.len());
         let m = &matches[0];
@@ -2018,7 +2188,15 @@ mod tests {
         let mut right_used = BTreeSet::new();
         let mut matches = Vec::new();
 
-        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+        pair_funclets_by_bytes(
+            &left,
+            &right,
+            &mut left_used,
+            &mut right_used,
+            &mut matches,
+            #[cfg(feature = "std")]
+            &crate::obj::map_file::SymbolEquivalences::default(),
+        );
 
         // Pass 3 fuzzy requires >=50% byte equality. These two share fewer than
         // half their bytes after masking, so nothing should pair.
@@ -2118,7 +2296,15 @@ mod tests {
         let mut left_used = BTreeSet::new();
         let mut right_used = BTreeSet::new();
         let mut matches = Vec::new();
-        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+        pair_funclets_by_bytes(
+            &left,
+            &right,
+            &mut left_used,
+            &mut right_used,
+            &mut matches,
+            #[cfg(feature = "std")]
+            &crate::obj::map_file::SymbolEquivalences::default(),
+        );
 
         // All three target funclets must be paired (none left for pass-3 fuzzy).
         for l in 0..3usize {
@@ -2197,7 +2383,15 @@ mod tests {
         let mut left_used = BTreeSet::new();
         let mut right_used = BTreeSet::new();
         let mut matches = Vec::new();
-        pair_funclets_by_bytes(&left, &right, &mut left_used, &mut right_used, &mut matches);
+        pair_funclets_by_bytes(
+            &left,
+            &right,
+            &mut left_used,
+            &mut right_used,
+            &mut matches,
+            #[cfg(feature = "std")]
+            &crate::obj::map_file::SymbolEquivalences::default(),
+        );
 
         // The single base funclet is byte-identical to the two "A" targets: one pairs
         // 1:1 (pass 2), the overflow reuses it (pass 2b). Both A targets are paired.
