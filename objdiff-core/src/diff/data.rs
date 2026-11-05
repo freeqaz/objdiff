@@ -55,7 +55,12 @@ fn reloc_eq(
         return false;
     }
 
-    let symbol_name_addend_matches = symbol_name_matches(left.symbol, right.symbol)
+    let symbol_name_addend_matches = (symbol_name_matches(left.symbol, right.symbol)
+        || left_obj.plain_name_equivalent(
+            left.relocation.target_symbol,
+            right_obj,
+            right.relocation.target_symbol,
+        ))
         && left.relocation.addend == right.relocation.addend;
     match (left.symbol.section, right.symbol.section) {
         (Some(sl), Some(sr)) => {

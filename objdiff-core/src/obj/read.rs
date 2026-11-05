@@ -1263,6 +1263,14 @@ pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result
         },
         _ => BTreeMap::new(),
     };
+    // Built from the FINAL symbol list (after section combining and the
+    // synthetic section symbols), so its indices are the ones every consumer sees.
+    let msvc_plain_names =
+        if config.msvc_plain_name_equivalence && obj_file.format() == object::BinaryFormat::Coff {
+            crate::obj::msvc_plain::MsvcPlainNames::build(&symbols)
+        } else {
+            Default::default()
+        };
     let mut obj = Object {
         arch,
         endianness: obj_file.endianness(),
@@ -1275,6 +1283,7 @@ pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result
         timestamp: None,
         flow_analysis_results: Default::default(),
         weak_external_defaults,
+        msvc_plain_names,
     };
 
     // Need to construct the obj first so that we have a convinient package to

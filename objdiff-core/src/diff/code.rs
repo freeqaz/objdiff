@@ -1467,7 +1467,17 @@ fn reloc_eq(
             normalize_mangled_array_sizes(&left_reloc.symbol.name)
                 .zip(normalize_mangled_array_sizes(&right_reloc.symbol.name))
                 .is_some_and(|(l, r)| l == r)
-        };
+        }
+        // PDB plain-name equivalence (COFF, `msvcPlainNameEquivalence`): one
+        // internal-linkage function, named by its PDB `S_LPROC32` spelling on
+        // the split target and by its MSVC decoration on our side. Exact after
+        // undecoration + whitespace normalisation, unambiguous on both sides;
+        // see `obj::msvc_plain`.
+        || left_obj.plain_name_equivalent(
+            left_reloc.relocation.target_symbol,
+            right_obj,
+            right_reloc.relocation.target_symbol,
+        );
     let symbol_name_addend_matches =
         names_match && left_reloc.relocation.addend == right_reloc.relocation.addend;
     // NameOnly: target symbol name (+ section) must match, but the addend is ignored.

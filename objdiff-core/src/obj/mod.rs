@@ -3,6 +3,7 @@ mod dwarf2;
 #[cfg(feature = "std")]
 pub mod map_file;
 mod mdebug;
+pub mod msvc_plain;
 pub mod read;
 pub mod split_meta;
 
@@ -314,6 +315,13 @@ pub struct Object {
     ///
     /// Empty for every non-COFF format.
     pub weak_external_defaults: BTreeMap<String, String>,
+    /// PDB plain-name equivalence table for MSVC internal-linkage symbols.
+    ///
+    /// Built by the reader for COFF objects when
+    /// `DiffObjConfig::msvc_plain_name_equivalence` is set; empty otherwise,
+    /// in which case [`Object::plain_name_equivalent`] never holds. See
+    /// [`msvc_plain`] for the rule.
+    pub msvc_plain_names: msvc_plain::MsvcPlainNames,
 }
 
 impl Default for Object {
@@ -330,11 +338,30 @@ impl Default for Object {
             timestamp: None,
             flow_analysis_results: BTreeMap::<u64, Box<dyn FlowAnalysisResult>>::new(),
             weak_external_defaults: BTreeMap::new(),
+            msvc_plain_names: Default::default(),
         }
     }
 }
 
 impl Object {
+    /// True if this object's symbol `symbol_index` and `other`'s symbol
+    /// `other_index` are one internal-linkage MSVC symbol, spelled by its PDB
+    /// plain name on one side and by its decoration on the other. Never true
+    /// for non-COFF objects or with `msvcPlainNameEquivalence` off.
+    pub fn plain_name_equivalent(
+        &self,
+        symbol_index: usize,
+        other: &Object,
+        other_index: usize,
+    ) -> bool {
+        msvc_plain::plain_name_equivalent(
+            &self.msvc_plain_names,
+            symbol_index,
+            &other.msvc_plain_names,
+            other_index,
+        )
+    }
+
     pub fn resolve_instruction_ref(
         &self,
         symbol_index: usize,

@@ -220,4 +220,8 @@ Object {
     timestamp: None,
     flow_analysis_results: {},
     weak_external_defaults: {},
+    msvc_plain_names: MsvcPlainNames {
+        symbols: 9,
+        participating: 4,
+    },
 }
