@@ -16,9 +16,12 @@ use regex::Regex;
 /// spellings may denote the body at this address" — rendered with nothing added
 /// and nothing dropped.
 ///
-/// Internally this is the adjacency relation of the co-location graph: each
-/// name maps to the union of every group it appears in (a `BTreeSet`, so
-/// iteration order, `canonical`, and `Debug` output are deterministic). A
+/// Internally each name maps to the ids of every group it appears in, and two
+/// names are adjacent iff those id lists intersect: the adjacency relation of
+/// the co-location graph, stored in space linear in the file rather than
+/// quadratic in group size (see `membership`). Groups are canonicalised
+/// (members and groups sorted and deduplicated) before ids are assigned, so
+/// `canonical`, `PartialEq` and the relation are independent of file order. A
 /// per-name *single* group would be a partition-shaped answer to a pairwise
 /// question; `reloc_eq` only ever asks "may name A stand in for name B?", and
 /// adjacency answers precisely that.
@@ -53,56 +56,116 @@ use regex::Regex;
 ///   position: it hands on the relation the generator asserted, exactly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymbolEquivalences {
-    /// name → union of every multi-symbol address group containing it (self
-    /// included). Names that never share an address are absent.
-    adjacency: HashMap<String, BTreeSet<String>>,
+    /// name -> ascending ids of every multi-symbol address group containing
+    /// it. Names that never share an address are absent.
+    ///
+    /// Stored as group MEMBERSHIP, not as the adjacency sets themselves: the
+    /// relation is the same (two names are adjacent iff their id lists
+    /// intersect), but adjacency costs O(sum of squared group sizes). A PDB's
+    /// /OPT:ICF groups are not small -- cea-decomp's HCEX.pdb has one address
+    /// carrying 1,899 publics (every `return false;` virtual) and another
+    /// 1,868 -- and materialising their adjacency took ~3 s and ~0.5 GB per
+    /// `objdiff-cli diff` invocation. Membership is linear in the file.
+    membership: HashMap<String, Vec<u32>>,
+    /// group id -> lexicographically smallest member, for [`canonical`](Self::canonical).
+    group_min: Vec<String>,
 }
 
 impl SymbolEquivalences {
     /// May `a` stand in for `b` (or vice versa)? True iff the map file asserts
-    /// them co-located at some address. Symmetric by construction — the
-    /// adjacency sets are built from unordered groups — so callers need no
-    /// two-way lookup. Names never seen in a group alias nothing (a name is not
-    /// even self-aliased unless it appears in some multi-symbol group; callers
-    /// compare for plain equality first).
+    /// them co-located at some address. Symmetric by construction -- group
+    /// membership is unordered -- so callers need no two-way lookup. Names
+    /// never seen in a group alias nothing (a name is not even self-aliased
+    /// unless it appears in some multi-symbol group; callers compare for plain
+    /// equality first).
     pub fn aliases(&self, a: &str, b: &str) -> bool {
-        self.adjacency.get(a).is_some_and(|s| s.contains(b))
+        let (Some(ga), Some(gb)) = (self.membership.get(a), self.membership.get(b)) else {
+            return false;
+        };
+        // Both lists are ascending; a name is in one group in practice.
+        let (mut i, mut j) = (0, 0);
+        while i < ga.len() && j < gb.len() {
+            match ga[i].cmp(&gb[j]) {
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        false
     }
 
     /// Deterministic representative for `name`: the lexicographically smallest
-    /// member of its adjacency set (which includes `name` itself), or `name`
-    /// unchanged if it appears in no group.
+    /// member of its adjacency set (which includes `name` itself), i.e. the
+    /// smallest member of any group containing it, or `name` unchanged if it
+    /// appears in no group.
     ///
     /// This is a KEYING HEURISTIC for the opt-in case-B promotion index, not
     /// part of the forgiveness semantics. Keying by a representative forces an
     /// equivalence relation, and the relation here is deliberately not
     /// transitive, so no labeling can be exact: two names asserted equivalent
-    /// may get different representatives (a missed index collision — the pass
+    /// may get different representatives (a missed index collision -- the pass
     /// misses a candidate, conservative), and two names NOT asserted equivalent
-    /// may share one through a common neighbor (a spurious index collision —
+    /// may share one through a common neighbor (a spurious index collision --
     /// screened downstream by the case-B pass's unique-retail-VA, oracle
     /// own-TU, and byte-masked-equality gates). An exact scheme would key the
     /// index on the relocation-masked bytes alone and verify reloc names
     /// pairwise via [`aliases`](Self::aliases) at lookup; that redesign is
     /// intentionally out of scope here.
     pub fn canonical<'a>(&'a self, name: &'a str) -> &'a str {
-        match self.adjacency.get(name).and_then(|s| s.first()) {
-            Some(min) => min.as_str(),
+        match self.membership.get(name) {
+            Some(ids) => {
+                ids.iter().map(|&g| self.group_min[g as usize].as_str()).min().unwrap_or(name)
+            }
             None => name,
         }
     }
 
     /// Number of names that appear in at least one multi-symbol group.
-    pub fn len(&self) -> usize { self.adjacency.len() }
+    pub fn len(&self) -> usize { self.membership.len() }
 
-    pub fn is_empty(&self) -> bool { self.adjacency.is_empty() }
+    pub fn is_empty(&self) -> bool { self.membership.is_empty() }
 
-    /// Record one address group's assertion: every pair of names in `group` may
-    /// stand in for each other.
-    fn add_group(&mut self, group: &[String]) {
-        for sym in group {
-            self.adjacency.entry(sym.clone()).or_default().extend(group.iter().cloned());
+    /// Number of distinct address groups (after merging groups with identical
+    /// member sets, which assert nothing more than one of them does).
+    pub fn group_count(&self) -> usize { self.group_min.len() }
+
+    /// Build the relation from address groups directly: every pair of names
+    /// within one group may stand in for each other. Groups with fewer than
+    /// two entries assert nothing and are dropped. The result does not depend
+    /// on the order of `groups` or of the names within each.
+    pub fn from_groups<I, G, S>(groups: I) -> Self
+    where
+        I: IntoIterator<Item = G>,
+        G: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        // Canonical form: each group's members sorted + deduplicated, groups
+        // sorted + deduplicated. Ids follow that order, so equal inputs (in
+        // any permutation) build equal values -- `PartialEq` and the
+        // reproducibility tests depend on it.
+        let mut canon: Vec<Vec<String>> = groups
+            .into_iter()
+            .filter_map(|g| {
+                let raw: Vec<String> = g.into_iter().map(Into::into).collect();
+                if raw.len() < 2 {
+                    return None;
+                }
+                let set: BTreeSet<String> = raw.into_iter().collect();
+                Some(set.into_iter().collect())
+            })
+            .collect();
+        canon.sort();
+        canon.dedup();
+        let mut out = SymbolEquivalences::default();
+        for (id, group) in canon.into_iter().enumerate() {
+            let id = id as u32;
+            for name in &group {
+                out.membership.entry(name.clone()).or_default().push(id);
+            }
+            // `group` is sorted, so its first member is its minimum.
+            out.group_min.push(group.into_iter().next().unwrap_or_default());
         }
+        out
     }
 }
 
@@ -114,9 +177,9 @@ pub fn parse_msvc_map(reader: impl BufRead) -> SymbolEquivalences {
     let pattern =
         Regex::new(r"^\s*\d{4}:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]{8})\s+").expect("invalid regex");
 
-    // Bucket lines by address. The HashMap is only a lookup; the result is a
-    // union over unordered groups, so no iteration order can reach the output
-    // (proven by `line_order_is_not_evidence` below).
+    // Bucket lines by address. The HashMap is only a lookup; `from_groups`
+    // canonicalises, so no iteration order can reach the output (proven by
+    // `line_order_is_not_evidence` below).
     let mut address_to_symbols: HashMap<String, Vec<String>> = HashMap::new();
 
     for line in reader.lines() {
@@ -128,13 +191,7 @@ pub fn parse_msvc_map(reader: impl BufRead) -> SymbolEquivalences {
         }
     }
 
-    let mut equivalences = SymbolEquivalences::default();
-    for symbols in address_to_symbols.values() {
-        if symbols.len() > 1 {
-            equivalences.add_group(symbols);
-        }
-    }
-    equivalences
+    SymbolEquivalences::from_groups(address_to_symbols.into_values())
 }
 
 #[cfg(test)]
