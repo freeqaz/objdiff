@@ -1963,7 +1963,33 @@ fn find_symbol(
         return Some(symbol_idx);
     }
 
-    None
+    find_symbol_by_plain_name(obj, in_obj, in_symbol_idx, used, section_name, section_kind)
+}
+
+/// Exact names first, then the PDB plain-name equivalence: a split target names
+/// an internal-linkage MSVC function by its undecorated PDB spelling, our object
+/// by its decoration. Only consulted when no exact-name partner exists, and the
+/// equivalence itself refuses any key that is ambiguous in either object (see
+/// `obj::msvc_plain`), so it can only pair a symbol that would otherwise have
+/// stayed unpaired. Empty tables (non-COFF, option off) make this a no-op.
+fn find_symbol_by_plain_name(
+    obj: &Object,
+    in_obj: &Object,
+    in_symbol_idx: usize,
+    used: Option<&BTreeSet<usize>>,
+    section_name: &str,
+    section_kind: SectionKind,
+) -> Option<usize> {
+    if obj.msvc_plain_names.is_empty() || !in_obj.msvc_plain_names.participates(in_symbol_idx) {
+        return None;
+    }
+    unmatched_symbols(obj, used)
+        .find(|&(symbol_idx, symbol)| {
+            in_obj.plain_name_equivalent(in_symbol_idx, obj, symbol_idx)
+                && symbol_section_kind(obj, symbol) == section_kind
+                && symbol_section(obj, symbol).is_some_and(|(name, _)| name == section_name)
+        })
+        .map(|(symbol_idx, _)| symbol_idx)
 }
 
 /// Cheap name-only symbol matching (skips expensive data diffs for compiler-generated symbols).
@@ -1992,7 +2018,7 @@ fn find_symbol_by_name(
         return Some(symbol_idx);
     }
 
-    None
+    find_symbol_by_plain_name(obj, in_obj, in_symbol_idx, used, section_name, section_kind)
 }
 
 /// Find matching sections between each object.

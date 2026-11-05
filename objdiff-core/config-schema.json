@@ -128,6 +128,13 @@
       "description": "Combines all text sections into one."
     },
     {
+      "id": "msvcPlainNameEquivalence",
+      "type": "boolean",
+      "default": true,
+      "name": "Pair MSVC internal-linkage symbols by PDB plain name",
+      "description": "COFF only. Treats an internal-linkage (static or anonymous-namespace) MSVC symbol whose name-only undecoration equals the other side's plain PDB spelling as the same symbol, when pairing symbols and when comparing relocation targets. Exact equality after whitespace normalisation; ambiguous keys (overloads) are refused."
+    },
+    {
       "id": "preferredStringEncoding",
       "type": "choice",
       "default": "auto",
@@ -399,7 +406,8 @@
         "showSymbolSizes",
         "spaceBetweenArgs",
         "combineDataSections",
-        "combineTextSections"
+        "combineTextSections",
+        "msvcPlainNameEquivalence"
       ]
     },
     {
